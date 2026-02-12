@@ -327,6 +327,79 @@ fn test_force_wait_flag() {
     );
 }
 
+// --- PHP Composer fixture tests ---
+
+#[test]
+fn test_php_composer_contract() {
+    let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    assert_eq!(contract.base_image, "php:8.2-fpm");
+    assert_eq!(contract.workdir, Some("/var/www/html".to_string()));
+    assert_eq!(contract.exposed_ports.len(), 1);
+    assert_eq!(contract.exposed_ports[0].port, 9000);
+}
+
+#[test]
+fn test_php_composer_package_detection() {
+    let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    // Should detect monolog/monolog from composer require
+    assert!(
+        contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: extractor::PackageManager::Composer,
+                ..
+            } if package == "monolog/monolog"
+        )),
+        "should detect composer require monolog/monolog"
+    );
+}
+
+#[test]
+fn test_php_composer_apt_packages_detected() {
+    let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    // Should detect git and unzip from apt-get install
+    assert!(contract.assertions.iter().any(|a| matches!(
+        &a.kind,
+        AssertionKind::PackageInstalled {
+            package,
+            manager: extractor::PackageManager::Apt,
+            version_cmd: Some(_),
+        } if package == "git"
+    )));
+    assert!(contract.assertions.iter().any(|a| matches!(
+        &a.kind,
+        AssertionKind::PackageInstalled {
+            package,
+            manager: extractor::PackageManager::Apt,
+            ..
+        } if package == "unzip"
+    )));
+}
+
+#[test]
+fn test_php_composer_goss_output() {
+    let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+
+    let yml = &output.goss_yml;
+    assert!(
+        yml.contains("composer show 'monolog/monolog'"),
+        "should generate composer show check for monolog"
+    );
+    assert!(
+        yml.contains("dpkg -s git"),
+        "should generate dpkg check for git"
+    );
+}
+
 // --- Secret redaction tests ---
 
 #[test]
