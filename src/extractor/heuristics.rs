@@ -301,11 +301,15 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
                     return None;
                 }
                 // Skip requirements file references
-                if pkg.ends_with(".txt") || pkg.ends_with(".cfg") || pkg.contains('/') || pkg == "." {
+                if pkg.ends_with(".txt") || pkg.ends_with(".cfg") || pkg.contains('/') || pkg == "."
+                {
                     return None;
                 }
                 // Strip version specifiers (e.g. "flask==2.0" -> "flask")
-                let pkg_name = pkg.split(&['=', '>', '<', '!', '~', '['][..]).next().unwrap_or(pkg);
+                let pkg_name = pkg
+                    .split(&['=', '>', '<', '!', '~', '['][..])
+                    .next()
+                    .unwrap_or(pkg);
                 if pkg_name.is_empty() {
                     return None;
                 }
@@ -330,9 +334,9 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
                     return None;
                 }
                 // Strip version specifiers (@scope/pkg@version -> @scope/pkg)
-                let pkg_name = if pkg.starts_with('@') {
+                let pkg_name = if let Some(stripped) = pkg.strip_prefix('@') {
                     // Scoped package: @scope/name@version
-                    if let Some(at_pos) = pkg[1..].find('@') {
+                    if let Some(at_pos) = stripped.find('@') {
                         &pkg[..at_pos + 1]
                     } else {
                         pkg
@@ -482,10 +486,9 @@ mod tests {
         let cmd = CommandForm::Shell("apt-get install -y ca-certificates gnupg".to_string());
         let assertions = analyze_run_command(&cmd, 10);
         assert!(
-            assertions.iter().all(|a| !matches!(
-                &a.kind,
-                AssertionKind::PackageInstalled { .. }
-            )),
+            assertions
+                .iter()
+                .all(|a| !matches!(&a.kind, AssertionKind::PackageInstalled { .. })),
             "low-value packages should not generate assertions"
         );
     }
@@ -520,7 +523,9 @@ mod tests {
 
     #[test]
     fn test_composer_flags_skipped() {
-        let cmd = CommandForm::Shell("composer require --no-dev --prefer-dist monolog/monolog".to_string());
+        let cmd = CommandForm::Shell(
+            "composer require --no-dev --prefer-dist monolog/monolog".to_string(),
+        );
         let assertions = analyze_run_command(&cmd, 10);
         // Should not have assertions for flag remnants like "no-dev" or "prefer-dist"
         assert!(assertions.iter().all(|a| {
