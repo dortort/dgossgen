@@ -42,6 +42,7 @@ pub struct ProbeConfig {
     pub target: Option<String>,
     pub build_args: Vec<(String, String)>,
     pub run_args: Vec<String>,
+    pub allow_unsafe_run_args: bool,
     pub timeout: Duration,
     pub network_isolation: bool,
 }
@@ -55,6 +56,7 @@ impl Default for ProbeConfig {
             target: None,
             build_args: Vec::new(),
             run_args: Vec::new(),
+            allow_unsafe_run_args: false,
             timeout: Duration::from_secs(60),
             network_isolation: true,
         }
@@ -81,6 +83,8 @@ pub struct ProbeEvidence {
 
 /// Run the probe pipeline: build, run, inspect, collect evidence.
 pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
+    validate_run_args(&config.run_args, config.allow_unsafe_run_args)?;
+
     let rt = config.runtime.to_string();
 
     // Step 1: Build the image
@@ -154,6 +158,95 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
     let _ = Command::new(&rt).args(["rmi", &image_tag]).output();
 
     evidence
+}
+
+fn validate_run_args(run_args: &[String], allow_unsafe: bool) -> Result<()> {
+    if allow_unsafe {
+        return Ok(());
+    }
+
+    for arg in run_args {
+        validate_single_run_arg(arg)?;
+    }
+    Ok(())
+}
+
+fn validate_single_run_arg(arg: &str) -> Result<()> {
+    if arg.trim() != arg || arg.chars().any(char::is_whitespace) {
+        bail!(
+            "invalid --run-arg '{}': only single-token flags are accepted in safe mode; use --unsafe-run-arg to bypass",
+            arg
+        );
+    }
+
+    if arg == "--read-only" || arg == "--init" {
+        return Ok(());
+    }
+
+    if let Some(value) = arg.strip_prefix("--env=") {
+        if is_valid_key_value(value) {
+            return Ok(());
+        }
+        bail!(
+            "invalid --run-arg '{}': expected --env=KEY=VALUE format; use --unsafe-run-arg to bypass",
+            arg
+        );
+    }
+
+    if let Some(value) = arg.strip_prefix("--env-file=") {
+        if !value.is_empty() && !value.starts_with('/') && !value.starts_with("..") {
+            return Ok(());
+        }
+        bail!(
+            "invalid --run-arg '{}': unsafe --env-file path; use --unsafe-run-arg to bypass",
+            arg
+        );
+    }
+
+    if arg.starts_with("--cpus=")
+        || arg.starts_with("--memory=")
+        || arg.starts_with("--memory-swap=")
+        || arg.starts_with("--cpuset-cpus=")
+        || arg.starts_with("--cpuset-mems=")
+        || arg.starts_with("--pids-limit=")
+        || arg.starts_with("--ulimit=")
+        || arg.starts_with("--tmpfs=")
+        || arg.starts_with("--user=")
+        || arg.starts_with("--workdir=")
+        || arg.starts_with("--hostname=")
+        || arg.starts_with("--shm-size=")
+    {
+        return Ok(());
+    }
+
+    if let Some(value) = arg.strip_prefix("--security-opt=") {
+        if value == "no-new-privileges" || value == "no-new-privileges:true" {
+            return Ok(());
+        }
+        bail!(
+            "invalid --run-arg '{}': only --security-opt=no-new-privileges is allowed in safe mode; use --unsafe-run-arg to bypass",
+            arg
+        );
+    }
+
+    if arg == "--ipc=private" {
+        return Ok(());
+    }
+
+    bail!(
+        "blocked --run-arg '{}': not allowlisted in safe mode; use --unsafe-run-arg to bypass",
+        arg
+    );
+}
+
+fn is_valid_key_value(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
 }
 
 fn collect_evidence(
@@ -365,5 +458,42 @@ mod tests {
 
         merge_evidence(&mut contract, &evidence);
         assert_eq!(contract.assertions[0].confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_validate_run_args_accepts_allowlisted_flags() {
+        let args = vec![
+            "--read-only".to_string(),
+            "--init".to_string(),
+            "--env=APP_ENV=prod".to_string(),
+            "--cpus=1.5".to_string(),
+            "--memory=256m".to_string(),
+            "--security-opt=no-new-privileges".to_string(),
+            "--ipc=private".to_string(),
+        ];
+        assert!(validate_run_args(&args, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_run_args_rejects_dangerous_flags_in_safe_mode() {
+        let args = vec![
+            "--privileged".to_string(),
+            "--network=host".to_string(),
+            "-v=/:/host".to_string(),
+        ];
+        for arg in args {
+            let err = validate_run_args(&[arg], false).unwrap_err().to_string();
+            assert!(err.contains("unsafe-run-arg"));
+        }
+    }
+
+    #[test]
+    fn test_validate_run_args_unsafe_mode_allows_anything() {
+        let args = vec![
+            "--privileged".to_string(),
+            "--network=host".to_string(),
+            "--volume=/tmp:/tmp".to_string(),
+        ];
+        assert!(validate_run_args(&args, true).is_ok());
     }
 }
