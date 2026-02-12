@@ -12,7 +12,7 @@ fn test_cli_help_exits_success() {
 }
 
 #[test]
-fn test_init_with_warnings_exits_before_writing_output() {
+fn test_init_with_warnings_still_writes_output() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
     let output_dir = temp.path().join("generated");
@@ -38,7 +38,7 @@ fn test_init_with_warnings_exits_before_writing_output() {
         .code(2);
 
     assert!(
-        !output_dir.join("goss.yml").exists(),
-        "goss.yml should not be written when warnings cause exit code 2"
+        output_dir.join("goss.yml").exists(),
+        "goss.yml should still be written even when warnings cause exit code 2"
     );
 }
