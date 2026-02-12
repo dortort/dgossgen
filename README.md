@@ -21,6 +21,13 @@ dgossgen ingests a Dockerfile (optionally plus build context metadata) and outpu
 
 ## Installation
 
+### Homebrew (macOS and Linux)
+
+```sh
+brew tap dortort/tap
+brew install dgossgen
+```
+
 ### From source
 
 ```sh
