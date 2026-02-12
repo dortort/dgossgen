@@ -204,6 +204,27 @@ fn is_pip_flag_remnant(pkg: &str) -> bool {
     ) || pkg.len() == 1 // single-char remnants are almost always flags
 }
 
+/// Detects remnants of composer flags after the general loop strips leading dashes.
+fn is_composer_flag_remnant(pkg: &str) -> bool {
+    matches!(
+        pkg,
+        "no-dev"
+            | "no-scripts"
+            | "no-plugins"
+            | "no-progress"
+            | "no-interaction"
+            | "no-update"
+            | "prefer-dist"
+            | "prefer-source"
+            | "prefer-stable"
+            | "optimize-autoloader"
+            | "dev"
+            | "W"
+            | "w"
+            | "n"
+    ) || pkg.len() == 1
+}
+
 /// Optional enrichment: known version-check commands for well-known packages.
 /// Returns `None` for packages where only the package-manager check is appropriate.
 fn known_version_cmd(pkg: &str) -> Option<String> {
@@ -222,6 +243,7 @@ fn known_version_cmd(pkg: &str) -> Option<String> {
         "mysql-server" => Some("mysql --version".to_string()),
         "vim" => Some("vim --version".to_string()),
         "nano" => Some("nano --version".to_string()),
+        "composer" => Some("composer --version".to_string()),
         _ => None,
     }
 }
@@ -335,6 +357,33 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
                 })
             }),
         ),
+        // composer require (PHP)
+        (
+            Regex::new(r"composer\s+require\s+(.+?)(?:\s*&&|\s*$)").unwrap(),
+            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
+                // Skip flags (remnants after dash-stripping)
+                if is_composer_flag_remnant(pkg) {
+                    return None;
+                }
+                // Composer packages are vendor/package — keep as-is
+                // Strip version constraint if present (e.g. "monolog/monolog:^2.0" -> "monolog/monolog")
+                let pkg_name = pkg.split(&[':', ' '][..]).next().unwrap_or(pkg);
+                if pkg_name.is_empty() || !pkg_name.contains('/') {
+                    // Valid composer packages always have vendor/name format
+                    return None;
+                }
+                Some(ContractAssertion {
+                    kind: AssertionKind::PackageInstalled {
+                        package: pkg_name.to_string(),
+                        manager: PackageManager::Composer,
+                        version_cmd: None,
+                    },
+                    provenance: format!("RUN composer require {}", pkg_name),
+                    source_line: line,
+                    confidence: Confidence::Low,
+                })
+            }),
+        ),
     ]
 }
 
@@ -439,6 +488,48 @@ mod tests {
             )),
             "low-value packages should not generate assertions"
         );
+    }
+
+    #[test]
+    fn test_detect_composer_package() {
+        let cmd = CommandForm::Shell("composer require monolog/monolog".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Composer,
+                version_cmd: None,
+            } if package == "monolog/monolog"
+        )));
+    }
+
+    #[test]
+    fn test_detect_composer_package_with_version_constraint() {
+        let cmd = CommandForm::Shell("composer require symfony/console:^6.0".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Composer,
+                ..
+            } if package == "symfony/console"
+        )));
+    }
+
+    #[test]
+    fn test_composer_flags_skipped() {
+        let cmd = CommandForm::Shell("composer require --no-dev --prefer-dist monolog/monolog".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        // Should not have assertions for flag remnants like "no-dev" or "prefer-dist"
+        assert!(assertions.iter().all(|a| {
+            if let AssertionKind::PackageInstalled { package, .. } = &a.kind {
+                package.contains('/')
+            } else {
+                true
+            }
+        }));
     }
 
     #[test]

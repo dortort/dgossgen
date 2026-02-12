@@ -294,6 +294,9 @@ fn build_main_resources(
                     PackageManager::Apk => format!("apk info -e {}", sanitize_shell_arg(package)),
                     PackageManager::Pip => format!("pip show {}", sanitize_shell_arg(package)),
                     PackageManager::Npm => format!("npm list -g {}", sanitize_shell_arg(package)),
+                    PackageManager::Composer => {
+                        format!("composer show {}", sanitize_shell_arg(package))
+                    }
                 };
                 resources.push(GossResource::Command {
                     name: format!("package-{}", command_to_name(package)),

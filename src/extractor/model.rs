@@ -124,4 +124,5 @@ pub enum PackageManager {
     Apk,
     Pip,
     Npm,
+    Composer,
 }
