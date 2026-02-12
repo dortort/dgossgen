@@ -58,55 +58,80 @@ impl VariableResolver {
     /// Resolve ${VAR} and $VAR references in a string.
     pub fn resolve(&self, input: &str) -> String {
         let mut result = String::with_capacity(input.len());
-        let chars: Vec<char> = input.chars().collect();
-        let mut i = 0;
+        let mut iter = input.char_indices().peekable();
 
-        while i < chars.len() {
-            if chars[i] == '$' && i + 1 < chars.len() {
-                if chars[i + 1] == '{' {
-                    // ${VAR} or ${VAR:-default} form
-                    if let Some(close) = input[i..].find('}') {
-                        let var_expr = &input[i + 2..i + close];
-                        let (var_name, default) = if let Some(sep) = var_expr.find(":-") {
-                            (&var_expr[..sep], Some(&var_expr[sep + 2..]))
-                        } else if let Some(sep) = var_expr.find('-') {
-                            (&var_expr[..sep], Some(&var_expr[sep + 1..]))
-                        } else {
-                            (var_expr, None)
-                        };
+        while let Some((idx, ch)) = iter.next() {
+            if ch != '$' {
+                result.push(ch);
+                continue;
+            }
 
-                        if let Some(val) = self.vars.get(var_name) {
-                            result.push_str(val);
-                        } else if let Some(def) = default {
-                            result.push_str(def);
-                        } else {
-                            // Keep the original reference (symbolic)
-                            result.push_str(&input[i..i + close + 1]);
-                        }
-                        i += close + 1;
-                        continue;
+            let Some((next_idx, next_ch)) = iter.peek().copied() else {
+                result.push('$');
+                continue;
+            };
+
+            if next_ch == '{' {
+                iter.next(); // consume '{'
+                let expr_start = next_idx + next_ch.len_utf8();
+                let mut close_idx = None;
+
+                for (pos, current) in iter.by_ref() {
+                    if current == '}' {
+                        close_idx = Some(pos);
+                        break;
                     }
-                } else if chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_' {
-                    // $VAR form
-                    let start = i + 1;
-                    let mut end = start;
-                    while end < chars.len()
-                        && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
-                    {
-                        end += 1;
-                    }
-                    let var_name = &input[start..end];
+                }
+
+                if let Some(end_idx) = close_idx {
+                    let var_expr = &input[expr_start..end_idx];
+                    let (var_name, default) = if let Some(sep) = var_expr.find(":-") {
+                        (&var_expr[..sep], Some(&var_expr[sep + 2..]))
+                    } else if let Some(sep) = var_expr.find('-') {
+                        (&var_expr[..sep], Some(&var_expr[sep + 1..]))
+                    } else {
+                        (var_expr, None)
+                    };
+
                     if let Some(val) = self.vars.get(var_name) {
                         result.push_str(val);
+                    } else if let Some(def) = default {
+                        result.push_str(def);
                     } else {
-                        result.push_str(&input[i..end]);
+                        result.push_str(&input[idx..end_idx + 1]);
                     }
-                    i = end;
-                    continue;
+                } else {
+                    // Unterminated ${...}: preserve the tail literally.
+                    result.push_str(&input[idx..]);
+                    break;
                 }
+                continue;
             }
-            result.push(chars[i]);
-            i += 1;
+
+            if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+                iter.next(); // consume first var-name char
+                let name_start = next_idx;
+                let mut name_end = name_start + next_ch.len_utf8();
+
+                while let Some((pos, current)) = iter.peek().copied() {
+                    if current.is_ascii_alphanumeric() || current == '_' {
+                        name_end = pos + current.len_utf8();
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                let var_name = &input[name_start..name_end];
+                if let Some(val) = self.vars.get(var_name) {
+                    result.push_str(val);
+                } else {
+                    result.push_str(&input[idx..name_end]);
+                }
+                continue;
+            }
+
+            result.push('$');
         }
 
         result
@@ -115,13 +140,66 @@ impl VariableResolver {
     /// Check if a string contains unresolved variables.
     pub fn has_unresolved(&self, input: &str) -> bool {
         let resolved = self.resolve(input);
-        resolved.contains('$')
+        contains_variable_reference(&resolved)
     }
 
     /// Get current variable map.
     pub fn variables(&self) -> &HashMap<String, String> {
         &self.vars
     }
+}
+
+fn contains_variable_reference(input: &str) -> bool {
+    let mut iter = input.char_indices().peekable();
+    while let Some((_, ch)) = iter.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        let Some((_, next_ch)) = iter.peek().copied() else {
+            continue;
+        };
+
+        if next_ch == '{' {
+            iter.next(); // consume '{'
+            let mut name = String::new();
+            while let Some((_, current)) = iter.peek().copied() {
+                iter.next();
+                if current == '}' {
+                    if is_valid_var_name(&name) {
+                        return true;
+                    }
+                    break;
+                }
+                name.push(current);
+            }
+            continue;
+        }
+
+        if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_valid_var_name(expr: &str) -> bool {
+    let var_name = if let Some(sep) = expr.find(":-") {
+        &expr[..sep]
+    } else if let Some(sep) = expr.find('-') {
+        &expr[..sep]
+    } else {
+        expr
+    };
+
+    let mut chars = var_name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -154,5 +232,20 @@ mod tests {
         let mut resolver = VariableResolver::new();
         resolver.vars.insert("APP".to_string(), "myapp".to_string());
         assert_eq!(resolver.resolve("/opt/$APP/config"), "/opt/myapp/config");
+    }
+
+    #[test]
+    fn test_resolve_unicode_input_without_panicking() {
+        let mut resolver = VariableResolver::new();
+        resolver.vars.insert("APP".to_string(), "servico".to_string());
+        assert_eq!(resolver.resolve("π/$APP/ß"), "π/servico/ß");
+    }
+
+    #[test]
+    fn test_has_unresolved_ignores_literal_dollar_usage() {
+        let resolver = VariableResolver::new();
+        assert!(!resolver.has_unresolved("Price is $5.00"));
+        assert!(!resolver.has_unresolved("echo $$"));
+        assert!(!resolver.has_unresolved("status is $?"));
     }
 }
