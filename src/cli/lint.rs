@@ -97,8 +97,6 @@ mod tests {
         let yaml = "file:\n  /tmp/file:\n    exists: true\n";
         let mut issues = Vec::new();
         lint_goss_content(yaml, "goss.yml", &mut issues);
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("ephemeral path")));
+        assert!(issues.iter().any(|i| i.message.contains("ephemeral path")));
     }
 }

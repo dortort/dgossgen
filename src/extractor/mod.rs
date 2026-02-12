@@ -427,10 +427,12 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
         let entrypoint_assertions: Vec<_> = contract
             .assertions
             .iter()
-            .filter(|a| matches!(
-                &a.kind,
-                AssertionKind::FileExists { path, .. } if path == "/docker-entrypoint.sh"
-            ))
+            .filter(|a| {
+                matches!(
+                    &a.kind,
+                    AssertionKind::FileExists { path, .. } if path == "/docker-entrypoint.sh"
+                )
+            })
             .collect();
         assert_eq!(entrypoint_assertions.len(), 1);
         assert!(matches!(

@@ -237,7 +237,9 @@ mod tests {
     #[test]
     fn test_resolve_unicode_input_without_panicking() {
         let mut resolver = VariableResolver::new();
-        resolver.vars.insert("APP".to_string(), "servico".to_string());
+        resolver
+            .vars
+            .insert("APP".to_string(), "servico".to_string());
         assert_eq!(resolver.resolve("π/$APP/ß"), "π/servico/ß");
     }
 

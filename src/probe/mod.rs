@@ -243,7 +243,10 @@ fn is_valid_key_value(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
 }
 
-fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<std::process::Output> {
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let mut child = command.spawn().with_context(|| "spawning command")?;
@@ -251,7 +254,9 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<s
 
     loop {
         if let Some(_status) = child.try_wait().with_context(|| "polling command status")? {
-            return child.wait_with_output().with_context(|| "collecting command output");
+            return child
+                .wait_with_output()
+                .with_context(|| "collecting command output");
         }
 
         if started.elapsed() >= timeout {

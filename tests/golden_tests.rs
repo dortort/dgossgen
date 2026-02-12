@@ -207,11 +207,13 @@ fn test_complex_healthcheck_entrypoint_script_detection() {
     let entrypoint_assertions: Vec<_> = contract
         .assertions
         .iter()
-        .filter(|a| matches!(
-            &a.kind,
-            AssertionKind::FileExists { path, mode, .. }
-                if path == "/docker-entrypoint.sh" && mode.as_deref() == Some("0755")
-        ))
+        .filter(|a| {
+            matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, mode, .. }
+                    if path == "/docker-entrypoint.sh" && mode.as_deref() == Some("0755")
+            )
+        })
         .collect();
     assert_eq!(entrypoint_assertions.len(), 1);
 }
