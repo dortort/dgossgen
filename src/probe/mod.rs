@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::extractor::{AssertionKind, ContractAssertion, RuntimeContract};
 use crate::Confidence;
@@ -86,9 +87,11 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
     validate_run_args(&config.run_args, config.allow_unsafe_run_args)?;
 
     let rt = config.runtime.to_string();
+    let image_tag = format!("dgossgen-probe-{}", std::process::id());
+    let container_name = format!("dgossgen-probe-{}", std::process::id());
+    let cleanup = ProbeCleanup::new(rt.clone(), container_name.clone(), image_tag.clone());
 
     // Step 1: Build the image
-    let image_tag = format!("dgossgen-probe-{}", std::process::id());
     let mut build_cmd = Command::new(&rt);
     build_cmd.arg("build");
 
@@ -117,9 +120,9 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
             String::from_utf8_lossy(&build_output.stderr)
         );
     }
+    cleanup.mark_image_created();
 
     // Step 2: Run the container
-    let container_name = format!("dgossgen-probe-{}", std::process::id());
     let mut run_cmd = Command::new(&rt);
     run_cmd.args(["run", "-d", "--name", &container_name]);
 
@@ -139,25 +142,16 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
         .with_context(|| format!("running {} run", rt))?;
 
     if !run_output.status.success() {
-        // Clean up image
-        let _ = Command::new(&rt).args(["rmi", &image_tag]).output();
         bail!(
             "{} run failed:\n{}",
             rt,
             String::from_utf8_lossy(&run_output.stderr)
         );
     }
+    cleanup.mark_container_created();
 
     // Step 3: Collect evidence (with timeout)
-    let evidence = collect_evidence(&rt, &container_name, &image_tag, config.timeout);
-
-    // Step 4: Clean up
-    let _ = Command::new(&rt)
-        .args(["rm", "-f", &container_name])
-        .output();
-    let _ = Command::new(&rt).args(["rmi", &image_tag]).output();
-
-    evidence
+    collect_evidence(&rt, &container_name, &image_tag, config.timeout)
 }
 
 fn validate_run_args(run_args: &[String], allow_unsafe: bool) -> Result<()> {
@@ -249,19 +243,85 @@ fn is_valid_key_value(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
 }
 
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<std::process::Output> {
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| "spawning command")?;
+    let started = Instant::now();
+
+    loop {
+        if let Some(_status) = child.try_wait().with_context(|| "polling command status")? {
+            return child.wait_with_output().with_context(|| "collecting command output");
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("command timed out after {:?}", timeout);
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Debug)]
+struct ProbeCleanup {
+    runtime: String,
+    container_name: String,
+    image_tag: String,
+    container_created: AtomicBool,
+    image_created: AtomicBool,
+}
+
+impl ProbeCleanup {
+    fn new(runtime: String, container_name: String, image_tag: String) -> Self {
+        Self {
+            runtime,
+            container_name,
+            image_tag,
+            container_created: AtomicBool::new(false),
+            image_created: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_container_created(&self) {
+        self.container_created.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_image_created(&self) {
+        self.image_created.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ProbeCleanup {
+    fn drop(&mut self) {
+        if self.container_created.load(Ordering::Relaxed) {
+            let _ = Command::new(&self.runtime)
+                .args(["rm", "-f", &self.container_name])
+                .output();
+        }
+
+        if self.image_created.load(Ordering::Relaxed) {
+            let _ = Command::new(&self.runtime)
+                .args(["rmi", &self.image_tag])
+                .output();
+        }
+    }
+}
+
 fn collect_evidence(
     runtime: &str,
     container: &str,
     image: &str,
-    _timeout: Duration,
+    timeout: Duration,
 ) -> Result<ProbeEvidence> {
     let mut evidence = ProbeEvidence::default();
 
     // Inspect the image
-    let inspect_output = Command::new(runtime)
-        .args(["image", "inspect", image])
-        .output()
-        .with_context(|| "image inspect")?;
+    let mut inspect_cmd = Command::new(runtime);
+    inspect_cmd.args(["image", "inspect", image]);
+    let inspect_output =
+        run_command_with_timeout(inspect_cmd, timeout).with_context(|| "image inspect")?;
 
     if inspect_output.status.success() {
         let json_str = String::from_utf8_lossy(&inspect_output.stdout);
@@ -271,9 +331,9 @@ fn collect_evidence(
     }
 
     // Check running processes
-    let ps_output = Command::new(runtime)
-        .args(["exec", container, "ps", "aux"])
-        .output();
+    let mut ps_cmd = Command::new(runtime);
+    ps_cmd.args(["exec", container, "ps", "aux"]);
+    let ps_output = run_command_with_timeout(ps_cmd, timeout);
 
     if let Ok(output) = ps_output {
         if output.status.success() {
@@ -289,9 +349,9 @@ fn collect_evidence(
     }
 
     // Check open ports (via ss or netstat)
-    let ss_output = Command::new(runtime)
-        .args(["exec", container, "ss", "-tlnp"])
-        .output();
+    let mut ss_cmd = Command::new(runtime);
+    ss_cmd.args(["exec", container, "ss", "-tlnp"]);
+    let ss_output = run_command_with_timeout(ss_cmd, timeout);
 
     if let Ok(output) = ss_output {
         if output.status.success() {
@@ -305,9 +365,9 @@ fn collect_evidence(
     }
 
     // Check user
-    let id_output = Command::new(runtime)
-        .args(["exec", container, "id"])
-        .output();
+    let mut id_cmd = Command::new(runtime);
+    id_cmd.args(["exec", container, "id"]);
+    let id_output = run_command_with_timeout(id_cmd, timeout);
 
     if let Ok(output) = id_output {
         if output.status.success() {
@@ -317,9 +377,9 @@ fn collect_evidence(
     }
 
     // Check env (filtered)
-    let env_output = Command::new(runtime)
-        .args(["exec", container, "env"])
-        .output();
+    let mut env_cmd = Command::new(runtime);
+    env_cmd.args(["exec", container, "env"]);
+    let env_output = run_command_with_timeout(env_cmd, timeout);
 
     if let Ok(output) = env_output {
         if output.status.success() {
@@ -495,5 +555,35 @@ mod tests {
             "--volume=/tmp:/tmp".to_string(),
         ];
         assert!(validate_run_args(&args, true).is_ok());
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_success() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf ok"]);
+        let output = run_command_with_timeout(cmd, Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+    }
+
+    #[test]
+    fn test_run_command_with_timeout_kills_hanging_command() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 1"]);
+        let err = run_command_with_timeout(cmd, Duration::from_millis(10))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn test_probe_cleanup_drop_is_non_fatal_without_runtime() {
+        let cleanup = ProbeCleanup::new(
+            "runtime-does-not-exist".to_string(),
+            "container".to_string(),
+            "image".to_string(),
+        );
+        cleanup.mark_container_created();
+        cleanup.mark_image_created();
     }
 }
