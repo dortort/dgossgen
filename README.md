@@ -27,6 +27,8 @@ dgossgen ingests a Dockerfile (optionally plus build context metadata) and outpu
 curl -fsSL https://raw.githubusercontent.com/dortort/dgossgen/main/install.sh | sh
 ```
 
+The installer verifies the downloaded archive against the published `.sha256` checksum before installing.
+
 To install to a custom directory:
 
 ```sh
