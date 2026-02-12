@@ -21,6 +21,18 @@ dgossgen ingests a Dockerfile (optionally plus build context metadata) and outpu
 
 ## Installation
 
+### One-liner (macOS and Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dortort/dgossgen/main/install.sh | sh
+```
+
+To install to a custom directory:
+
+```sh
+INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/dortort/dgossgen/main/install.sh | sh
+```
+
 ### Homebrew (macOS and Linux)
 
 ```sh
