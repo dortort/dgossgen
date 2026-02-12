@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ast::{Instruction, Stage};
+use super::ast::{ArgInstruction, Instruction, Stage};
 
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
@@ -18,6 +18,17 @@ impl VariableResolver {
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
             self.vars.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// Load ARGs declared before the first FROM.
+    pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
+        for arg in args {
+            if !self.vars.contains_key(&arg.name) {
+                if let Some(default) = &arg.default {
+                    self.vars.insert(arg.name.clone(), default.clone());
+                }
+            }
         }
     }
 

@@ -20,10 +20,11 @@ pub fn extract_contract(
 
     let mut resolver = VariableResolver::new();
     resolver.load_build_args(build_args);
+    resolver.load_global_args(&dockerfile.global_args);
     resolver.process_stage(stage);
 
     let mut contract = RuntimeContract {
-        base_image: stage.image.clone(),
+        base_image: resolver.resolve(&stage.image),
         ..Default::default()
     };
 
@@ -58,9 +59,10 @@ pub fn extract_contract(
 
                 if resolved.chars().all(|c| c.is_ascii_digit()) {
                     contract.assertions.push(ContractAssertion {
-                        kind: AssertionKind::CommandExit {
-                            command: format!("id -u | grep -q {}", resolved),
+                        kind: AssertionKind::CommandOutput {
+                            command: "id -u".to_string(),
                             exit_status: 0,
+                            expected_output: vec![resolved.clone()],
                         },
                         provenance: format!("USER {}", user),
                         source_line: inst.line_number,
@@ -381,7 +383,37 @@ USER 1001
         let contract = extract_contract(&df, None, &[]);
         assert!(contract.assertions.iter().any(|a| matches!(
             &a.kind,
-            AssertionKind::CommandExit { command, .. } if command.contains("1001")
+            AssertionKind::CommandOutput {
+                command,
+                expected_output,
+                ..
+            } if command == "id -u" && expected_output == &vec!["1001".to_string()]
         )));
+    }
+
+    #[test]
+    fn test_global_arg_resolves_base_image() {
+        let content = r#"
+ARG BASE_IMAGE=ubuntu:22.04
+FROM $BASE_IMAGE
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.base_image, "ubuntu:22.04");
+    }
+
+    #[test]
+    fn test_build_arg_overrides_global_arg_for_base_image() {
+        let content = r#"
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("BASE_IMAGE".to_string(), "alpine:3.20".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:3.20");
     }
 }
