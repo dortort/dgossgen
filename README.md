@@ -36,8 +36,7 @@ INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/dortort/dg
 ### Homebrew (macOS and Linux)
 
 ```sh
-brew tap dortort/tap
-brew install dgossgen
+brew install dortort/tap/dgossgen
 ```
 
 ### From source
