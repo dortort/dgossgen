@@ -277,10 +277,13 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             for w in &output.warnings {
                 eprintln!("{} {}", style("warning:").yellow(), w);
             }
-            return Ok(ExitCode::from(2));
         }
 
         output::write_output(&common.output_dir, &output)?;
+
+        if !output.warnings.is_empty() {
+            return Ok(ExitCode::from(2));
+        }
     }
 
     if common.editor {
