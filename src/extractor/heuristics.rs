@@ -1,7 +1,9 @@
 use crate::parser::CommandForm;
 use crate::Confidence;
 
-use super::model::*;
+use super::model::{
+    AssertionKind, ComponentKind, ContractAssertion, InstalledComponent, PackageManager,
+};
 use regex::Regex;
 
 /// Analyze a RUN command for installed packages and generate assertions.
@@ -165,6 +167,65 @@ pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<Con
     assertions
 }
 
+/// Packages that are low-value for assertion purposes (build-time deps, meta-packages).
+fn is_low_value_package(pkg: &str) -> bool {
+    matches!(
+        pkg,
+        "ca-certificates"
+            | "gnupg"
+            | "gnupg2"
+            | "apt-transport-https"
+            | "software-properties-common"
+            | "lsb-release"
+            | "dirmngr"
+    )
+}
+
+/// Detects remnants of pip flags after the general loop strips leading dashes.
+/// E.g. "--no-cache-dir" becomes "no-cache-dir", "-r" becomes "r".
+fn is_pip_flag_remnant(pkg: &str) -> bool {
+    matches!(
+        pkg,
+        "no-cache-dir"
+            | "no-deps"
+            | "no-build-isolation"
+            | "no-binary"
+            | "prefer-binary"
+            | "user"
+            | "upgrade"
+            | "force-reinstall"
+            | "pre"
+            | "quiet"
+            | "verbose"
+            | "r"
+            | "q"
+            | "U"
+            | "e"
+    ) || pkg.len() == 1 // single-char remnants are almost always flags
+}
+
+/// Optional enrichment: known version-check commands for well-known packages.
+/// Returns `None` for packages where only the package-manager check is appropriate.
+fn known_version_cmd(pkg: &str) -> Option<String> {
+    match pkg {
+        "nginx" => Some("nginx -v".to_string()),
+        "curl" => Some("curl --version".to_string()),
+        "wget" => Some("wget --version".to_string()),
+        "python3" | "python" => Some("python3 --version".to_string()),
+        "nodejs" | "node" => Some("node --version".to_string()),
+        "git" => Some("git --version".to_string()),
+        "java" | "default-jre" | "default-jdk" => Some("java -version".to_string()),
+        "ruby" => Some("ruby --version".to_string()),
+        "php" => Some("php --version".to_string()),
+        "redis" | "redis-server" => Some("redis-cli --version".to_string()),
+        "postgres" | "postgresql" => Some("postgres --version".to_string()),
+        "mysql-server" => Some("mysql --version".to_string()),
+        "vim" => Some("vim --version".to_string()),
+        "nano" => Some("nano --version".to_string()),
+        _ => None,
+    }
+}
+
 /// Package install pattern detectors.
 type PatternDetector = Box<dyn Fn(&str, usize) -> Option<ContractAssertion>>;
 
@@ -174,11 +235,14 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
         (
             Regex::new(r"apt-get\s+install\s+(?:-y\s+)?(.+?)(?:\s*&&|\s*$)").unwrap(),
             Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                let known = known_apt_package_version_cmd(pkg)?;
+                if is_low_value_package(pkg) {
+                    return None;
+                }
                 Some(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
-                        command: known,
-                        exit_status: 0,
+                    kind: AssertionKind::PackageInstalled {
+                        package: pkg.to_string(),
+                        manager: PackageManager::Apt,
+                        version_cmd: known_version_cmd(pkg),
                     },
                     provenance: format!("RUN apt-get install {}", pkg),
                     source_line: line,
@@ -190,11 +254,14 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
         (
             Regex::new(r"apk\s+add\s+(?:--no-cache\s+)?(.+?)(?:\s*&&|\s*$)").unwrap(),
             Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                let known = known_apk_package_version_cmd(pkg)?;
+                if is_low_value_package(pkg) {
+                    return None;
+                }
                 Some(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
-                        command: known,
-                        exit_status: 0,
+                    kind: AssertionKind::PackageInstalled {
+                        package: pkg.to_string(),
+                        manager: PackageManager::Apk,
+                        version_cmd: known_version_cmd(pkg),
                     },
                     provenance: format!("RUN apk add {}", pkg),
                     source_line: line,
@@ -205,59 +272,70 @@ fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
         // pip install
         (
             Regex::new(r"pip3?\s+install\s+(.+?)(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|_pkg: &str, line: usize| -> Option<ContractAssertion> {
+            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
+                // The general loop already strips leading dashes, so we see
+                // flag remnants like "no-cache-dir", "r", "q" etc. Filter them.
+                if is_pip_flag_remnant(pkg) {
+                    return None;
+                }
+                // Skip requirements file references
+                if pkg.ends_with(".txt") || pkg.ends_with(".cfg") || pkg.contains('/') || pkg == "." {
+                    return None;
+                }
+                // Strip version specifiers (e.g. "flask==2.0" -> "flask")
+                let pkg_name = pkg.split(&['=', '>', '<', '!', '~', '['][..]).next().unwrap_or(pkg);
+                if pkg_name.is_empty() {
+                    return None;
+                }
                 Some(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
-                        command: "python3 --version".to_string(),
-                        exit_status: 0,
+                    kind: AssertionKind::PackageInstalled {
+                        package: pkg_name.to_string(),
+                        manager: PackageManager::Pip,
+                        version_cmd: known_version_cmd(pkg_name),
                     },
-                    provenance: "RUN pip install".to_string(),
+                    provenance: format!("RUN pip install {}", pkg_name),
                     source_line: line,
                     confidence: Confidence::Low,
                 })
             }),
         ),
-        // npm install
+        // npm install (global or named packages)
         (
             Regex::new(r"npm\s+(?:install|ci)(?:\s+(.+?))?(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|_pkg: &str, line: usize| -> Option<ContractAssertion> {
+            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
+                // npm ci / npm install (no args) installs from package.json — no specific package to assert
+                if pkg.is_empty() || pkg.starts_with('-') {
+                    return None;
+                }
+                // Strip version specifiers (@scope/pkg@version -> @scope/pkg)
+                let pkg_name = if pkg.starts_with('@') {
+                    // Scoped package: @scope/name@version
+                    if let Some(at_pos) = pkg[1..].find('@') {
+                        &pkg[..at_pos + 1]
+                    } else {
+                        pkg
+                    }
+                } else if let Some(at_pos) = pkg.find('@') {
+                    &pkg[..at_pos]
+                } else {
+                    pkg
+                };
+                if pkg_name.is_empty() {
+                    return None;
+                }
                 Some(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
-                        command: "node --version".to_string(),
-                        exit_status: 0,
+                    kind: AssertionKind::PackageInstalled {
+                        package: pkg_name.to_string(),
+                        manager: PackageManager::Npm,
+                        version_cmd: known_version_cmd(pkg_name),
                     },
-                    provenance: "RUN npm install".to_string(),
+                    provenance: format!("RUN npm install {}", pkg_name),
                     source_line: line,
                     confidence: Confidence::Low,
                 })
             }),
         ),
     ]
-}
-
-fn known_apt_package_version_cmd(pkg: &str) -> Option<String> {
-    match pkg {
-        "nginx" => Some("nginx -v".to_string()),
-        "curl" => Some("curl --version".to_string()),
-        "wget" => Some("wget --version".to_string()),
-        "python3" => Some("python3 --version".to_string()),
-        "nodejs" | "node" => Some("node --version".to_string()),
-        "git" => Some("git --version".to_string()),
-        "vim" | "nano" | "ca-certificates" | "gnupg" => None, // Skip low-value
-        _ => None,
-    }
-}
-
-fn known_apk_package_version_cmd(pkg: &str) -> Option<String> {
-    match pkg {
-        "nginx" => Some("nginx -v".to_string()),
-        "curl" => Some("curl --version".to_string()),
-        "wget" => Some("wget --version".to_string()),
-        "python3" => Some("python3 --version".to_string()),
-        "nodejs" | "node" => Some("node --version".to_string()),
-        "git" => Some("git --version".to_string()),
-        _ => None,
-    }
 }
 
 /// Detect user creation commands.
@@ -292,8 +370,75 @@ mod tests {
         let assertions = analyze_run_command(&cmd, 5);
         assert!(assertions.iter().any(|a| matches!(
             &a.kind,
-            AssertionKind::CommandExit { command, .. } if command == "nginx -v"
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Apt,
+                version_cmd: Some(_),
+            } if package == "nginx"
         )));
+    }
+
+    #[test]
+    fn test_detect_unknown_apt_package() {
+        let cmd = CommandForm::Shell("apt-get install -y myfancyapp".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Apt,
+                version_cmd: None,
+            } if package == "myfancyapp"
+        )));
+    }
+
+    #[test]
+    fn test_detect_unknown_apk_package() {
+        let cmd = CommandForm::Shell("apk add --no-cache somelib".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Apk,
+                version_cmd: None,
+            } if package == "somelib"
+        )));
+    }
+
+    #[test]
+    fn test_detect_pip_package() {
+        let cmd = CommandForm::Shell("pip install flask requests".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Pip,
+                ..
+            } if package == "flask"
+        )));
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Pip,
+                ..
+            } if package == "requests"
+        )));
+    }
+
+    #[test]
+    fn test_low_value_packages_skipped() {
+        let cmd = CommandForm::Shell("apt-get install -y ca-certificates gnupg".to_string());
+        let assertions = analyze_run_command(&cmd, 10);
+        assert!(
+            assertions.iter().all(|a| !matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled { .. }
+            )),
+            "low-value packages should not generate assertions"
+        );
     }
 
     #[test]
