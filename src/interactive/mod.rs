@@ -244,9 +244,16 @@ fn print_contract_summary(contract: &RuntimeContract) {
 /// Open a file in the user's preferred editor.
 pub fn open_in_editor(path: &str) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    std::process::Command::new(&editor)
+    let status = std::process::Command::new(&editor)
         .arg(path)
         .status()
         .map_err(|e| anyhow::anyhow!("failed to open editor '{}': {}", editor, e))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "editor '{}' exited with status {}",
+            editor,
+            status
+        ));
+    }
     Ok(())
 }

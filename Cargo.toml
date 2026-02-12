@@ -17,7 +17,6 @@ dialoguer = "0.11"
 
 # Pretty output
 console = "0.15"
-indicatif = "0.17"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -26,7 +25,6 @@ serde_json = "1"
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
 
 # Regex for heuristic parsing
 regex = "1"
@@ -35,10 +33,6 @@ regex = "1"
 log = "0.4"
 env_logger = "0.11"
 
-# Linked hash map for stable ordering
-indexmap = { version = "2", features = ["serde"] }
-
 [dev-dependencies]
 tempfile = "3"
-pretty_assertions = "1"
-insta = { version = "1", features = ["yaml"] }
+assert_cmd = "2"
