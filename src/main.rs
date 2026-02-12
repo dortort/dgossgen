@@ -273,14 +273,14 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
-        output::write_output(&common.output_dir, &output)?;
-
         if !output.warnings.is_empty() {
             for w in &output.warnings {
                 eprintln!("{} {}", style("warning:").yellow(), w);
             }
             return Ok(ExitCode::from(2));
         }
+
+        output::write_output(&common.output_dir, &output)?;
     }
 
     if common.editor {
@@ -353,14 +353,14 @@ fn cmd_probe(
     };
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
-    output::write_output(&common.output_dir, &output)?;
-
     if !output.warnings.is_empty() {
         for w in &output.warnings {
             eprintln!("{} {}", style("warning:").yellow(), w);
         }
         return Ok(ExitCode::from(2));
     }
+
+    output::write_output(&common.output_dir, &output)?;
 
     Ok(ExitCode::SUCCESS)
 }

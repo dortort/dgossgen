@@ -164,7 +164,7 @@ jobs:
           sed -i 's/^          //' dgossgen.rb
 
       - name: Push to Homebrew tap
-        uses: dmnemec/copy_file_to_another_repo_action@main
+        uses: dmnemec/copy_file_to_another_repo_action@bbebd3da22e4a37d04dca5f782edd5201cb97083
         env:
           API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         with:
