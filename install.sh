@@ -48,13 +48,40 @@ if [ -z "$VERSION" ]; then
 fi
 
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}-${TARGET}.tar.gz"
+SHA_URL="${URL}.sha256"
 
 echo "Installing ${BINARY} ${VERSION} (${TARGET})..."
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-$fetch "$URL" | tar xz -C "$TMPDIR"
+ARCHIVE="${TMPDIR}/${BINARY}-${TARGET}.tar.gz"
+CHECKSUM_FILE="${ARCHIVE}.sha256"
+
+$fetch "$URL" > "$ARCHIVE"
+$fetch "$SHA_URL" > "$CHECKSUM_FILE"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_sha=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual_sha=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+else
+  echo "error: sha256sum or shasum is required for checksum verification" >&2
+  exit 1
+fi
+
+expected_sha=$(awk '{print $1}' "$CHECKSUM_FILE" | head -1)
+if [ -z "$expected_sha" ]; then
+  echo "error: release checksum file is empty or invalid" >&2
+  exit 1
+fi
+
+if [ "$actual_sha" != "$expected_sha" ]; then
+  echo "error: checksum verification failed for downloaded archive" >&2
+  exit 1
+fi
+
+tar xz -f "$ARCHIVE" -C "$TMPDIR"
 
 if [ ! -f "${TMPDIR}/${BINARY}" ]; then
   echo "error: binary not found in archive" >&2; exit 1
