@@ -202,19 +202,23 @@ pub fn extract_contract(
                 let confidence = Confidence::Medium;
 
                 let is_dir = full_dest.ends_with('/');
-                let filetype = if is_dir {
+                let is_entrypoint_script = is_entrypoint_path(&full_dest);
+                let filetype = if is_entrypoint_script {
+                    Some("file".to_string())
+                } else if is_dir {
                     Some("directory".to_string())
                 } else {
-                    None // Could be file or directory
+                    None
                 };
-
-                contract.assertions.push(ContractAssertion {
-                    kind: AssertionKind::FileExists {
-                        path: full_dest.clone(),
-                        filetype,
-                        mode: chmod.clone(),
-                    },
-                    provenance: format!(
+                let mode = if is_entrypoint_script {
+                    chmod.clone().or_else(|| Some("0755".to_string()))
+                } else {
+                    chmod.clone()
+                };
+                let provenance = if is_entrypoint_script {
+                    format!("COPY {} (entrypoint script pattern)", dest)
+                } else {
+                    format!(
                         "COPY {} {}",
                         if from_stage.is_some() {
                             format!("--from={}", from_stage.as_ref().unwrap())
@@ -224,25 +228,19 @@ pub fn extract_contract(
                         dest
                     )
                     .trim()
-                    .to_string(),
+                    .to_string()
+                };
+
+                contract.assertions.push(ContractAssertion {
+                    kind: AssertionKind::FileExists {
+                        path: full_dest.clone(),
+                        filetype,
+                        mode,
+                    },
+                    provenance,
                     source_line: inst.line_number,
                     confidence,
                 });
-
-                // Check for entrypoint scripts
-                if is_entrypoint_path(&full_dest) {
-                    let mode = chmod.clone().or_else(|| Some("0755".to_string()));
-                    contract.assertions.push(ContractAssertion {
-                        kind: AssertionKind::FileExists {
-                            path: full_dest.clone(),
-                            filetype: Some("file".to_string()),
-                            mode,
-                        },
-                        provenance: format!("COPY {} (entrypoint script pattern)", dest),
-                        source_line: inst.line_number,
-                        confidence: Confidence::Medium,
-                    });
-                }
 
                 contract.filesystem_paths.push(full_dest);
             }
@@ -415,5 +413,33 @@ FROM ${BASE_IMAGE}
             &[("BASE_IMAGE".to_string(), "alpine:3.20".to_string())],
         );
         assert_eq!(contract.base_image, "alpine:3.20");
+    }
+
+    #[test]
+    fn test_entrypoint_copy_generates_single_mode_aware_file_assertion() {
+        let content = r#"
+FROM alpine
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let entrypoint_assertions: Vec<_> = contract
+            .assertions
+            .iter()
+            .filter(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path == "/docker-entrypoint.sh"
+            ))
+            .collect();
+        assert_eq!(entrypoint_assertions.len(), 1);
+        assert!(matches!(
+            &entrypoint_assertions[0].kind,
+            AssertionKind::FileExists {
+                filetype: Some(ft),
+                mode: Some(mode),
+                ..
+            } if ft == "file" && mode == "0755"
+        ));
     }
 }

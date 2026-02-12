@@ -334,11 +334,48 @@ fn build_main_resources(
 
 /// Deduplicate resources by their identity key.
 fn deduplicate_resources(resources: &mut Vec<GossResource>) {
-    let mut seen = std::collections::HashSet::new();
-    resources.retain(|r| {
-        let key = r.identity_key();
-        seen.insert(key)
-    });
+    let mut deduped = Vec::new();
+    let mut key_to_index = std::collections::HashMap::new();
+
+    for resource in resources.drain(..) {
+        let key = resource.identity_key();
+        if let Some(idx) = key_to_index.get(&key).copied() {
+            merge_resource(&mut deduped[idx], resource);
+        } else {
+            key_to_index.insert(key, deduped.len());
+            deduped.push(resource);
+        }
+    }
+
+    *resources = deduped;
+}
+
+fn merge_resource(existing: &mut GossResource, incoming: GossResource) {
+    if let (
+        GossResource::File {
+            filetype: existing_filetype,
+            mode: existing_mode,
+            confidence: existing_confidence,
+            ..
+        },
+        GossResource::File {
+            filetype: incoming_filetype,
+            mode: incoming_mode,
+            confidence: incoming_confidence,
+            ..
+        },
+    ) = (existing, incoming)
+    {
+        if existing_filetype.is_none() {
+            *existing_filetype = incoming_filetype;
+        }
+        if existing_mode.is_none() {
+            *existing_mode = incoming_mode;
+        }
+        if incoming_confidence > *existing_confidence {
+            *existing_confidence = incoming_confidence;
+        }
+    }
 }
 
 /// Convert a command string to a valid YAML key name.
@@ -511,5 +548,39 @@ EXPOSE 80
     fn test_sanitize_shell_arg() {
         assert_eq!(sanitize_shell_arg("myuser"), "myuser");
         assert_eq!(sanitize_shell_arg("user name"), "'user name'");
+    }
+
+    #[test]
+    fn test_deduplicate_file_resources_prefers_mode_and_filetype() {
+        let mut resources = vec![
+            GossResource::File {
+                path: "/docker-entrypoint.sh".to_string(),
+                exists: true,
+                filetype: None,
+                mode: None,
+                provenance: "COPY /docker-entrypoint.sh".to_string(),
+                confidence: Confidence::Medium,
+            },
+            GossResource::File {
+                path: "/docker-entrypoint.sh".to_string(),
+                exists: true,
+                filetype: Some("file".to_string()),
+                mode: Some("0755".to_string()),
+                provenance: "COPY /docker-entrypoint.sh (entrypoint script pattern)".to_string(),
+                confidence: Confidence::High,
+            },
+        ];
+
+        deduplicate_resources(&mut resources);
+        assert_eq!(resources.len(), 1);
+        assert!(matches!(
+            &resources[0],
+            GossResource::File {
+                filetype: Some(ft),
+                mode: Some(mode),
+                confidence: Confidence::High,
+                ..
+            } if ft == "file" && mode == "0755"
+        ));
     }
 }

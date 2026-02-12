@@ -204,11 +204,16 @@ fn test_complex_healthcheck_entrypoint_script_detection() {
     let contract = extractor::extract_contract(&df, None, &[]);
 
     // Should detect the entrypoint script and assert it exists with executable permission
-    assert!(contract.assertions.iter().any(|a| matches!(
-        &a.kind,
-        AssertionKind::FileExists { path, mode, .. }
-            if path == "/docker-entrypoint.sh" && mode.as_deref() == Some("0755")
-    )));
+    let entrypoint_assertions: Vec<_> = contract
+        .assertions
+        .iter()
+        .filter(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, mode, .. }
+                if path == "/docker-entrypoint.sh" && mode.as_deref() == Some("0755")
+        ))
+        .collect();
+    assert_eq!(entrypoint_assertions.len(), 1);
 }
 
 #[test]
