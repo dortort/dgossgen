@@ -109,7 +109,8 @@ dgossgen probe [OPTIONS]
 
 Options:
       --runtime <RUNTIME>    Container runtime: docker|podman [default: docker]
-      --run-arg <ARG>        Additional docker run arguments (repeatable)
+      --run-arg <ARG>        Additional run argument (safe-mode allowlisted, repeatable)
+      --unsafe-run-arg       Allow unrestricted run args (disables run-arg safety checks)
       --allow-network        Disable network isolation for probe container
   (plus all init options)
 ```
@@ -351,6 +352,7 @@ command:
 
 - **Secret redaction**: Environment variable values for keys matching `SECRET`, `TOKEN`, `PASSWORD`, `KEY`, etc. are never embedded in generated assertions
 - **Probe isolation**: Probe containers run with `--network none` by default (override with `--allow-network`)
+- **Probe run args**: `--run-arg` is allowlisted in safe mode; use `--unsafe-run-arg` only for trusted inputs
 - **Command sanitization**: Dockerfile strings are treated as data; values are sanitized when embedded into YAML commands to prevent injection
 
 ## Development

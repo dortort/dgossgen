@@ -50,6 +50,10 @@ enum Commands {
         #[arg(long = "run-arg", num_args = 1)]
         run_args: Vec<String>,
 
+        /// Allow unrestricted run arguments (disables safe-mode allowlist)
+        #[arg(long)]
+        unsafe_run_arg: bool,
+
         /// Disable network isolation for probe container
         #[arg(long)]
         allow_network: bool,
@@ -160,8 +164,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             common,
             runtime,
             run_args,
+            unsafe_run_arg,
             allow_network,
-        } => cmd_probe(common, runtime, run_args, allow_network),
+        } => cmd_probe(common, runtime, run_args, unsafe_run_arg, allow_network),
         Commands::Explain { common } => cmd_explain(common),
         Commands::Lint { file, wait_file } => cmd_lint(file, wait_file),
     }
@@ -289,6 +294,7 @@ fn cmd_probe(
     common: CommonArgs,
     runtime: String,
     run_args: Vec<String>,
+    unsafe_run_arg: bool,
     allow_network: bool,
 ) -> Result<ExitCode> {
     let profile = parse_profile(&common.profile)?;
@@ -320,6 +326,7 @@ fn cmd_probe(
         target: common.target.clone(),
         build_args: build_args.clone(),
         run_args,
+        allow_unsafe_run_args: unsafe_run_arg,
         network_isolation: !allow_network,
         ..Default::default()
     };
