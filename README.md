@@ -1,6 +1,21 @@
 # dgossgen
 
+[![CI](https://github.com/dortort/dgossgen/actions/workflows/ci.yml/badge.svg)](https://github.com/dortort/dgossgen/actions/workflows/ci.yml)
+[![Release](https://github.com/dortort/dgossgen/actions/workflows/release.yml/badge.svg)](https://github.com/dortort/dgossgen/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
+
 Generate [dgoss](https://github.com/goss-org/goss/tree/master/extras/dgoss)-ready test suites from Dockerfiles.
+
+## Why
+
+[Goss](https://github.com/goss-org/goss) is a declarative server validation framework — you write YAML assertions about processes, ports, files, users, and commands, and Goss verifies them. [dgoss](https://github.com/goss-org/goss/tree/master/extras/dgoss) wraps Goss for Docker: it starts a container from an image and runs those checks against the live instance.
+
+This fills a gap in the container pipeline. Dockerfile linters and CVE scanners run *before* or *without* execution, but neither answers the question that matters most: does the built image actually behave like the intended runtime environment? Ports listening on the right interface, processes running as the expected user, config files landing in the right place, health endpoints responding — these only surface at deploy time if not tested earlier. ([more context](https://dortort.com/posts/runtime-contract-tests-with-dgoss/))
+
+The catch is that writing `goss.yml` by hand means re-encoding facts already declared in the Dockerfile. dgossgen automates that: it reads your Dockerfile, extracts the runtime contract, and generates the test suite so you can run `dgoss run` without the boilerplate.
+
+## What it produces
 
 dgossgen ingests a Dockerfile (optionally plus build context metadata) and outputs:
 - **`goss.yml`** — core assertions (files, ports, processes, commands)
