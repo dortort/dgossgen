@@ -177,8 +177,7 @@ fn parse_build_args(args: &[String]) -> Vec<(String, String)> {
 }
 
 fn parse_profile(s: &str) -> Result<Profile> {
-    s.parse::<Profile>()
-        .map_err(|e| anyhow::anyhow!("{}", e))
+    s.parse::<Profile>().map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
@@ -190,11 +189,8 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         .with_context(|| format!("parsing {}", common.dockerfile.display()))?;
 
     // Extract contract
-    let mut contract = extractor::extract_contract(
-        &dockerfile,
-        common.target.as_deref(),
-        &build_args,
-    );
+    let mut contract =
+        extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
 
     // Load policy
     let policy = PolicyConfig::load_or_default(&common.context);
@@ -238,21 +234,16 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         let output = generator::generate(&contract, profile, &policy, force_wait);
 
         // Preview and confirm
-        loop {
-            match interactive::preview_and_confirm(&output)? {
-                interactive::UserAction::Accept => break,
-                interactive::UserAction::Edit => {
-                    write_output(&common.output_dir, &output)?;
-                    let goss_path = common.output_dir.join("goss.yml");
-                    interactive::open_in_editor(
-                        goss_path.to_str().unwrap_or("goss.yml"),
-                    )?;
-                    return Ok(ExitCode::SUCCESS);
-                }
-                interactive::UserAction::Regenerate => {
-                    eprintln!("Regeneration with different profiles is available via --profile flag.");
-                    break;
-                }
+        match interactive::preview_and_confirm(&output)? {
+            interactive::UserAction::Accept => {}
+            interactive::UserAction::Edit => {
+                write_output(&common.output_dir, &output)?;
+                let goss_path = common.output_dir.join("goss.yml");
+                interactive::open_in_editor(goss_path.to_str().unwrap_or("goss.yml"))?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            interactive::UserAction::Regenerate => {
+                eprintln!("Regeneration with different profiles is available via --profile flag.");
             }
         }
 
@@ -260,13 +251,9 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
     } else {
         // Apply CLI overrides for health path
         if let Some(path) = &common.health_path {
-            let port = common.primary_port.unwrap_or_else(|| {
-                contract
-                    .exposed_ports
-                    .first()
-                    .map(|p| p.port)
-                    .unwrap_or(80)
-            });
+            let port = common
+                .primary_port
+                .unwrap_or_else(|| contract.exposed_ports.first().map(|p| p.port).unwrap_or(80));
             contract.assertions.push(extractor::ContractAssertion {
                 kind: AssertionKind::HttpStatus {
                     url: format!("http://127.0.0.1:{}{path}", port),
@@ -316,11 +303,8 @@ fn cmd_probe(
 
     // Phase A: Static analysis
     let dockerfile = parser::parse_dockerfile(&common.dockerfile)?;
-    let mut contract = extractor::extract_contract(
-        &dockerfile,
-        common.target.as_deref(),
-        &build_args,
-    );
+    let mut contract =
+        extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
 
     eprintln!(
         "{} Phase A (static analysis) complete: {} assertions",
@@ -348,10 +332,7 @@ fn cmd_probe(
     let evidence = probe::run_probe(&probe_config)?;
     probe::merge_evidence(&mut contract, &evidence);
 
-    eprintln!(
-        "{}",
-        style("Probe complete. Evidence merged.").green()
-    );
+    eprintln!("{}", style("Probe complete. Evidence merged.").green());
 
     // Generate
     let policy = PolicyConfig::load_or_default(&common.context);
@@ -380,22 +361,11 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
     let build_args = parse_build_args(&common.build_args);
 
     let dockerfile = parser::parse_dockerfile(&common.dockerfile)?;
-    let contract = extractor::extract_contract(
-        &dockerfile,
-        common.target.as_deref(),
-        &build_args,
-    );
+    let contract = extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
 
-    println!(
-        "{}",
-        style("=== dgossgen explain ===").bold().cyan()
-    );
+    println!("{}", style("=== dgossgen explain ===").bold().cyan());
     println!();
-    println!(
-        "{} {}",
-        style("Base image:").bold(),
-        contract.base_image
-    );
+    println!("{} {}", style("Base image:").bold(), contract.base_image);
     println!(
         "{} {}",
         style("Total assertions:").bold(),
@@ -404,30 +374,19 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
     println!();
 
     for (i, assertion) in contract.assertions.iter().enumerate() {
-        println!(
-            "{}",
-            style(format!("--- Assertion #{} ---", i + 1)).bold()
-        );
+        println!("{}", style(format!("--- Assertion #{} ---", i + 1)).bold());
         println!(
             "  {}: {}",
             style("Type").dim(),
             assertion_type_name(&assertion.kind)
         );
-        println!(
-            "  {}: {}",
-            style("Provenance").dim(),
-            assertion.provenance
-        );
+        println!("  {}: {}", style("Provenance").dim(), assertion.provenance);
         println!(
             "  {}: line {}",
             style("Source").dim(),
             assertion.source_line
         );
-        println!(
-            "  {}: {}",
-            style("Confidence").dim(),
-            assertion.confidence
-        );
+        println!("  {}: {}", style("Confidence").dim(), assertion.confidence);
         println!(
             "  {}: {}",
             style("Description").dim(),
@@ -440,16 +399,13 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
 }
 
 fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
-    println!(
-        "{}",
-        style("=== dgossgen lint ===").bold().cyan()
-    );
+    println!("{}", style("=== dgossgen lint ===").bold().cyan());
 
     let mut issues = Vec::new();
 
     // Lint main goss.yml
-    let content = std::fs::read_to_string(&file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let content =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
     lint_goss_content(&content, file.to_str().unwrap_or("goss.yml"), &mut issues);
 
@@ -466,7 +422,10 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
         }
     } else {
         // Auto-detect goss_wait.yml next to the main file
-        let wait_path = file.parent().unwrap_or(Path::new(".")).join("goss_wait.yml");
+        let wait_path = file
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("goss_wait.yml");
         if wait_path.exists() {
             let wait_content = std::fs::read_to_string(&wait_path)?;
             lint_goss_content(&wait_content, "goss_wait.yml", &mut issues);
@@ -644,21 +603,13 @@ fn write_output(output_dir: &Path, output: &generator::GeneratorOutput) -> Resul
     let goss_path = output_dir.join("goss.yml");
     std::fs::write(&goss_path, &output.goss_yml)
         .with_context(|| format!("writing {}", goss_path.display()))?;
-    eprintln!(
-        "{} {}",
-        style("wrote").green(),
-        goss_path.display()
-    );
+    eprintln!("{} {}", style("wrote").green(), goss_path.display());
 
     if let Some(wait_content) = &output.goss_wait_yml {
         let wait_path = output_dir.join("goss_wait.yml");
         std::fs::write(&wait_path, wait_content)
             .with_context(|| format!("writing {}", wait_path.display()))?;
-        eprintln!(
-            "{} {}",
-            style("wrote").green(),
-            wait_path.display()
-        );
+        eprintln!("{} {}", style("wrote").green(), wait_path.display());
     }
 
     Ok(())

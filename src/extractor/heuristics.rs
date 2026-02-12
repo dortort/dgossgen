@@ -166,8 +166,9 @@ pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<Con
 }
 
 /// Package install pattern detectors.
-fn package_install_patterns() -> Vec<(Regex, Box<dyn Fn(&str, usize) -> Option<ContractAssertion>>)>
-{
+type PatternDetector = Box<dyn Fn(&str, usize) -> Option<ContractAssertion>>;
+
+fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
     vec![
         // apt-get install
         (

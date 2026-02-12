@@ -4,15 +4,14 @@ use super::ast::{Instruction, Stage};
 
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
+#[derive(Default)]
 pub struct VariableResolver {
     vars: HashMap<String, String>,
 }
 
 impl VariableResolver {
     pub fn new() -> Self {
-        Self {
-            vars: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Load build args (from CLI --build-arg flags).
@@ -142,9 +141,7 @@ mod tests {
     #[test]
     fn test_resolve_mixed() {
         let mut resolver = VariableResolver::new();
-        resolver
-            .vars
-            .insert("APP".to_string(), "myapp".to_string());
+        resolver.vars.insert("APP".to_string(), "myapp".to_string());
         assert_eq!(resolver.resolve("/opt/$APP/config"), "/opt/myapp/config");
     }
 }

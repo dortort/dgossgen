@@ -99,9 +99,7 @@ pub fn render_goss_wait(resources: &[GossResource]) -> String {
 /// Render a minimal viable wait file with just a port check.
 pub fn render_goss_wait_minimal(port: u16, protocol: &str) -> String {
     let mut output = String::new();
-    output.push_str(&format!(
-        "# Minimal viable wait: port readiness check\n"
-    ));
+    output.push_str("# Minimal viable wait: port readiness check\n");
     output.push_str(&format!(
         "# derived from EXPOSE {}; confidence: medium\n",
         port
