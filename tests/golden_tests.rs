@@ -162,7 +162,11 @@ fn test_go_minimal_contract() {
     // Numeric user should produce uid-based assertion
     assert!(contract.assertions.iter().any(|a| matches!(
         &a.kind,
-        AssertionKind::CommandExit { command, .. } if command.contains("65534")
+        AssertionKind::CommandOutput {
+            command,
+            expected_output,
+            ..
+        } if command == "id -u" && expected_output == &vec!["65534".to_string()]
     )));
 }
 
