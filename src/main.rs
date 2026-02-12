@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use console::style;
 
+use dgossgen::cli::{explain, lint, output};
 use dgossgen::config::PolicyConfig;
 use dgossgen::extractor::{self, AssertionKind};
 use dgossgen::generator;
@@ -242,7 +243,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         match interactive::preview_and_confirm(&output)? {
             interactive::UserAction::Accept => {}
             interactive::UserAction::Edit => {
-                write_output(&common.output_dir, &output)?;
+                output::write_output(&common.output_dir, &output)?;
                 let goss_path = common.output_dir.join("goss.yml");
                 interactive::open_in_editor(goss_path.to_str().unwrap_or("goss.yml"))?;
                 return Ok(ExitCode::SUCCESS);
@@ -252,7 +253,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             }
         }
 
-        write_output(&common.output_dir, &output)?;
+        output::write_output(&common.output_dir, &output)?;
     } else {
         // Apply CLI overrides for health path
         if let Some(path) = &common.health_path {
@@ -272,7 +273,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
-        write_output(&common.output_dir, &output)?;
+        output::write_output(&common.output_dir, &output)?;
 
         if !output.warnings.is_empty() {
             for w in &output.warnings {
@@ -352,7 +353,7 @@ fn cmd_probe(
     };
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
-    write_output(&common.output_dir, &output)?;
+    output::write_output(&common.output_dir, &output)?;
 
     if !output.warnings.is_empty() {
         for w in &output.warnings {
@@ -385,7 +386,7 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
         println!(
             "  {}: {}",
             style("Type").dim(),
-            assertion_type_name(&assertion.kind)
+            explain::assertion_type_name(&assertion.kind)
         );
         println!("  {}: {}", style("Provenance").dim(), assertion.provenance);
         println!(
@@ -397,7 +398,7 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
         println!(
             "  {}: {}",
             style("Description").dim(),
-            assertion_description(&assertion.kind)
+            explain::assertion_description(&assertion.kind)
         );
         println!();
     }
@@ -408,20 +409,20 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
 fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
     println!("{}", style("=== dgossgen lint ===").bold().cyan());
 
-    let mut issues = Vec::new();
+    let mut issues: Vec<lint::LintIssue> = Vec::new();
 
     // Lint main goss.yml
     let content =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
-    lint_goss_content(&content, file.to_str().unwrap_or("goss.yml"), &mut issues);
+    lint::lint_goss_content(&content, file.to_str().unwrap_or("goss.yml"), &mut issues);
 
     // Lint wait file if present
     if let Some(wait_path) = &wait_file {
         if wait_path.exists() {
             let wait_content = std::fs::read_to_string(wait_path)
                 .with_context(|| format!("reading {}", wait_path.display()))?;
-            lint_goss_content(
+            lint::lint_goss_content(
                 &wait_content,
                 wait_path.to_str().unwrap_or("goss_wait.yml"),
                 &mut issues,
@@ -435,7 +436,7 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
             .join("goss_wait.yml");
         if wait_path.exists() {
             let wait_content = std::fs::read_to_string(&wait_path)?;
-            lint_goss_content(&wait_content, "goss_wait.yml", &mut issues);
+            lint::lint_goss_content(&wait_content, "goss_wait.yml", &mut issues);
         }
     }
 
@@ -457,173 +458,4 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
         );
         Ok(ExitCode::from(2))
     }
-}
-
-struct LintIssue {
-    file: String,
-    message: String,
-}
-
-fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
-    // Check YAML validity
-    let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(content);
-    if parsed.is_err() {
-        issues.push(LintIssue {
-            file: filename.to_string(),
-            message: "Invalid YAML syntax".to_string(),
-        });
-        return;
-    }
-
-    let doc = parsed.unwrap();
-
-    // Check for common flake patterns
-    if let Some(mapping) = doc.as_mapping() {
-        // Check for ephemeral paths
-        if let Some(files) = mapping.get(serde_yaml::Value::String("file".to_string())) {
-            if let Some(file_map) = files.as_mapping() {
-                for (key, _) in file_map {
-                    if let Some(path) = key.as_str() {
-                        if path.contains("/tmp/")
-                            || path.contains("/var/cache/")
-                            || path.contains("/proc/")
-                        {
-                            issues.push(LintIssue {
-                                file: filename.to_string(),
-                                message: format!(
-                                    "File assertion on ephemeral path '{}' may be flaky",
-                                    path
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check for process assertions (often flaky)
-        if let Some(processes) = mapping.get(serde_yaml::Value::String("process".to_string())) {
-            if let Some(proc_map) = processes.as_mapping() {
-                if proc_map.len() > 3 {
-                    issues.push(LintIssue {
-                        file: filename.to_string(),
-                        message: "Many process assertions (>3) increase flake risk".to_string(),
-                    });
-                }
-            }
-        }
-
-        // Check command timeouts
-        if let Some(commands) = mapping.get(serde_yaml::Value::String("command".to_string())) {
-            if let Some(cmd_map) = commands.as_mapping() {
-                for (key, val) in cmd_map {
-                    if let Some(cmd_val) = val.as_mapping() {
-                        let timeout = cmd_val
-                            .get(serde_yaml::Value::String("timeout".to_string()))
-                            .and_then(|v| v.as_u64());
-
-                        if timeout.is_none() || timeout == Some(0) {
-                            if let Some(name) = key.as_str() {
-                                issues.push(LintIssue {
-                                    file: filename.to_string(),
-                                    message: format!(
-                                        "Command '{}' has no timeout (may hang)",
-                                        name
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn assertion_type_name(kind: &AssertionKind) -> &'static str {
-    match kind {
-        AssertionKind::FileExists { .. } => "file",
-        AssertionKind::PortListening { .. } => "port",
-        AssertionKind::ProcessRunning { .. } => "process",
-        AssertionKind::CommandExit { .. } => "command",
-        AssertionKind::CommandOutput { .. } => "command (with output)",
-        AssertionKind::UserExists { .. } => "user",
-        AssertionKind::HealthcheckPasses { .. } => "healthcheck",
-        AssertionKind::HttpStatus { .. } => "http",
-        AssertionKind::PackageInstalled { .. } => "package",
-    }
-}
-
-fn assertion_description(kind: &AssertionKind) -> String {
-    match kind {
-        AssertionKind::FileExists {
-            path,
-            filetype,
-            mode,
-        } => {
-            let mut desc = format!("File '{}' exists", path);
-            if let Some(ft) = filetype {
-                desc.push_str(&format!(" (type: {})", ft));
-            }
-            if let Some(m) = mode {
-                desc.push_str(&format!(" (mode: {})", m));
-            }
-            desc
-        }
-        AssertionKind::PortListening { protocol, port } => {
-            format!("Port {}/{} is listening", port, protocol)
-        }
-        AssertionKind::ProcessRunning { name } => {
-            format!("Process '{}' is running", name)
-        }
-        AssertionKind::CommandExit {
-            command,
-            exit_status,
-        } => {
-            format!("Command '{}' exits with status {}", command, exit_status)
-        }
-        AssertionKind::CommandOutput {
-            command,
-            exit_status,
-            expected_output,
-        } => {
-            format!(
-                "Command '{}' exits with status {} and outputs {:?}",
-                command, exit_status, expected_output
-            )
-        }
-        AssertionKind::UserExists { username } => {
-            format!("User '{}' exists", username)
-        }
-        AssertionKind::HealthcheckPasses { command } => {
-            format!("Healthcheck '{}' passes", command)
-        }
-        AssertionKind::HttpStatus { url, status } => {
-            format!("HTTP {} returns status {}", url, status)
-        }
-        AssertionKind::PackageInstalled {
-            package, manager, ..
-        } => {
-            format!("Package '{}' installed via {:?}", package, manager)
-        }
-    }
-}
-
-fn write_output(output_dir: &Path, output: &generator::GeneratorOutput) -> Result<()> {
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("creating output directory {}", output_dir.display()))?;
-
-    let goss_path = output_dir.join("goss.yml");
-    std::fs::write(&goss_path, &output.goss_yml)
-        .with_context(|| format!("writing {}", goss_path.display()))?;
-    eprintln!("{} {}", style("wrote").green(), goss_path.display());
-
-    if let Some(wait_content) = &output.goss_wait_yml {
-        let wait_path = output_dir.join("goss_wait.yml");
-        std::fs::write(&wait_path, wait_content)
-            .with_context(|| format!("writing {}", wait_path.display()))?;
-        eprintln!("{} {}", style("wrote").green(), wait_path.display());
-    }
-
-    Ok(())
 }
