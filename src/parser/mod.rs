@@ -17,8 +17,11 @@ pub fn parse_dockerfile(path: &Path) -> Result<Dockerfile> {
 /// Parse Dockerfile content string into a structured Dockerfile.
 pub fn parse_dockerfile_content(content: &str) -> Result<Dockerfile> {
     let raw_instructions = parse_raw_instructions(content)?;
-    let stages = build_stages(raw_instructions)?;
-    Ok(Dockerfile { stages })
+    let (global_args, stages) = build_stages(raw_instructions)?;
+    Ok(Dockerfile {
+        global_args,
+        stages,
+    })
 }
 
 /// Merge continuation lines (trailing backslash) into single logical lines,
@@ -402,26 +405,23 @@ fn parse_healthcheck(args: &str, line_num: usize, raw: &str) -> RawInstruction {
     // Parse optional flags before CMD
     loop {
         remaining = remaining.trim_start().to_string();
+        if remaining.is_empty() {
+            break;
+        }
+
+        let end = remaining.find(' ').unwrap_or(remaining.len());
         if remaining.starts_with("--interval=") {
-            if let Some(end) = remaining.find(' ') {
-                interval = Some(remaining[11..end].to_string());
-                remaining = remaining[end..].to_string();
-            }
+            interval = Some(remaining[11..end].to_string());
+            remaining = remaining[end..].to_string();
         } else if remaining.starts_with("--timeout=") {
-            if let Some(end) = remaining.find(' ') {
-                timeout = Some(remaining[10..end].to_string());
-                remaining = remaining[end..].to_string();
-            }
+            timeout = Some(remaining[10..end].to_string());
+            remaining = remaining[end..].to_string();
         } else if remaining.starts_with("--start-period=") {
-            if let Some(end) = remaining.find(' ') {
-                start_period = Some(remaining[15..end].to_string());
-                remaining = remaining[end..].to_string();
-            }
+            start_period = Some(remaining[15..end].to_string());
+            remaining = remaining[end..].to_string();
         } else if remaining.starts_with("--retries=") {
-            if let Some(end) = remaining.find(' ') {
-                retries = remaining[10..end].parse().ok();
-                remaining = remaining[end..].to_string();
-            }
+            retries = remaining[10..end].parse().ok();
+            remaining = remaining[end..].to_string();
         } else {
             break;
         }
@@ -509,7 +509,8 @@ fn parse_json_array(s: &str) -> Vec<String> {
 }
 
 /// Build stages from raw instructions.
-fn build_stages(instructions: Vec<RawInstruction>) -> Result<Vec<Stage>> {
+fn build_stages(instructions: Vec<RawInstruction>) -> Result<(Vec<ArgInstruction>, Vec<Stage>)> {
+    let mut global_args = Vec::new();
     let mut stages: Vec<Stage> = Vec::new();
     let mut current_instructions: Vec<RawInstruction> = Vec::new();
     let mut current_from: Option<RawInstruction> = None;
@@ -526,8 +527,12 @@ fn build_stages(instructions: Vec<RawInstruction>) -> Result<Vec<Stage>> {
             current_from = Some(inst);
         } else if current_from.is_some() {
             current_instructions.push(inst);
+        } else if let Instruction::Arg { name, default } = &inst.instruction {
+            global_args.push(ArgInstruction {
+                name: name.clone(),
+                default: default.clone(),
+            });
         }
-        // ARG before first FROM is a global arg (not tracked in stages currently)
     }
 
     // Last stage
@@ -535,7 +540,7 @@ fn build_stages(instructions: Vec<RawInstruction>) -> Result<Vec<Stage>> {
         stages.push(build_single_stage(from_inst, current_instructions));
     }
 
-    Ok(stages)
+    Ok((global_args, stages))
 }
 
 fn build_single_stage(from_inst: RawInstruction, instructions: Vec<RawInstruction>) -> Stage {
@@ -653,6 +658,41 @@ HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost/ || exit 1
             .iter()
             .find(|i| matches!(i.instruction, Instruction::Healthcheck { .. }));
         assert!(hc.is_some());
+    }
+
+    #[test]
+    fn test_parse_healthcheck_trailing_flag_without_cmd() {
+        let content = r#"
+FROM nginx
+HEALTHCHECK --retries=3
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let hc = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Healthcheck { retries, .. } => Some(*retries),
+                _ => None,
+            });
+        assert_eq!(hc, Some(Some(3)));
+    }
+
+    #[test]
+    fn test_parse_global_args_before_first_from() {
+        let content = r#"
+ARG BASE_IMAGE=ubuntu:22.04
+ARG APP_VERSION
+FROM $BASE_IMAGE
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        assert_eq!(df.global_args.len(), 2);
+        assert_eq!(df.global_args[0].name, "BASE_IMAGE");
+        assert_eq!(
+            df.global_args[0].default.as_deref(),
+            Some("ubuntu:22.04")
+        );
+        assert_eq!(df.global_args[1].name, "APP_VERSION");
+        assert_eq!(df.global_args[1].default, None);
     }
 
     #[test]
