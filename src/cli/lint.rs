@@ -6,7 +6,7 @@ pub struct LintIssue {
 
 pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
     // Check YAML validity
-    let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(content);
+    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(content);
     if parsed.is_err() {
         issues.push(LintIssue {
             file: filename.to_string(),
@@ -20,7 +20,7 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
     // Check for common flake patterns
     if let Some(mapping) = doc.as_mapping() {
         // Check for ephemeral paths
-        if let Some(files) = mapping.get(serde_yaml::Value::String("file".to_string())) {
+        if let Some(files) = mapping.get(serde_yml::Value::String("file".to_string())) {
             if let Some(file_map) = files.as_mapping() {
                 for (key, _) in file_map {
                     if let Some(path) = key.as_str() {
@@ -42,7 +42,7 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
         }
 
         // Check for process assertions (often flaky)
-        if let Some(processes) = mapping.get(serde_yaml::Value::String("process".to_string())) {
+        if let Some(processes) = mapping.get(serde_yml::Value::String("process".to_string())) {
             if let Some(proc_map) = processes.as_mapping() {
                 if proc_map.len() > 3 {
                     issues.push(LintIssue {
@@ -54,12 +54,12 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
         }
 
         // Check command timeouts
-        if let Some(commands) = mapping.get(serde_yaml::Value::String("command".to_string())) {
+        if let Some(commands) = mapping.get(serde_yml::Value::String("command".to_string())) {
             if let Some(cmd_map) = commands.as_mapping() {
                 for (key, val) in cmd_map {
                     if let Some(cmd_val) = val.as_mapping() {
                         let timeout = cmd_val
-                            .get(serde_yaml::Value::String("timeout".to_string()))
+                            .get(serde_yml::Value::String("timeout".to_string()))
                             .and_then(|v| v.as_u64());
 
                         if timeout.is_none() || timeout == Some(0) {
