@@ -5,28 +5,136 @@ use super::model::{
     AssertionKind, ComponentKind, ContractAssertion, InstalledComponent, PackageManager,
 };
 use regex::Regex;
+use std::sync::LazyLock;
+
+static APT_INSTALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"apt-get\s+install\s+(?:-y\s+)?(.+?)(?:\s*&&|\s*$)").unwrap());
+static APK_ADD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"apk\s+add\s+(?:--no-cache\s+)?(.+?)(?:\s*&&|\s*$)").unwrap());
+static PIP_INSTALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"pip3?\s+install\s+(.+?)(?:\s*&&|\s*$)").unwrap());
+static NPM_INSTALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"npm\s+(?:install|ci)(?:\s+(.+?))?(?:\s*&&|\s*$)").unwrap());
+static COMPOSER_REQUIRE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"composer\s+require\s+(.+?)(?:\s*&&|\s*$)").unwrap());
+static USERADD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:useradd|adduser)\s+(?:[^\s]+\s+)*?(\w+)\s*$").unwrap());
+static COMPONENT_PATTERNS: LazyLock<Vec<(Regex, &'static str, ComponentKind)>> =
+    LazyLock::new(|| {
+        vec![
+            (
+                Regex::new(r"\bnginx\b").unwrap(),
+                "nginx",
+                ComponentKind::WebServer,
+            ),
+            (
+                Regex::new(r"\bapache2\b").unwrap(),
+                "apache2",
+                ComponentKind::WebServer,
+            ),
+            (
+                Regex::new(r"\bhttpd\b").unwrap(),
+                "httpd",
+                ComponentKind::WebServer,
+            ),
+            (
+                Regex::new(r"\bpython3?\b").unwrap(),
+                "python",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\bnode(js)?\b").unwrap(),
+                "node",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\bjava\b").unwrap(),
+                "java",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\bruby\b").unwrap(),
+                "ruby",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\bphp\b").unwrap(),
+                "php",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\b(go|golang)\b").unwrap(),
+                "go",
+                ComponentKind::Runtime,
+            ),
+            (
+                Regex::new(r"\bredis\b").unwrap(),
+                "redis",
+                ComponentKind::Database,
+            ),
+            (
+                Regex::new(r"\bpostgres(ql)?\b").unwrap(),
+                "postgres",
+                ComponentKind::Database,
+            ),
+            (
+                Regex::new(r"\bmysql\b").unwrap(),
+                "mysql",
+                ComponentKind::Database,
+            ),
+            (
+                Regex::new(r"\bcurl\b").unwrap(),
+                "curl",
+                ComponentKind::Tool,
+            ),
+            (
+                Regex::new(r"\bwget\b").unwrap(),
+                "wget",
+                ComponentKind::Tool,
+            ),
+        ]
+    });
 
 /// Analyze a RUN command for installed packages and generate assertions.
 pub fn analyze_run_command(cmd: &CommandForm, source_line: usize) -> Vec<ContractAssertion> {
     let cmd_str = cmd.to_string_lossy();
     let mut assertions = Vec::new();
 
-    // Package manager installs
-    for (pattern, detector) in package_install_patterns() {
-        if let Some(captures) = pattern.captures(&cmd_str) {
-            if let Some(pkgs) = captures.get(1) {
-                for pkg in pkgs.as_str().split_whitespace() {
-                    let pkg_clean = pkg.trim_start_matches('-');
-                    if pkg_clean.is_empty() || pkg_clean.starts_with('-') {
-                        continue;
-                    }
-                    if let Some(assertion) = detector(pkg_clean, source_line) {
-                        assertions.push(assertion);
-                    }
-                }
-            }
-        }
-    }
+    extract_package_assertions(
+        &mut assertions,
+        &cmd_str,
+        source_line,
+        &APT_INSTALL_RE,
+        detect_apt_package,
+    );
+    extract_package_assertions(
+        &mut assertions,
+        &cmd_str,
+        source_line,
+        &APK_ADD_RE,
+        detect_apk_package,
+    );
+    extract_package_assertions(
+        &mut assertions,
+        &cmd_str,
+        source_line,
+        &PIP_INSTALL_RE,
+        detect_pip_package,
+    );
+    extract_package_assertions(
+        &mut assertions,
+        &cmd_str,
+        source_line,
+        &NPM_INSTALL_RE,
+        detect_npm_package,
+    );
+    extract_package_assertions(
+        &mut assertions,
+        &cmd_str,
+        source_line,
+        &COMPOSER_REQUIRE_RE,
+        detect_composer_package,
+    );
 
     // User creation patterns
     if let Some(assertion) = detect_user_creation(&cmd_str, source_line) {
@@ -41,35 +149,17 @@ pub fn detect_installed_components(cmd: &CommandForm) -> Vec<InstalledComponent>
     let cmd_str = cmd.to_string_lossy().to_lowercase();
     let mut components = Vec::new();
 
-    let patterns: Vec<(&str, &str, ComponentKind)> = vec![
-        ("nginx", "nginx", ComponentKind::WebServer),
-        ("apache2", "apache2", ComponentKind::WebServer),
-        ("httpd", "httpd", ComponentKind::WebServer),
-        ("python", "python", ComponentKind::Runtime),
-        ("python3", "python3", ComponentKind::Runtime),
-        ("node", "node", ComponentKind::Runtime),
-        ("java", "java", ComponentKind::Runtime),
-        ("ruby", "ruby", ComponentKind::Runtime),
-        ("php", "php", ComponentKind::Runtime),
-        ("go ", "go", ComponentKind::Runtime),
-        ("golang", "golang", ComponentKind::Runtime),
-        ("redis", "redis", ComponentKind::Database),
-        ("postgres", "postgres", ComponentKind::Database),
-        ("mysql", "mysql", ComponentKind::Database),
-        ("curl", "curl", ComponentKind::Tool),
-        ("wget", "wget", ComponentKind::Tool),
-    ];
-
-    for (pattern, name, kind) in patterns {
-        if cmd_str.contains(pattern) {
+    for (pattern, name, kind) in COMPONENT_PATTERNS.iter() {
+        if pattern.is_match(&cmd_str) {
             components.push(InstalledComponent {
-                name: name.to_string(),
-                kind,
+                name: (*name).to_string(),
+                kind: kind.clone(),
                 source_line: 0, // Will be set by caller
             });
         }
     }
 
+    dedupe_components(&mut components);
     components
 }
 
@@ -248,153 +338,139 @@ fn known_version_cmd(pkg: &str) -> Option<String> {
     }
 }
 
-/// Package install pattern detectors.
-type PatternDetector = Box<dyn Fn(&str, usize) -> Option<ContractAssertion>>;
+fn extract_package_assertions(
+    assertions: &mut Vec<ContractAssertion>,
+    command: &str,
+    source_line: usize,
+    pattern: &Regex,
+    detector: fn(&str, usize) -> Option<ContractAssertion>,
+) {
+    if let Some(captures) = pattern.captures(command) {
+        if let Some(pkgs) = captures.get(1) {
+            for pkg in pkgs.as_str().split_whitespace() {
+                let pkg_clean = pkg.trim_start_matches('-');
+                if pkg_clean.is_empty() || pkg_clean.starts_with('-') {
+                    continue;
+                }
+                if let Some(assertion) = detector(pkg_clean, source_line) {
+                    assertions.push(assertion);
+                }
+            }
+        }
+    }
+}
 
-fn package_install_patterns() -> Vec<(Regex, PatternDetector)> {
-    vec![
-        // apt-get install
-        (
-            Regex::new(r"apt-get\s+install\s+(?:-y\s+)?(.+?)(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                if is_low_value_package(pkg) {
-                    return None;
-                }
-                Some(ContractAssertion {
-                    kind: AssertionKind::PackageInstalled {
-                        package: pkg.to_string(),
-                        manager: PackageManager::Apt,
-                        version_cmd: known_version_cmd(pkg),
-                    },
-                    provenance: format!("RUN apt-get install {}", pkg),
-                    source_line: line,
-                    confidence: Confidence::Low,
-                })
-            }),
-        ),
-        // apk add
-        (
-            Regex::new(r"apk\s+add\s+(?:--no-cache\s+)?(.+?)(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                if is_low_value_package(pkg) {
-                    return None;
-                }
-                Some(ContractAssertion {
-                    kind: AssertionKind::PackageInstalled {
-                        package: pkg.to_string(),
-                        manager: PackageManager::Apk,
-                        version_cmd: known_version_cmd(pkg),
-                    },
-                    provenance: format!("RUN apk add {}", pkg),
-                    source_line: line,
-                    confidence: Confidence::Low,
-                })
-            }),
-        ),
-        // pip install
-        (
-            Regex::new(r"pip3?\s+install\s+(.+?)(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                // The general loop already strips leading dashes, so we see
-                // flag remnants like "no-cache-dir", "r", "q" etc. Filter them.
-                if is_pip_flag_remnant(pkg) {
-                    return None;
-                }
-                // Skip requirements file references
-                if pkg.ends_with(".txt") || pkg.ends_with(".cfg") || pkg.contains('/') || pkg == "."
-                {
-                    return None;
-                }
-                // Strip version specifiers (e.g. "flask==2.0" -> "flask")
-                let pkg_name = pkg
-                    .split(&['=', '>', '<', '!', '~', '['][..])
-                    .next()
-                    .unwrap_or(pkg);
-                if pkg_name.is_empty() {
-                    return None;
-                }
-                Some(ContractAssertion {
-                    kind: AssertionKind::PackageInstalled {
-                        package: pkg_name.to_string(),
-                        manager: PackageManager::Pip,
-                        version_cmd: known_version_cmd(pkg_name),
-                    },
-                    provenance: format!("RUN pip install {}", pkg_name),
-                    source_line: line,
-                    confidence: Confidence::Low,
-                })
-            }),
-        ),
-        // npm install (global or named packages)
-        (
-            Regex::new(r"npm\s+(?:install|ci)(?:\s+(.+?))?(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                // npm ci / npm install (no args) installs from package.json — no specific package to assert
-                if pkg.is_empty() || pkg.starts_with('-') {
-                    return None;
-                }
-                // Strip version specifiers (@scope/pkg@version -> @scope/pkg)
-                let pkg_name = if let Some(stripped) = pkg.strip_prefix('@') {
-                    // Scoped package: @scope/name@version
-                    if let Some(at_pos) = stripped.find('@') {
-                        &pkg[..at_pos + 1]
-                    } else {
-                        pkg
-                    }
-                } else if let Some(at_pos) = pkg.find('@') {
-                    &pkg[..at_pos]
-                } else {
-                    pkg
-                };
-                if pkg_name.is_empty() {
-                    return None;
-                }
-                Some(ContractAssertion {
-                    kind: AssertionKind::PackageInstalled {
-                        package: pkg_name.to_string(),
-                        manager: PackageManager::Npm,
-                        version_cmd: known_version_cmd(pkg_name),
-                    },
-                    provenance: format!("RUN npm install {}", pkg_name),
-                    source_line: line,
-                    confidence: Confidence::Low,
-                })
-            }),
-        ),
-        // composer require (PHP)
-        (
-            Regex::new(r"composer\s+require\s+(.+?)(?:\s*&&|\s*$)").unwrap(),
-            Box::new(|pkg: &str, line: usize| -> Option<ContractAssertion> {
-                // Skip flags (remnants after dash-stripping)
-                if is_composer_flag_remnant(pkg) {
-                    return None;
-                }
-                // Composer packages are vendor/package — keep as-is
-                // Strip version constraint if present (e.g. "monolog/monolog:^2.0" -> "monolog/monolog")
-                let pkg_name = pkg.split(&[':', ' '][..]).next().unwrap_or(pkg);
-                if pkg_name.is_empty() || !pkg_name.contains('/') {
-                    // Valid composer packages always have vendor/name format
-                    return None;
-                }
-                Some(ContractAssertion {
-                    kind: AssertionKind::PackageInstalled {
-                        package: pkg_name.to_string(),
-                        manager: PackageManager::Composer,
-                        version_cmd: None,
-                    },
-                    provenance: format!("RUN composer require {}", pkg_name),
-                    source_line: line,
-                    confidence: Confidence::Low,
-                })
-            }),
-        ),
-    ]
+fn detect_apt_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
+    if is_low_value_package(pkg) {
+        return None;
+    }
+    Some(ContractAssertion {
+        kind: AssertionKind::PackageInstalled {
+            package: pkg.to_string(),
+            manager: PackageManager::Apt,
+            version_cmd: known_version_cmd(pkg),
+        },
+        provenance: format!("RUN apt-get install {}", pkg),
+        source_line,
+        confidence: Confidence::Low,
+    })
+}
+
+fn detect_apk_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
+    if is_low_value_package(pkg) {
+        return None;
+    }
+    Some(ContractAssertion {
+        kind: AssertionKind::PackageInstalled {
+            package: pkg.to_string(),
+            manager: PackageManager::Apk,
+            version_cmd: known_version_cmd(pkg),
+        },
+        provenance: format!("RUN apk add {}", pkg),
+        source_line,
+        confidence: Confidence::Low,
+    })
+}
+
+fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
+    if is_pip_flag_remnant(pkg) {
+        return None;
+    }
+    if pkg.ends_with(".txt") || pkg.ends_with(".cfg") || pkg.contains('/') || pkg == "." {
+        return None;
+    }
+    let pkg_name = pkg
+        .split(&['=', '>', '<', '!', '~', '['][..])
+        .next()
+        .unwrap_or(pkg);
+    if pkg_name.is_empty() {
+        return None;
+    }
+    Some(ContractAssertion {
+        kind: AssertionKind::PackageInstalled {
+            package: pkg_name.to_string(),
+            manager: PackageManager::Pip,
+            version_cmd: known_version_cmd(pkg_name),
+        },
+        provenance: format!("RUN pip install {}", pkg_name),
+        source_line,
+        confidence: Confidence::Low,
+    })
+}
+
+fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
+    if pkg.is_empty() || pkg.starts_with('-') {
+        return None;
+    }
+    let pkg_name = if let Some(stripped) = pkg.strip_prefix('@') {
+        if let Some(at_pos) = stripped.find('@') {
+            &pkg[..at_pos + 1]
+        } else {
+            pkg
+        }
+    } else if let Some(at_pos) = pkg.find('@') {
+        &pkg[..at_pos]
+    } else {
+        pkg
+    };
+    if pkg_name.is_empty() {
+        return None;
+    }
+    Some(ContractAssertion {
+        kind: AssertionKind::PackageInstalled {
+            package: pkg_name.to_string(),
+            manager: PackageManager::Npm,
+            version_cmd: known_version_cmd(pkg_name),
+        },
+        provenance: format!("RUN npm install {}", pkg_name),
+        source_line,
+        confidence: Confidence::Low,
+    })
+}
+
+fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
+    if is_composer_flag_remnant(pkg) {
+        return None;
+    }
+    let pkg_name = pkg.split(&[':', ' '][..]).next().unwrap_or(pkg);
+    if pkg_name.is_empty() || !pkg_name.contains('/') {
+        return None;
+    }
+    Some(ContractAssertion {
+        kind: AssertionKind::PackageInstalled {
+            package: pkg_name.to_string(),
+            manager: PackageManager::Composer,
+            version_cmd: None,
+        },
+        provenance: format!("RUN composer require {}", pkg_name),
+        source_line,
+        confidence: Confidence::Low,
+    })
 }
 
 /// Detect user creation commands.
 fn detect_user_creation(cmd_str: &str, source_line: usize) -> Option<ContractAssertion> {
-    let useradd_re = Regex::new(r"(?:useradd|adduser)\s+(?:[^\s]+\s+)*?(\w+)\s*$").ok()?;
-    if let Some(captures) = useradd_re.captures(cmd_str) {
+    if let Some(captures) = USERADD_RE.captures(cmd_str) {
         if let Some(username) = captures.get(1) {
             let name = username.as_str().to_string();
             // Filter out flags that look like usernames
@@ -411,6 +487,11 @@ fn detect_user_creation(cmd_str: &str, source_line: usize) -> Option<ContractAss
         }
     }
     None
+}
+
+fn dedupe_components(components: &mut Vec<InstalledComponent>) {
+    let mut seen = std::collections::HashSet::new();
+    components.retain(|component| seen.insert(component.name.clone()));
 }
 
 #[cfg(test)]
@@ -543,6 +624,15 @@ mod tests {
         let components = detect_installed_components(&cmd);
         assert!(components.iter().any(|c| c.name == "nginx"));
         assert!(components.iter().any(|c| c.name == "curl"));
+    }
+
+    #[test]
+    fn test_component_detection_avoids_substring_false_positives() {
+        let cmd =
+            CommandForm::Shell("echo download javascript && apt-get install -y ca-certificates".to_string());
+        let components = detect_installed_components(&cmd);
+        assert!(!components.iter().any(|c| c.name == "node"));
+        assert!(!components.iter().any(|c| c.name == "java"));
     }
 
     #[test]
