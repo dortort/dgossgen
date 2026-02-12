@@ -687,10 +687,7 @@ FROM $BASE_IMAGE
         let df = parse_dockerfile_content(content).unwrap();
         assert_eq!(df.global_args.len(), 2);
         assert_eq!(df.global_args[0].name, "BASE_IMAGE");
-        assert_eq!(
-            df.global_args[0].default.as_deref(),
-            Some("ubuntu:22.04")
-        );
+        assert_eq!(df.global_args[0].default.as_deref(), Some("ubuntu:22.04"));
         assert_eq!(df.global_args[1].name, "APP_VERSION");
         assert_eq!(df.global_args[1].default, None);
     }

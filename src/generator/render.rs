@@ -83,9 +83,7 @@ pub fn render_goss(resources: &[GossResource]) -> String {
                 );
             }
             GossResource::Port {
-                address,
-                listening,
-                ..
+                address, listening, ..
             } => {
                 doc.port.insert(
                     address.clone(),
@@ -134,7 +132,8 @@ pub fn render_goss(resources: &[GossResource]) -> String {
                 );
             }
             GossResource::Http { url, status, .. } => {
-                doc.http.insert(url.clone(), HttpAssertion { status: *status });
+                doc.http
+                    .insert(url.clone(), HttpAssertion { status: *status });
             }
         }
     }

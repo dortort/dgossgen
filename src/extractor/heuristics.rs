@@ -628,8 +628,9 @@ mod tests {
 
     #[test]
     fn test_component_detection_avoids_substring_false_positives() {
-        let cmd =
-            CommandForm::Shell("echo download javascript && apt-get install -y ca-certificates".to_string());
+        let cmd = CommandForm::Shell(
+            "echo download javascript && apt-get install -y ca-certificates".to_string(),
+        );
         let components = detect_installed_components(&cmd);
         assert!(!components.iter().any(|c| c.name == "node"));
         assert!(!components.iter().any(|c| c.name == "java"));
