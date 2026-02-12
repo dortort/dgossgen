@@ -20,19 +20,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -63,14 +58,19 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-            tar czf ../../../dgossgen-${{ matrix.target }}.tar.gz dgossgen
-          fi
+          tar czf ../../../dgossgen-${{ matrix.target }}.tar.gz dgossgen
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          shasum -a 256 dgossgen-${{ matrix.target }}.tar.gz > dgossgen-${{ matrix.target }}.tar.gz.sha256
 
       - uses: actions/upload-artifact@v4
         with:
           name: dgossgen-${{ matrix.target }}
-          path: dgossgen-${{ matrix.target }}.${{ matrix.archive }}
+          path: |
+            dgossgen-${{ matrix.target }}.tar.gz
+            dgossgen-${{ matrix.target }}.tar.gz.sha256
 
   release:
     name: Create Release
@@ -90,3 +90,87 @@ jobs:
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect SHA256 checksums
+        id: checksums
+        run: |
+          SHA_MACOS_ARM=$(cat artifacts/dgossgen-aarch64-apple-darwin/dgossgen-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_MACOS_X86=$(cat artifacts/dgossgen-x86_64-apple-darwin/dgossgen-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          SHA_LINUX_X86_MUSL=$(cat artifacts/dgossgen-x86_64-unknown-linux-musl/dgossgen-x86_64-unknown-linux-musl.tar.gz.sha256 | awk '{print $1}')
+          SHA_LINUX_ARM=$(cat artifacts/dgossgen-aarch64-unknown-linux-gnu/dgossgen-aarch64-unknown-linux-gnu.tar.gz.sha256 | awk '{print $1}')
+          echo "macos_arm=$SHA_MACOS_ARM" >> "$GITHUB_OUTPUT"
+          echo "macos_x86=$SHA_MACOS_X86" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_musl=$SHA_LINUX_X86_MUSL" >> "$GITHUB_OUTPUT"
+          echo "linux_arm=$SHA_LINUX_ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Generate formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cat > dgossgen.rb <<FORMULA
+          # typed: false
+          # frozen_string_literal: true
+
+          class Dgossgen < Formula
+            desc "Generate dgoss-ready test suites from Dockerfiles"
+            homepage "https://github.com/dortort/dgossgen"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/dortort/dgossgen/releases/download/v${VERSION}/dgossgen-aarch64-apple-darwin.tar.gz"
+                sha256 "${{ steps.checksums.outputs.macos_arm }}"
+              end
+              if Hardware::CPU.intel?
+                url "https://github.com/dortort/dgossgen/releases/download/v${VERSION}/dgossgen-x86_64-apple-darwin.tar.gz"
+                sha256 "${{ steps.checksums.outputs.macos_x86 }}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/dortort/dgossgen/releases/download/v${VERSION}/dgossgen-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${{ steps.checksums.outputs.linux_arm }}"
+              end
+              if Hardware::CPU.intel?
+                url "https://github.com/dortort/dgossgen/releases/download/v${VERSION}/dgossgen-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${{ steps.checksums.outputs.linux_x86_musl }}"
+              end
+            end
+
+            def install
+              bin.install "dgossgen"
+            end
+
+            test do
+              system "#{bin}/dgossgen", "--version"
+            end
+          end
+          FORMULA
+          # Fix indentation (heredoc adds leading spaces)
+          sed -i 's/^          //' dgossgen.rb
+
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: dgossgen.rb
+          destination_repo: dortort/homebrew-tap
+          destination_folder: Formula
+          user_email: github-actions[bot]@users.noreply.github.com
+          user_name: github-actions[bot]
+          commit_message: "dgossgen ${{ steps.version.outputs.version }}"
