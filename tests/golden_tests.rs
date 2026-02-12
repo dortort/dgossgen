@@ -430,20 +430,14 @@ EXPOSE 3000
     assert!(!policy.is_secret_key("APP_PORT"));
 }
 
-// --- Provenance comment tests ---
+// --- YAML validity tests ---
 
 #[test]
-fn test_output_contains_provenance_comments() {
+fn test_output_is_parseable_yaml() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[]);
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
-    assert!(
-        output.goss_yml.contains("# derived from"),
-        "output should contain provenance comments"
-    );
-    assert!(
-        output.goss_yml.contains("confidence:"),
-        "output should contain confidence tags"
-    );
+    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output.goss_yml);
+    assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");
 }

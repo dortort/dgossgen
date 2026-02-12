@@ -1,267 +1,170 @@
 use super::GossResource;
-use crate::Confidence;
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Serialize, Default)]
+struct GossDocument {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    file: BTreeMap<String, FileAssertion>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    port: BTreeMap<String, PortAssertion>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    process: BTreeMap<String, ProcessAssertion>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    command: BTreeMap<String, CommandAssertion>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    http: BTreeMap<String, HttpAssertion>,
+}
+
+impl GossDocument {
+    fn is_empty(&self) -> bool {
+        self.file.is_empty()
+            && self.port.is_empty()
+            && self.process.is_empty()
+            && self.command.is_empty()
+            && self.http.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FileAssertion {
+    exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filetype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PortAssertion {
+    listening: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessAssertion {
+    running: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandAssertion {
+    exec: String,
+    #[serde(rename = "exit-status")]
+    exit_status: i32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stdout: Vec<String>,
+    timeout: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpAssertion {
+    status: u16,
+}
 
 /// Render a list of GossResources into a goss.yml formatted string.
-/// Uses stable ordering and includes provenance comments.
 pub fn render_goss(resources: &[GossResource]) -> String {
-    let mut output = String::new();
+    let mut doc = GossDocument::default();
 
-    // Group resources by type for stable ordering
-    let files: Vec<_> = resources
-        .iter()
-        .filter(|r| matches!(r, GossResource::File { .. }))
-        .collect();
-    let ports: Vec<_> = resources
-        .iter()
-        .filter(|r| matches!(r, GossResource::Port { .. }))
-        .collect();
-    let processes: Vec<_> = resources
-        .iter()
-        .filter(|r| matches!(r, GossResource::Process { .. }))
-        .collect();
-    let commands: Vec<_> = resources
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                GossResource::Command { .. } | GossResource::CommandWithOutput { .. }
-            )
-        })
-        .collect();
-    let http: Vec<_> = resources
-        .iter()
-        .filter(|r| matches!(r, GossResource::Http { .. }))
-        .collect();
-
-    // Render each section
-    if !files.is_empty() {
-        output.push_str("file:\n");
-        for resource in &files {
-            render_file_resource(&mut output, resource);
+    for resource in resources {
+        match resource {
+            GossResource::File {
+                path,
+                exists,
+                filetype,
+                mode,
+                ..
+            } => {
+                doc.file.insert(
+                    path.clone(),
+                    FileAssertion {
+                        exists: *exists,
+                        filetype: filetype.clone(),
+                        mode: mode.clone(),
+                    },
+                );
+            }
+            GossResource::Port {
+                address,
+                listening,
+                ..
+            } => {
+                doc.port.insert(
+                    address.clone(),
+                    PortAssertion {
+                        listening: *listening,
+                    },
+                );
+            }
+            GossResource::Process { name, running, .. } => {
+                doc.process
+                    .insert(name.clone(), ProcessAssertion { running: *running });
+            }
+            GossResource::Command {
+                name,
+                command,
+                exit_status,
+                timeout,
+                ..
+            } => {
+                doc.command.insert(
+                    name.clone(),
+                    CommandAssertion {
+                        exec: command.clone(),
+                        exit_status: *exit_status,
+                        stdout: Vec::new(),
+                        timeout: *timeout,
+                    },
+                );
+            }
+            GossResource::CommandWithOutput {
+                name,
+                command,
+                exit_status,
+                stdout,
+                timeout,
+                ..
+            } => {
+                doc.command.insert(
+                    name.clone(),
+                    CommandAssertion {
+                        exec: command.clone(),
+                        exit_status: *exit_status,
+                        stdout: stdout.clone(),
+                        timeout: *timeout,
+                    },
+                );
+            }
+            GossResource::Http { url, status, .. } => {
+                doc.http.insert(url.clone(), HttpAssertion { status: *status });
+            }
         }
     }
 
-    if !ports.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("port:\n");
-        for resource in &ports {
-            render_port_resource(&mut output, resource);
-        }
+    if doc.is_empty() {
+        return "command: {}\n".to_string();
     }
 
-    if !processes.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("process:\n");
-        for resource in &processes {
-            render_process_resource(&mut output, resource);
-        }
-    }
-
-    if !commands.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("command:\n");
-        for resource in &commands {
-            render_command_resource(&mut output, resource);
-        }
-    }
-
-    if !http.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("http:\n");
-        for resource in &http {
-            render_http_resource(&mut output, resource);
-        }
-    }
-
-    if output.is_empty() {
-        // Emit a minimal valid goss.yml
-        output.push_str("# No assertions generated. Consider using --profile strict or providing more Dockerfile context.\n");
-        output.push_str("command: {}\n");
-    }
-
-    output
+    serde_yml::to_string(&doc).unwrap_or_else(|_| "command: {}\n".to_string())
 }
 
 /// Render goss_wait.yml with wait-specific resources.
 pub fn render_goss_wait(resources: &[GossResource]) -> String {
-    // Same structure as goss.yml but focused on readiness
     render_goss(resources)
 }
 
 /// Render a minimal viable wait file with just a port check.
 pub fn render_goss_wait_minimal(port: u16, protocol: &str) -> String {
-    let mut output = String::new();
-    output.push_str("# Minimal viable wait: port readiness check\n");
-    output.push_str(&format!(
-        "# derived from EXPOSE {}; confidence: medium\n",
-        port
-    ));
-    output.push_str("port:\n");
-    output.push_str(&format!("  {}:{}:\n", protocol, port));
-    output.push_str("    listening: true\n");
-    output
-}
-
-fn render_provenance_comment(output: &mut String, provenance: &str, confidence: Confidence) {
-    output.push_str(&format!(
-        "  # derived from {}; confidence: {}\n",
-        provenance, confidence
-    ));
-}
-
-fn render_file_resource(output: &mut String, resource: &GossResource) {
-    if let GossResource::File {
-        path,
-        exists,
-        filetype,
-        mode,
-        provenance,
-        confidence,
-    } = resource
-    {
-        render_provenance_comment(output, provenance, *confidence);
-        output.push_str(&format!("  {}:\n", yaml_escape_key(path)));
-        output.push_str(&format!("    exists: {}\n", exists));
-        if let Some(ft) = filetype {
-            output.push_str(&format!("    filetype: {}\n", ft));
-        }
-        if let Some(m) = mode {
-            output.push_str(&format!("    mode: \"{}\"\n", m));
-        }
-    }
-}
-
-fn render_port_resource(output: &mut String, resource: &GossResource) {
-    if let GossResource::Port {
-        address,
-        listening,
-        provenance,
-        confidence,
-    } = resource
-    {
-        render_provenance_comment(output, provenance, *confidence);
-        output.push_str(&format!("  {}:\n", address));
-        output.push_str(&format!("    listening: {}\n", listening));
-    }
-}
-
-fn render_process_resource(output: &mut String, resource: &GossResource) {
-    if let GossResource::Process {
-        name,
-        running,
-        provenance,
-        confidence,
-    } = resource
-    {
-        render_provenance_comment(output, provenance, *confidence);
-        output.push_str(&format!("  {}:\n", yaml_escape_key(name)));
-        output.push_str(&format!("    running: {}\n", running));
-    }
-}
-
-fn render_command_resource(output: &mut String, resource: &GossResource) {
-    match resource {
-        GossResource::Command {
-            name,
-            command,
-            exit_status,
-            timeout,
-            provenance,
-            confidence,
-        } => {
-            render_provenance_comment(output, provenance, *confidence);
-            output.push_str(&format!("  {}:\n", yaml_escape_key(name)));
-            output.push_str(&format!("    exec: \"{}\"\n", yaml_escape_value(command)));
-            output.push_str(&format!("    exit-status: {}\n", exit_status));
-            output.push_str(&format!("    timeout: {}\n", timeout));
-        }
-        GossResource::CommandWithOutput {
-            name,
-            command,
-            exit_status,
-            stdout,
-            timeout,
-            provenance,
-            confidence,
-        } => {
-            render_provenance_comment(output, provenance, *confidence);
-            output.push_str(&format!("  {}:\n", yaml_escape_key(name)));
-            output.push_str(&format!("    exec: \"{}\"\n", yaml_escape_value(command)));
-            output.push_str(&format!("    exit-status: {}\n", exit_status));
-            if !stdout.is_empty() {
-                output.push_str("    stdout:\n");
-                for line in stdout {
-                    output.push_str(&format!("      - \"{}\"\n", yaml_escape_value(line)));
-                }
-            }
-            output.push_str(&format!("    timeout: {}\n", timeout));
-        }
-        _ => {}
-    }
-}
-
-fn render_http_resource(output: &mut String, resource: &GossResource) {
-    if let GossResource::Http {
-        url,
-        status,
-        provenance,
-        confidence,
-    } = resource
-    {
-        render_provenance_comment(output, provenance, *confidence);
-        output.push_str(&format!("  {}:\n", yaml_escape_key(url)));
-        output.push_str(&format!("    status: {}\n", status));
-    }
-}
-
-/// Escape a YAML key (wrap in quotes if it contains special characters).
-fn yaml_escape_key(key: &str) -> String {
-    if key.contains(':')
-        || key.contains(' ')
-        || key.contains('#')
-        || key.contains('{')
-        || key.contains('}')
-        || key.contains('[')
-        || key.contains(']')
-        || key.contains(',')
-        || key.contains('&')
-        || key.contains('*')
-        || key.contains('!')
-        || key.contains('|')
-        || key.contains('>')
-        || key.contains('\'')
-        || key.contains('"')
-        || key.contains('%')
-        || key.contains('@')
-        || key.contains('`')
-    {
-        format!("\"{}\"", key.replace('"', "\\\""))
-    } else {
-        key.to_string()
-    }
-}
-
-/// Escape a YAML string value.
-fn yaml_escape_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut doc = GossDocument::default();
+    doc.port.insert(
+        format!("{}:{}", protocol, port),
+        PortAssertion { listening: true },
+    );
+    serde_yml::to_string(&doc).unwrap_or_else(|_| "command: {}\n".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Confidence;
 
     #[test]
     fn test_render_empty() {
@@ -281,7 +184,7 @@ mod tests {
         }];
         let output = render_goss(&resources);
         assert!(output.contains("file:"));
-        assert!(output.contains("/app:"));
+        assert!(output.contains("/app"));
         assert!(output.contains("exists: true"));
         assert!(output.contains("filetype: directory"));
     }
@@ -301,9 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn test_yaml_escape_key() {
-        assert_eq!(yaml_escape_key("simple"), "simple");
-        assert_eq!(yaml_escape_key("tcp:8080"), "\"tcp:8080\"");
+    fn test_rendered_yaml_is_parseable() {
+        let resources = vec![GossResource::Command {
+            name: "check".to_string(),
+            command: "echo hello && echo world".to_string(),
+            exit_status: 0,
+            timeout: 1000,
+            provenance: "RUN".to_string(),
+            confidence: Confidence::Low,
+        }];
+
+        let output = render_goss(&resources);
+        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        assert!(parsed.is_ok());
     }
 
     #[test]
@@ -334,7 +247,6 @@ mod tests {
         let file_pos = output.find("file:").unwrap();
         let port_pos = output.find("port:").unwrap();
         let process_pos = output.find("process:").unwrap();
-        // Stable order: file, port, process, command, http
         assert!(file_pos < port_pos);
         assert!(port_pos < process_pos);
     }

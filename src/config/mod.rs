@@ -64,7 +64,7 @@ impl PolicyConfig {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         let config: PolicyConfig =
-            serde_yaml::from_str(&content).with_context(|| "parsing config file")?;
+            serde_yml::from_str(&content).with_context(|| "parsing config file")?;
         Ok(config)
     }
 
@@ -216,7 +216,7 @@ secret_patterns:
   - SECRET
   - TOKEN
 "#;
-        let config: PolicyConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: PolicyConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(config.assert_ports, AssertionPolicy::Required);
         assert_eq!(config.assert_process, AssertionPolicy::Off);
         assert!(config.assert_file_modes);
