@@ -1,6 +1,7 @@
 /// Represents a parsed Dockerfile.
 #[derive(Debug, Clone)]
 pub struct Dockerfile {
+    pub global_args: Vec<ArgInstruction>,
     pub stages: Vec<Stage>,
 }
 
@@ -38,6 +39,13 @@ pub struct RawInstruction {
     pub line_number: usize,
     pub instruction: Instruction,
     pub raw: String,
+}
+
+/// A parsed ARG declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgInstruction {
+    pub name: String,
+    pub default: Option<String>,
 }
 
 /// The instruction types we handle for contract extraction.
