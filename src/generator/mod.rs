@@ -3,7 +3,7 @@ mod render;
 pub use render::*;
 
 use crate::config::PolicyConfig;
-use crate::extractor::{AssertionKind, ContractAssertion, RuntimeContract};
+use crate::extractor::{AssertionKind, ContractAssertion, PackageManager, RuntimeContract};
 use crate::{Confidence, Profile};
 
 /// Output of the goss generator.
@@ -277,6 +277,40 @@ fn build_main_resources(
                     resources.push(GossResource::Http {
                         url: url.clone(),
                         status: *status,
+                        provenance: assertion.provenance.clone(),
+                        confidence: assertion.confidence,
+                    });
+                }
+            }
+
+            AssertionKind::PackageInstalled {
+                package,
+                manager,
+                version_cmd,
+            } => {
+                // Primary assertion: package-manager-native check (works for any package)
+                let check_cmd = match manager {
+                    PackageManager::Apt => format!("dpkg -s {}", sanitize_shell_arg(package)),
+                    PackageManager::Apk => format!("apk info -e {}", sanitize_shell_arg(package)),
+                    PackageManager::Pip => format!("pip show {}", sanitize_shell_arg(package)),
+                    PackageManager::Npm => format!("npm list -g {}", sanitize_shell_arg(package)),
+                };
+                resources.push(GossResource::Command {
+                    name: format!("package-{}", command_to_name(package)),
+                    command: check_cmd,
+                    exit_status: 0,
+                    timeout: 10000,
+                    provenance: assertion.provenance.clone(),
+                    confidence: assertion.confidence,
+                });
+
+                // Enrichment: if we know a version command, add it too
+                if let Some(vcmd) = version_cmd {
+                    resources.push(GossResource::Command {
+                        name: command_to_name(vcmd),
+                        command: sanitize_command(vcmd),
+                        exit_status: 0,
+                        timeout: 10000,
                         provenance: assertion.provenance.clone(),
                         confidence: assertion.confidence,
                     });

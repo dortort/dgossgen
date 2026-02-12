@@ -543,6 +543,7 @@ fn assertion_type_name(kind: &AssertionKind) -> &'static str {
         AssertionKind::UserExists { .. } => "user",
         AssertionKind::HealthcheckPasses { .. } => "healthcheck",
         AssertionKind::HttpStatus { .. } => "http",
+        AssertionKind::PackageInstalled { .. } => "package",
     }
 }
 
@@ -592,6 +593,11 @@ fn assertion_description(kind: &AssertionKind) -> String {
         }
         AssertionKind::HttpStatus { url, status } => {
             format!("HTTP {} returns status {}", url, status)
+        }
+        AssertionKind::PackageInstalled {
+            package, manager, ..
+        } => {
+            format!("Package '{}' installed via {:?}", package, manager)
         }
     }
 }

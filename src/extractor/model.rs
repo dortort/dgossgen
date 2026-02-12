@@ -106,4 +106,22 @@ pub enum AssertionKind {
         url: String,
         status: u16,
     },
+    /// A package that should be installed, verified via the package manager.
+    PackageInstalled {
+        /// Package name as given to the package manager
+        package: String,
+        /// Package manager used to install it (apt, apk, pip, npm)
+        manager: PackageManager,
+        /// Optional enrichment: a known version-check command (e.g. "nginx -v")
+        version_cmd: Option<String>,
+    },
+}
+
+/// Supported package managers for installed-package assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageManager {
+    Apt,
+    Apk,
+    Pip,
+    Npm,
 }
