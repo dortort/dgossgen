@@ -11,7 +11,7 @@ impl Dockerfile {
             Some(name) => self.stages.iter().find(|s| {
                 s.alias
                     .as_ref()
-                    .map_or(false, |a| a.eq_ignore_ascii_case(name))
+                    .is_some_and(|a| a.eq_ignore_ascii_case(name))
             }),
             None => self.stages.last(),
         }
@@ -19,10 +19,7 @@ impl Dockerfile {
 
     /// Get all stage aliases for COPY --from resolution.
     pub fn stage_aliases(&self) -> Vec<String> {
-        self.stages
-            .iter()
-            .filter_map(|s| s.alias.clone())
-            .collect()
+        self.stages.iter().filter_map(|s| s.alias.clone()).collect()
     }
 }
 

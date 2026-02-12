@@ -7,7 +7,9 @@ pub mod probe;
 
 /// Confidence level for generated assertions.
 /// Higher confidence means lower risk of flaky tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Confidence {
     Low,
     Medium,

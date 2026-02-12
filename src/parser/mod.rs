@@ -38,9 +38,8 @@ fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
             current_line.clear();
         }
 
-        if trimmed.ends_with('\\') {
+        if let Some(without_backslash) = trimmed.strip_suffix('\\') {
             // Remove the backslash and accumulate
-            let without_backslash = &trimmed[..trimmed.len() - 1];
             if in_continuation {
                 current_line.push(' ');
                 current_line.push_str(without_backslash.trim());
@@ -154,10 +153,7 @@ fn parse_from(args: &str, line_num: usize) -> Result<RawInstruction> {
         idx += 1;
     }
 
-    let image = parts
-        .get(idx)
-        .unwrap_or(&"scratch")
-        .to_string();
+    let image = parts.get(idx).unwrap_or(&"scratch").to_string();
     idx += 1;
 
     let alias = if idx < parts.len() && parts[idx].eq_ignore_ascii_case("AS") {
@@ -211,14 +207,14 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
                 let key = remaining[..eq_pos].trim().to_string();
                 let after_eq = &remaining[eq_pos + 1..];
 
-                let (value, rest) = if after_eq.starts_with('"') {
+                let (value, rest) = if let Some(stripped) = after_eq.strip_prefix('"') {
                     // Quoted value
-                    if let Some(end_quote) = after_eq[1..].find('"') {
-                        let val = after_eq[1..=end_quote].to_string();
-                        let rest = after_eq[end_quote + 2..].to_string();
+                    if let Some(end_quote) = stripped.find('"') {
+                        let val = stripped[..end_quote].to_string();
+                        let rest = stripped[end_quote + 1..].to_string();
                         (val, rest)
                     } else {
-                        (after_eq[1..].to_string(), String::new())
+                        (stripped.to_string(), String::new())
                     }
                 } else {
                     // Unquoted value - goes until next whitespace
@@ -265,7 +261,10 @@ fn parse_expose(args: &str, line_num: usize, raw: &str) -> RawInstruction {
                 (p, "tcp".to_string())
             };
 
-            port_str.parse::<u16>().ok().map(|port| PortSpec { port, protocol })
+            port_str
+                .parse::<u16>()
+                .ok()
+                .map(|port| PortSpec { port, protocol })
         })
         .collect();
 
@@ -519,7 +518,10 @@ fn build_stages(instructions: Vec<RawInstruction>) -> Result<Vec<Stage>> {
         if matches!(inst.instruction, Instruction::From { .. }) {
             // Start a new stage
             if let Some(from_inst) = current_from.take() {
-                stages.push(build_single_stage(from_inst, std::mem::take(&mut current_instructions)));
+                stages.push(build_single_stage(
+                    from_inst,
+                    std::mem::take(&mut current_instructions),
+                ));
             }
             current_from = Some(inst);
         } else if current_from.is_some() {
@@ -626,8 +628,17 @@ ENV OLD_STYLE value
             })
             .collect();
         assert_eq!(envs.len(), 2);
-        assert_eq!(envs[0], vec![("KEY1".to_string(), "value1".to_string()), ("KEY2".to_string(), "value two".to_string())]);
-        assert_eq!(envs[1], vec![("OLD_STYLE".to_string(), "value".to_string())]);
+        assert_eq!(
+            envs[0],
+            vec![
+                ("KEY1".to_string(), "value1".to_string()),
+                ("KEY2".to_string(), "value two".to_string())
+            ]
+        );
+        assert_eq!(
+            envs[1],
+            vec![("OLD_STYLE".to_string(), "value".to_string())]
+        );
     }
 
     #[test]
@@ -683,7 +694,9 @@ COPY --from=builder /app /app
             .find(|i| matches!(i.instruction, Instruction::Copy { .. }))
             .unwrap();
         match &copy_inst.instruction {
-            Instruction::Copy { from_stage, dest, .. } => {
+            Instruction::Copy {
+                from_stage, dest, ..
+            } => {
                 assert_eq!(from_stage.as_deref(), Some("builder"));
                 assert_eq!(dest, "/app");
             }

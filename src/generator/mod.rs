@@ -30,8 +30,10 @@ pub fn generate(
     let mut warnings = Vec::new();
 
     // Partition assertions into wait vs. main
-    let (wait_assertions, main_assertions): (Vec<_>, Vec<_>) =
-        contract.assertions.iter().partition(|a| is_wait_assertion(a));
+    let (wait_assertions, main_assertions): (Vec<_>, Vec<_>) = contract
+        .assertions
+        .iter()
+        .partition(|a| is_wait_assertion(a));
 
     // Determine if we should generate goss_wait.yml
     let should_generate_wait = match force_wait {
@@ -47,8 +49,13 @@ pub fn generate(
 
     // Build goss_wait.yml
     let goss_wait_yml = if should_generate_wait {
-        let wait_resources =
-            build_wait_resources(&wait_assertions, &contract, min_confidence, policy, &mut warnings);
+        let wait_resources = build_wait_resources(
+            &wait_assertions,
+            contract,
+            min_confidence,
+            policy,
+            &mut warnings,
+        );
         if wait_resources.is_empty() {
             // Generate minimal viable wait from port check
             if let Some(port) = contract.exposed_ports.first() {
@@ -65,8 +72,13 @@ pub fn generate(
     };
 
     // Build goss.yml
-    let main_resources =
-        build_main_resources(&main_assertions, min_confidence, profile, policy, &mut warnings);
+    let main_resources = build_main_resources(
+        &main_assertions,
+        min_confidence,
+        profile,
+        policy,
+        &mut warnings,
+    );
     let goss_yml = render_goss(&main_resources);
 
     GeneratorOutput {
@@ -80,8 +92,7 @@ pub fn generate(
 fn is_wait_assertion(assertion: &ContractAssertion) -> bool {
     matches!(
         assertion.kind,
-        AssertionKind::HealthcheckPasses { .. }
-            | AssertionKind::PortListening { .. }
+        AssertionKind::HealthcheckPasses { .. } | AssertionKind::PortListening { .. }
     )
 }
 
@@ -131,7 +142,10 @@ fn build_wait_resources(
     }
 
     // If no healthcheck but we have process info, add process check
-    if resources.is_empty() || !resources.iter().any(|r| matches!(r, GossResource::Command { .. }))
+    if resources.is_empty()
+        || !resources
+            .iter()
+            .any(|r| matches!(r, GossResource::Command { .. }))
     {
         if let Some(ep) = &contract.entrypoint {
             if let Some(binary) = ep.primary_binary() {
@@ -309,11 +323,7 @@ fn command_to_name(command: &str) -> String {
 /// Sanitize a command string for safe YAML embedding.
 fn sanitize_command(command: &str) -> String {
     // Remove potentially dangerous characters but keep the command functional
-    command
-        .replace('\0', "")
-        .replace('\r', "")
-        .trim()
-        .to_string()
+    command.replace(['\0', '\r'], "").trim().to_string()
 }
 
 /// Sanitize a shell argument to prevent injection.

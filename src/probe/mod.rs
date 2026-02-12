@@ -145,8 +145,7 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
     }
 
     // Step 3: Collect evidence (with timeout)
-    let evidence =
-        collect_evidence(&rt, &container_name, &image_tag, config.timeout);
+    let evidence = collect_evidence(&rt, &container_name, &image_tag, config.timeout);
 
     // Step 4: Clean up
     let _ = Command::new(&rt)
@@ -282,9 +281,10 @@ pub fn merge_evidence(contract: &mut RuntimeContract, evidence: &ProbeEvidence) 
 
     // Add new evidence-based assertions for discovered ports not in static analysis
     for (port, proto) in &evidence.listening_ports {
-        let already_exists = contract.assertions.iter().any(|a| {
-            matches!(&a.kind, AssertionKind::PortListening { port: p, .. } if p == port)
-        });
+        let already_exists = contract
+            .assertions
+            .iter()
+            .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: p, .. } if p == port));
         if !already_exists {
             contract.assertions.push(ContractAssertion {
                 kind: AssertionKind::PortListening {

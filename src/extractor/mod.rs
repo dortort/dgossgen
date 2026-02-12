@@ -36,7 +36,8 @@ pub fn extract_contract(
                 if resolved.starts_with('/') {
                     current_workdir = resolved.clone();
                 } else {
-                    current_workdir = format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
+                    current_workdir =
+                        format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
                 }
                 contract.workdir = Some(current_workdir.clone());
                 contract.assertions.push(ContractAssertion {
@@ -196,11 +197,7 @@ pub fn extract_contract(
                     )
                 };
 
-                let confidence = if from_stage.is_some() {
-                    Confidence::Medium
-                } else {
-                    Confidence::Medium
-                };
+                let confidence = Confidence::Medium;
 
                 let is_dir = full_dest.ends_with('/');
                 let filetype = if is_dir {
@@ -215,7 +212,17 @@ pub fn extract_contract(
                         filetype,
                         mode: chmod.clone(),
                     },
-                    provenance: format!("COPY {} {}", if from_stage.is_some() { format!("--from={}", from_stage.as_ref().unwrap()) } else { "".to_string() }, dest).trim().to_string(),
+                    provenance: format!(
+                        "COPY {} {}",
+                        if from_stage.is_some() {
+                            format!("--from={}", from_stage.as_ref().unwrap())
+                        } else {
+                            "".to_string()
+                        },
+                        dest
+                    )
+                    .trim()
+                    .to_string(),
                     source_line: inst.line_number,
                     confidence,
                 });
@@ -235,9 +242,7 @@ pub fn extract_contract(
                     });
                 }
 
-                contract
-                    .filesystem_paths
-                    .push(full_dest);
+                contract.filesystem_paths.push(full_dest);
             }
 
             Instruction::Add {
@@ -339,9 +344,10 @@ HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost/ || exit 1
         let contract = extract_contract(&df, None, &[]);
 
         assert!(contract.healthcheck.is_some());
-        let has_healthcheck_assertion = contract.assertions.iter().any(|a| {
-            matches!(a.kind, AssertionKind::HealthcheckPasses { .. })
-        });
+        let has_healthcheck_assertion = contract
+            .assertions
+            .iter()
+            .any(|a| matches!(a.kind, AssertionKind::HealthcheckPasses { .. }));
         assert!(has_healthcheck_assertion);
     }
 

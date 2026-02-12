@@ -18,17 +18,17 @@ pub struct InteractiveSession {
 /// Run interactive Q&A to refine the contract and generation.
 pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession> {
     println!();
-    println!("{}", style("=== dgossgen interactive mode ===").bold().cyan());
+    println!(
+        "{}",
+        style("=== dgossgen interactive mode ===").bold().cyan()
+    );
     println!();
 
     // Show inferred contract summary
     print_contract_summary(contract);
 
     println!();
-    println!(
-        "{}",
-        style("Let's refine the test configuration:").bold()
-    );
+    println!("{}", style("Let's refine the test configuration:").bold());
     println!();
 
     let mut session = InteractiveSession {
@@ -105,10 +105,7 @@ pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession>
 
     // Q4: Volume mounts
     if !contract.volumes.is_empty() {
-        println!(
-            "\n{}",
-            style("Declared volumes:").dim()
-        );
+        println!("\n{}", style("Declared volumes:").dim());
         for vol in &contract.volumes {
             println!("  - {}", vol);
         }
@@ -138,10 +135,7 @@ pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession>
 /// Preview generated output and offer accept/edit/regenerate.
 pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
     println!();
-    println!(
-        "{}",
-        style("=== Generated goss.yml ===").bold().green()
-    );
+    println!("{}", style("=== Generated goss.yml ===").bold().green());
     println!("{}", &output.goss_yml);
 
     if let Some(wait) = &output.goss_wait_yml {
@@ -153,10 +147,7 @@ pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
     }
 
     if !output.warnings.is_empty() {
-        println!(
-            "\n{}",
-            style("Warnings:").bold().yellow()
-        );
+        println!("\n{}", style("Warnings:").bold().yellow());
         for w in &output.warnings {
             println!("  - {}", w);
         }
@@ -164,7 +155,11 @@ pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
 
     println!();
 
-    let actions = vec!["Accept", "Edit in $EDITOR", "Regenerate (different strictness)"];
+    let actions = vec![
+        "Accept",
+        "Edit in $EDITOR",
+        "Regenerate (different strictness)",
+    ];
     let selection = Select::new()
         .with_prompt("What would you like to do?")
         .items(&actions)
@@ -189,11 +184,7 @@ pub enum UserAction {
 
 /// Print a summary of the inferred contract.
 fn print_contract_summary(contract: &RuntimeContract) {
-    println!(
-        "{} {}",
-        style("Base image:").dim(),
-        contract.base_image
-    );
+    println!("{} {}", style("Base image:").dim(), contract.base_image);
 
     if let Some(workdir) = &contract.workdir {
         println!("{} {}", style("Working dir:").dim(), workdir);
@@ -209,19 +200,11 @@ fn print_contract_summary(contract: &RuntimeContract) {
             .iter()
             .map(|p| format!("{}/{}", p.port, p.protocol))
             .collect();
-        println!(
-            "{} {}",
-            style("Exposed ports:").dim(),
-            ports.join(", ")
-        );
+        println!("{} {}", style("Exposed ports:").dim(), ports.join(", "));
     }
 
     if let Some(ep) = &contract.entrypoint {
-        println!(
-            "{} {}",
-            style("Entrypoint:").dim(),
-            ep.to_string_lossy()
-        );
+        println!("{} {}", style("Entrypoint:").dim(), ep.to_string_lossy());
     }
 
     if let Some(cmd) = &contract.cmd {

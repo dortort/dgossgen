@@ -25,14 +25,14 @@ fn test_nginx_contract_extraction() {
     assert!(contract.healthcheck.is_some());
 
     // Should have assertions for: files, ports, healthcheck, process
-    assert!(contract.assertions.iter().any(|a| matches!(
-        &a.kind,
-        AssertionKind::PortListening { port: 80, .. }
-    )));
-    assert!(contract.assertions.iter().any(|a| matches!(
-        &a.kind,
-        AssertionKind::HealthcheckPasses { .. }
-    )));
+    assert!(contract
+        .assertions
+        .iter()
+        .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: 80, .. })));
+    assert!(contract
+        .assertions
+        .iter()
+        .any(|a| matches!(&a.kind, AssertionKind::HealthcheckPasses { .. })));
 }
 
 #[test]
@@ -41,10 +41,19 @@ fn test_nginx_generates_wait_file() {
     let contract = extractor::extract_contract(&df, None, &[]);
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
-    assert!(output.goss_wait_yml.is_some(), "nginx with healthcheck should generate wait file");
+    assert!(
+        output.goss_wait_yml.is_some(),
+        "nginx with healthcheck should generate wait file"
+    );
     let wait = output.goss_wait_yml.unwrap();
-    assert!(wait.contains("command:"), "wait file should have command section");
-    assert!(wait.contains("healthcheck"), "wait file should contain healthcheck");
+    assert!(
+        wait.contains("command:"),
+        "wait file should have command section"
+    );
+    assert!(
+        wait.contains("healthcheck"),
+        "wait file should contain healthcheck"
+    );
 }
 
 #[test]
@@ -55,7 +64,10 @@ fn test_nginx_goss_yml_content() {
 
     let yml = &output.goss_yml;
     assert!(yml.contains("file:"), "should have file assertions");
-    assert!(yml.contains("/etc/nginx/nginx.conf"), "should check nginx config");
+    assert!(
+        yml.contains("/etc/nginx/nginx.conf"),
+        "should check nginx config"
+    );
 }
 
 // --- Node.js multistage fixture tests ---
@@ -117,7 +129,10 @@ fn test_python_simple_contract() {
     assert_eq!(contract.exposed_ports[0].port, 5000);
 
     // Environment variables should be captured
-    assert!(contract.env.iter().any(|(k, v)| k == "FLASK_APP" && v == "app.py"));
+    assert!(contract
+        .env
+        .iter()
+        .any(|(k, v)| k == "FLASK_APP" && v == "app.py"));
 }
 
 #[test]
@@ -215,8 +230,10 @@ fn test_minimal_profile_skips_low_confidence() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[]);
 
-    let output_strict = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
-    let output_minimal = generator::generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
+    let output_strict =
+        generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+    let output_minimal =
+        generator::generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
 
     // Strict profile should include more assertions (or equal) than minimal
     let strict_lines = output_strict.goss_yml.lines().count();
@@ -240,8 +257,14 @@ fn test_generation_is_idempotent() {
     let output1 = generator::generate(&contract, Profile::Standard, &policy, None);
     let output2 = generator::generate(&contract, Profile::Standard, &policy, None);
 
-    assert_eq!(output1.goss_yml, output2.goss_yml, "goss.yml should be idempotent");
-    assert_eq!(output1.goss_wait_yml, output2.goss_wait_yml, "goss_wait.yml should be idempotent");
+    assert_eq!(
+        output1.goss_yml, output2.goss_yml,
+        "goss.yml should be idempotent"
+    );
+    assert_eq!(
+        output1.goss_wait_yml, output2.goss_wait_yml,
+        "goss_wait.yml should be idempotent"
+    );
 }
 
 // --- Stable ordering test ---
@@ -274,18 +297,34 @@ fn test_output_has_stable_ordering() {
 fn test_no_wait_flag() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[]);
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), Some(false));
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        Some(false),
+    );
 
-    assert!(output.goss_wait_yml.is_none(), "--no-wait should suppress wait file");
+    assert!(
+        output.goss_wait_yml.is_none(),
+        "--no-wait should suppress wait file"
+    );
 }
 
 #[test]
 fn test_force_wait_flag() {
     let df = parser::parse_dockerfile(&fixture_path("python_simple.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[]);
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), Some(true));
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        Some(true),
+    );
 
-    assert!(output.goss_wait_yml.is_some(), "--force-wait should always generate wait file");
+    assert!(
+        output.goss_wait_yml.is_some(),
+        "--force-wait should always generate wait file"
+    );
 }
 
 // --- Secret redaction tests ---
