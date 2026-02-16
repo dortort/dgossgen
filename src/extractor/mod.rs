@@ -113,7 +113,8 @@ pub fn extract_contract(
 
             Instruction::Entrypoint(cmd) => {
                 contract.entrypoint = Some(cmd.clone());
-                if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", inst.line_number) {
+                if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", inst.line_number)
+                {
                     contract.assertions.push(assertion);
                 }
             }
@@ -272,12 +273,20 @@ fn make_process_assertion(
     ))
 }
 
-fn resolve_dest_path(dest: &str, resolver: &crate::parser::VariableResolver, current_workdir: &str) -> String {
+fn resolve_dest_path(
+    dest: &str,
+    resolver: &crate::parser::VariableResolver,
+    current_workdir: &str,
+) -> String {
     let resolved_dest = resolver.resolve(dest);
     if resolved_dest.starts_with('/') {
         resolved_dest
     } else {
-        format!("{}/{}", current_workdir.trim_end_matches('/'), resolved_dest)
+        format!(
+            "{}/{}",
+            current_workdir.trim_end_matches('/'),
+            resolved_dest
+        )
     }
 }
 

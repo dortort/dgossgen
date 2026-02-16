@@ -382,14 +382,24 @@ fn detect_apt_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(make_package_assertion(pkg, PackageManager::Apt, "RUN apt-get install", source_line))
+    Some(make_package_assertion(
+        pkg,
+        PackageManager::Apt,
+        "RUN apt-get install",
+        source_line,
+    ))
 }
 
 fn detect_apk_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(make_package_assertion(pkg, PackageManager::Apk, "RUN apk add", source_line))
+    Some(make_package_assertion(
+        pkg,
+        PackageManager::Apk,
+        "RUN apk add",
+        source_line,
+    ))
 }
 
 fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -406,7 +416,12 @@ fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(make_package_assertion(pkg_name, PackageManager::Pip, "RUN pip install", source_line))
+    Some(make_package_assertion(
+        pkg_name,
+        PackageManager::Pip,
+        "RUN pip install",
+        source_line,
+    ))
 }
 
 fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -427,7 +442,12 @@ fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(make_package_assertion(pkg_name, PackageManager::Npm, "RUN npm install", source_line))
+    Some(make_package_assertion(
+        pkg_name,
+        PackageManager::Npm,
+        "RUN npm install",
+        source_line,
+    ))
 }
 
 fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -438,7 +458,12 @@ fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAsse
     if pkg_name.is_empty() || !pkg_name.contains('/') {
         return None;
     }
-    Some(make_package_assertion(pkg_name, PackageManager::Composer, "RUN composer require", source_line))
+    Some(make_package_assertion(
+        pkg_name,
+        PackageManager::Composer,
+        "RUN composer require",
+        source_line,
+    ))
 }
 
 /// Detect user creation commands.
