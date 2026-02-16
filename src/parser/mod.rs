@@ -293,11 +293,31 @@ fn parse_volume(args: &str, line_num: usize, raw: &str) -> RawInstruction {
     }
 }
 
+/// Parse source files and destination from COPY/ADD arguments after flags have been consumed.
+fn parse_sources_and_dest(parts: &[&str], start_idx: usize) -> (Vec<String>, String) {
+    let file_parts = &parts[start_idx..];
+    let dest = if file_parts.len() > 1 {
+        file_parts.last().unwrap_or(&".").to_string()
+    } else if file_parts.len() == 1 {
+        file_parts[0].to_string()
+    } else {
+        ".".to_string()
+    };
+
+    let mut sources = Vec::new();
+    if file_parts.len() > 1 {
+        for s in &file_parts[..file_parts.len() - 1] {
+            sources.push(s.to_string());
+        }
+    }
+
+    (sources, dest)
+}
+
 fn parse_copy(args: &str, line_num: usize, raw: &str) -> RawInstruction {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let mut from_stage = None;
     let mut chmod = None;
-    let mut sources = Vec::new();
     let mut idx = 0;
 
     // Parse flags
@@ -316,21 +336,7 @@ fn parse_copy(args: &str, line_num: usize, raw: &str) -> RawInstruction {
         }
     }
 
-    // Remaining parts: sources... dest
-    let file_parts = &parts[idx..];
-    let dest = if file_parts.len() > 1 {
-        file_parts.last().unwrap_or(&".").to_string()
-    } else if file_parts.len() == 1 {
-        file_parts[0].to_string()
-    } else {
-        ".".to_string()
-    };
-
-    if file_parts.len() > 1 {
-        for s in &file_parts[..file_parts.len() - 1] {
-            sources.push(s.to_string());
-        }
-    }
+    let (sources, dest) = parse_sources_and_dest(&parts, idx);
 
     RawInstruction {
         line_number: line_num,
@@ -347,7 +353,6 @@ fn parse_copy(args: &str, line_num: usize, raw: &str) -> RawInstruction {
 fn parse_add(args: &str, line_num: usize, raw: &str) -> RawInstruction {
     let parts: Vec<&str> = args.split_whitespace().collect();
     let mut chmod = None;
-    let mut sources = Vec::new();
     let mut idx = 0;
 
     while idx < parts.len() {
@@ -361,20 +366,7 @@ fn parse_add(args: &str, line_num: usize, raw: &str) -> RawInstruction {
         }
     }
 
-    let file_parts = &parts[idx..];
-    let dest = if file_parts.len() > 1 {
-        file_parts.last().unwrap_or(&".").to_string()
-    } else if file_parts.len() == 1 {
-        file_parts[0].to_string()
-    } else {
-        ".".to_string()
-    };
-
-    if file_parts.len() > 1 {
-        for s in &file_parts[..file_parts.len() - 1] {
-            sources.push(s.to_string());
-        }
-    }
+    let (sources, dest) = parse_sources_and_dest(&parts, idx);
 
     RawInstruction {
         line_number: line_num,
