@@ -72,6 +72,22 @@ pub struct ContractAssertion {
     pub confidence: Confidence,
 }
 
+impl ContractAssertion {
+    pub fn new(
+        kind: AssertionKind,
+        provenance: impl Into<String>,
+        source_line: usize,
+        confidence: Confidence,
+    ) -> Self {
+        Self {
+            kind,
+            provenance: provenance.into(),
+            source_line,
+            confidence,
+        }
+    }
+}
+
 /// Types of assertions that can be generated.
 #[derive(Debug, Clone)]
 pub enum AssertionKind {
@@ -125,4 +141,11 @@ pub enum PackageManager {
     Pip,
     Npm,
     Composer,
+}
+
+/// Check whether a binary name refers to a shell interpreter.
+/// Handles both bare names ("sh", "bash") and absolute paths ("/bin/sh", "/usr/bin/bash").
+pub(crate) fn is_shell_interpreter(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    matches!(base, "sh" | "bash" | "dash" | "zsh" | "ash")
 }

@@ -222,18 +222,18 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         if let Some(path) = &session.health_path {
             let status = session.health_status.unwrap_or(200);
-            contract.assertions.push(extractor::ContractAssertion {
-                kind: AssertionKind::HttpStatus {
+            contract.assertions.push(extractor::ContractAssertion::new(
+                AssertionKind::HttpStatus {
                     url: format!(
                         "http://127.0.0.1:{}{path}",
                         session.primary_port.unwrap_or(80)
                     ),
                     status,
                 },
-                provenance: "interactive: user-provided health endpoint".to_string(),
-                source_line: 0,
-                confidence: Confidence::High,
-            });
+                "interactive: user-provided health endpoint",
+                0,
+                Confidence::High,
+            ));
         }
 
         // Generate
@@ -260,15 +260,15 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             let port = common
                 .primary_port
                 .unwrap_or_else(|| contract.exposed_ports.first().map(|p| p.port).unwrap_or(80));
-            contract.assertions.push(extractor::ContractAssertion {
-                kind: AssertionKind::HttpStatus {
+            contract.assertions.push(extractor::ContractAssertion::new(
+                AssertionKind::HttpStatus {
                     url: format!("http://127.0.0.1:{}{path}", port),
                     status: common.health_status,
                 },
-                provenance: "CLI: --health-path flag".to_string(),
-                source_line: 0,
-                confidence: Confidence::High,
-            });
+                "CLI: --health-path flag",
+                0,
+                Confidence::High,
+            ));
         }
 
         // Non-interactive generation
