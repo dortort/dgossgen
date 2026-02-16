@@ -113,44 +113,16 @@ pub fn extract_contract(
 
             Instruction::Entrypoint(cmd) => {
                 contract.entrypoint = Some(cmd.clone());
-                if let Some(binary) = cmd.primary_binary() {
-                    let confidence = match cmd {
-                        CommandForm::Exec(_) => Confidence::Medium,
-                        CommandForm::Shell(_) => Confidence::Low,
-                    };
-                    // Don't assert process for shell interpreters
-                    if !is_shell_interpreter(&binary) {
-                        contract.assertions.push(ContractAssertion::new(
-                            AssertionKind::ProcessRunning {
-                                name: binary.clone(),
-                            },
-                            format!("ENTRYPOINT {}", cmd.to_string_lossy()),
-                            inst.line_number,
-                            confidence,
-                        ));
-                    }
+                if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", inst.line_number) {
+                    contract.assertions.push(assertion);
                 }
             }
 
             Instruction::Cmd(cmd) => {
                 contract.cmd = Some(cmd.clone());
-                // Only add process assertion if no ENTRYPOINT is set
                 if contract.entrypoint.is_none() {
-                    if let Some(binary) = cmd.primary_binary() {
-                        let confidence = match cmd {
-                            CommandForm::Exec(_) => Confidence::Medium,
-                            CommandForm::Shell(_) => Confidence::Low,
-                        };
-                        if !is_shell_interpreter(&binary) {
-                            contract.assertions.push(ContractAssertion::new(
-                                AssertionKind::ProcessRunning {
-                                    name: binary.clone(),
-                                },
-                                format!("CMD {}", cmd.to_string_lossy()),
-                                inst.line_number,
-                                confidence,
-                            ));
-                        }
+                    if let Some(assertion) = make_process_assertion(cmd, "CMD", inst.line_number) {
+                        contract.assertions.push(assertion);
                     }
                 }
             }
@@ -188,16 +160,7 @@ pub fn extract_contract(
             } => {
                 // Only assert on files copied from within the build (not from other stages
                 // where we can't know what was built), unless the dest is an absolute path
-                let resolved_dest = resolver.resolve(dest);
-                let full_dest = if resolved_dest.starts_with('/') {
-                    resolved_dest.clone()
-                } else {
-                    format!(
-                        "{}/{}",
-                        current_workdir.trim_end_matches('/'),
-                        resolved_dest
-                    )
-                };
+                let full_dest = resolve_dest_path(dest, &resolver, &current_workdir);
 
                 let confidence = Confidence::Medium;
 
@@ -250,16 +213,7 @@ pub fn extract_contract(
                 dest,
                 chmod,
             } => {
-                let resolved_dest = resolver.resolve(dest);
-                let full_dest = if resolved_dest.starts_with('/') {
-                    resolved_dest.clone()
-                } else {
-                    format!(
-                        "{}/{}",
-                        current_workdir.trim_end_matches('/'),
-                        resolved_dest
-                    )
-                };
+                let full_dest = resolve_dest_path(dest, &resolver, &current_workdir);
 
                 contract.assertions.push(ContractAssertion::new(
                     AssertionKind::FileExists {
@@ -295,6 +249,36 @@ pub fn extract_contract(
     contract.assertions.extend(service_assertions);
 
     contract
+}
+
+fn make_process_assertion(
+    cmd: &CommandForm,
+    provenance_prefix: &str,
+    source_line: usize,
+) -> Option<ContractAssertion> {
+    let binary = cmd.primary_binary()?;
+    let confidence = match cmd {
+        CommandForm::Exec(_) => Confidence::Medium,
+        CommandForm::Shell(_) => Confidence::Low,
+    };
+    if is_shell_interpreter(&binary) {
+        return None;
+    }
+    Some(ContractAssertion::new(
+        AssertionKind::ProcessRunning { name: binary },
+        format!("{} {}", provenance_prefix, cmd.to_string_lossy()),
+        source_line,
+        confidence,
+    ))
+}
+
+fn resolve_dest_path(dest: &str, resolver: &crate::parser::VariableResolver, current_workdir: &str) -> String {
+    let resolved_dest = resolver.resolve(dest);
+    if resolved_dest.starts_with('/') {
+        resolved_dest
+    } else {
+        format!("{}/{}", current_workdir.trim_end_matches('/'), resolved_dest)
+    }
 }
 
 fn is_entrypoint_path(path: &str) -> bool {
