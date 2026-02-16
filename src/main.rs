@@ -186,29 +186,44 @@ fn parse_profile(s: &str) -> Result<Profile> {
     s.parse::<Profile>().map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
-    let profile = parse_profile(&common.profile)?;
-    let build_args = parse_build_args(&common.build_args);
-
-    // Parse Dockerfile
-    let dockerfile = parser::parse_dockerfile(&common.dockerfile)
-        .with_context(|| format!("parsing {}", common.dockerfile.display()))?;
-
-    // Extract contract
-    let mut contract =
-        extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
-
-    // Load policy
-    let policy = PolicyConfig::load_or_default(&common.context);
-
-    // Apply interactive refinement if requested
-    let force_wait = if common.no_wait {
+fn resolve_force_wait(no_wait: bool, force_wait: bool) -> Option<bool> {
+    if no_wait {
         Some(false)
-    } else if common.force_wait {
+    } else if force_wait {
         Some(true)
     } else {
         None
-    };
+    }
+}
+
+type LoadedContract = (Profile, Vec<(String, String)>, extractor::RuntimeContract);
+
+fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
+    let profile = parse_profile(&common.profile)?;
+    let build_args = parse_build_args(&common.build_args);
+    let dockerfile = parser::parse_dockerfile(&common.dockerfile)
+        .with_context(|| format!("parsing {}", common.dockerfile.display()))?;
+    let contract = extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
+    Ok((profile, build_args, contract))
+}
+
+fn emit_output(output_dir: &Path, output: &generator::GeneratorOutput) -> Result<ExitCode> {
+    if !output.warnings.is_empty() {
+        for w in &output.warnings {
+            eprintln!("{} {}", style("warning:").yellow(), w);
+        }
+    }
+    output::write_output(output_dir, output)?;
+    if !output.warnings.is_empty() {
+        return Ok(ExitCode::from(2));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
+    let (profile, _build_args, mut contract) = load_contract(&common)?;
+    let policy = PolicyConfig::load_or_default(&common.context);
+    let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     if interactive {
         let session = interactive::run_interactive(&contract)?;
@@ -273,16 +288,9 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
-        if !output.warnings.is_empty() {
-            for w in &output.warnings {
-                eprintln!("{} {}", style("warning:").yellow(), w);
-            }
-        }
-
-        output::write_output(&common.output_dir, &output)?;
-
-        if !output.warnings.is_empty() {
-            return Ok(ExitCode::from(2));
+        let exit_code = emit_output(&common.output_dir, &output)?;
+        if exit_code != ExitCode::SUCCESS {
+            return Ok(exit_code);
         }
     }
 
@@ -301,20 +309,13 @@ fn cmd_probe(
     unsafe_run_arg: bool,
     allow_network: bool,
 ) -> Result<ExitCode> {
-    let profile = parse_profile(&common.profile)?;
-    let build_args = parse_build_args(&common.build_args);
+    let (profile, build_args, mut contract) = load_contract(&common)?;
 
     let rt: ContainerRuntime = runtime
         .parse()
         .map_err(|e: String| anyhow::anyhow!("{}", e))?;
 
-    // Check runtime availability
     probe::check_runtime(rt)?;
-
-    // Phase A: Static analysis
-    let dockerfile = parser::parse_dockerfile(&common.dockerfile)?;
-    let mut contract =
-        extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
 
     eprintln!(
         "{} Phase A (static analysis) complete: {} assertions",
@@ -347,32 +348,14 @@ fn cmd_probe(
 
     // Generate
     let policy = PolicyConfig::load_or_default(&common.context);
-    let force_wait = if common.no_wait {
-        Some(false)
-    } else if common.force_wait {
-        Some(true)
-    } else {
-        None
-    };
+    let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
-    if !output.warnings.is_empty() {
-        for w in &output.warnings {
-            eprintln!("{} {}", style("warning:").yellow(), w);
-        }
-        return Ok(ExitCode::from(2));
-    }
-
-    output::write_output(&common.output_dir, &output)?;
-
-    Ok(ExitCode::SUCCESS)
+    emit_output(&common.output_dir, &output)
 }
 
 fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
-    let build_args = parse_build_args(&common.build_args);
-
-    let dockerfile = parser::parse_dockerfile(&common.dockerfile)?;
-    let contract = extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
+    let (_profile, _build_args, contract) = load_contract(&common)?;
 
     println!("{}", style("=== dgossgen explain ===").bold().cyan());
     println!();
