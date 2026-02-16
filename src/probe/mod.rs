@@ -444,15 +444,15 @@ pub fn merge_evidence(contract: &mut RuntimeContract, evidence: &ProbeEvidence) 
             .iter()
             .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: p, .. } if p == port));
         if !already_exists {
-            contract.assertions.push(ContractAssertion {
-                kind: AssertionKind::PortListening {
+            contract.assertions.push(ContractAssertion::new(
+                AssertionKind::PortListening {
                     protocol: proto.clone(),
                     port: *port,
                 },
-                provenance: "probe: discovered listening port".to_string(),
-                source_line: 0,
-                confidence: Confidence::High,
-            });
+                "probe: discovered listening port",
+                0,
+                Confidence::High,
+            ));
         }
     }
 }
@@ -504,15 +504,15 @@ mod tests {
                 port: 8080,
                 protocol: "tcp".to_string(),
             }],
-            assertions: vec![ContractAssertion {
-                kind: AssertionKind::PortListening {
+            assertions: vec![ContractAssertion::new(
+                AssertionKind::PortListening {
                     protocol: "tcp".to_string(),
                     port: 8080,
                 },
-                provenance: "EXPOSE 8080".to_string(),
-                source_line: 5,
-                confidence: Confidence::Medium,
-            }],
+                "EXPOSE 8080",
+                5,
+                Confidence::Medium,
+            )],
             ..Default::default()
         };
 

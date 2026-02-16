@@ -170,25 +170,25 @@ pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<Con
     for component in components {
         match component.name.as_str() {
             "nginx" => {
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::FileExists {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::FileExists {
                         path: "/etc/nginx/nginx.conf".to_string(),
                         filetype: Some("file".to_string()),
                         mode: None,
                     },
-                    provenance: "nginx service pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Medium,
-                });
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                    "nginx service pattern",
+                    component.source_line,
+                    Confidence::Medium,
+                ));
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: "nginx -v".to_string(),
                         exit_status: 0,
                     },
-                    provenance: "nginx service pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Medium,
-                });
+                    "nginx service pattern",
+                    component.source_line,
+                    Confidence::Medium,
+                ));
             }
             "apache2" | "httpd" => {
                 let binary = if component.name == "apache2" {
@@ -196,59 +196,59 @@ pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<Con
                 } else {
                     "httpd"
                 };
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: format!("{} -v", binary),
                         exit_status: 0,
                     },
-                    provenance: format!("{} service pattern", component.name),
-                    source_line: component.source_line,
-                    confidence: Confidence::Medium,
-                });
+                    format!("{} service pattern", component.name),
+                    component.source_line,
+                    Confidence::Medium,
+                ));
             }
             "python" | "python3" => {
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: "python3 --version".to_string(),
                         exit_status: 0,
                     },
-                    provenance: "python runtime pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Low,
-                });
+                    "python runtime pattern",
+                    component.source_line,
+                    Confidence::Low,
+                ));
             }
             "node" => {
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: "node --version".to_string(),
                         exit_status: 0,
                     },
-                    provenance: "node runtime pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Low,
-                });
+                    "node runtime pattern",
+                    component.source_line,
+                    Confidence::Low,
+                ));
             }
             "java" => {
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: "java -version".to_string(),
                         exit_status: 0,
                     },
-                    provenance: "java runtime pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Low,
-                });
+                    "java runtime pattern",
+                    component.source_line,
+                    Confidence::Low,
+                ));
             }
             "redis" => {
-                assertions.push(ContractAssertion {
-                    kind: AssertionKind::CommandExit {
+                assertions.push(ContractAssertion::new(
+                    AssertionKind::CommandExit {
                         command: "redis-cli --version".to_string(),
                         exit_status: 0,
                     },
-                    provenance: "redis service pattern".to_string(),
-                    source_line: component.source_line,
-                    confidence: Confidence::Medium,
-                });
+                    "redis service pattern",
+                    component.source_line,
+                    Confidence::Medium,
+                ));
             }
             _ => {}
         }
@@ -364,32 +364,32 @@ fn detect_apt_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(ContractAssertion {
-        kind: AssertionKind::PackageInstalled {
+    Some(ContractAssertion::new(
+        AssertionKind::PackageInstalled {
             package: pkg.to_string(),
             manager: PackageManager::Apt,
             version_cmd: known_version_cmd(pkg),
         },
-        provenance: format!("RUN apt-get install {}", pkg),
+        format!("RUN apt-get install {}", pkg),
         source_line,
-        confidence: Confidence::Low,
-    })
+        Confidence::Low,
+    ))
 }
 
 fn detect_apk_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(ContractAssertion {
-        kind: AssertionKind::PackageInstalled {
+    Some(ContractAssertion::new(
+        AssertionKind::PackageInstalled {
             package: pkg.to_string(),
             manager: PackageManager::Apk,
             version_cmd: known_version_cmd(pkg),
         },
-        provenance: format!("RUN apk add {}", pkg),
+        format!("RUN apk add {}", pkg),
         source_line,
-        confidence: Confidence::Low,
-    })
+        Confidence::Low,
+    ))
 }
 
 fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -406,16 +406,16 @@ fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(ContractAssertion {
-        kind: AssertionKind::PackageInstalled {
+    Some(ContractAssertion::new(
+        AssertionKind::PackageInstalled {
             package: pkg_name.to_string(),
             manager: PackageManager::Pip,
             version_cmd: known_version_cmd(pkg_name),
         },
-        provenance: format!("RUN pip install {}", pkg_name),
+        format!("RUN pip install {}", pkg_name),
         source_line,
-        confidence: Confidence::Low,
-    })
+        Confidence::Low,
+    ))
 }
 
 fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -436,16 +436,16 @@ fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(ContractAssertion {
-        kind: AssertionKind::PackageInstalled {
+    Some(ContractAssertion::new(
+        AssertionKind::PackageInstalled {
             package: pkg_name.to_string(),
             manager: PackageManager::Npm,
             version_cmd: known_version_cmd(pkg_name),
         },
-        provenance: format!("RUN npm install {}", pkg_name),
+        format!("RUN npm install {}", pkg_name),
         source_line,
-        confidence: Confidence::Low,
-    })
+        Confidence::Low,
+    ))
 }
 
 fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -456,16 +456,16 @@ fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAsse
     if pkg_name.is_empty() || !pkg_name.contains('/') {
         return None;
     }
-    Some(ContractAssertion {
-        kind: AssertionKind::PackageInstalled {
+    Some(ContractAssertion::new(
+        AssertionKind::PackageInstalled {
             package: pkg_name.to_string(),
             manager: PackageManager::Composer,
             version_cmd: None,
         },
-        provenance: format!("RUN composer require {}", pkg_name),
+        format!("RUN composer require {}", pkg_name),
         source_line,
-        confidence: Confidence::Low,
-    })
+        Confidence::Low,
+    ))
 }
 
 /// Detect user creation commands.
@@ -475,14 +475,14 @@ fn detect_user_creation(cmd_str: &str, source_line: usize) -> Option<ContractAss
             let name = username.as_str().to_string();
             // Filter out flags that look like usernames
             if !name.starts_with('-') {
-                return Some(ContractAssertion {
-                    kind: AssertionKind::UserExists {
+                return Some(ContractAssertion::new(
+                    AssertionKind::UserExists {
                         username: name.clone(),
                     },
-                    provenance: format!("RUN useradd/adduser {}", name),
+                    format!("RUN useradd/adduser {}", name),
                     source_line,
-                    confidence: Confidence::Medium,
-                });
+                    Confidence::Medium,
+                ));
             }
         }
     }

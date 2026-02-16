@@ -41,16 +41,16 @@ pub fn extract_contract(
                         format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
                 }
                 contract.workdir = Some(current_workdir.clone());
-                contract.assertions.push(ContractAssertion {
-                    kind: AssertionKind::FileExists {
+                contract.assertions.push(ContractAssertion::new(
+                    AssertionKind::FileExists {
                         path: current_workdir.clone(),
                         filetype: Some("directory".to_string()),
                         mode: None,
                     },
-                    provenance: format!("WORKDIR {}", dir),
-                    source_line: inst.line_number,
-                    confidence: Confidence::High,
-                });
+                    format!("WORKDIR {}", dir),
+                    inst.line_number,
+                    Confidence::High,
+                ));
             }
 
             Instruction::User(user) => {
@@ -58,42 +58,42 @@ pub fn extract_contract(
                 contract.user = Some(resolved.clone());
 
                 if resolved.chars().all(|c| c.is_ascii_digit()) {
-                    contract.assertions.push(ContractAssertion {
-                        kind: AssertionKind::CommandOutput {
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::CommandOutput {
                             command: "id -u".to_string(),
                             exit_status: 0,
                             expected_output: vec![resolved.clone()],
                         },
-                        provenance: format!("USER {}", user),
-                        source_line: inst.line_number,
-                        confidence: Confidence::High,
-                    });
+                        format!("USER {}", user),
+                        inst.line_number,
+                        Confidence::High,
+                    ));
                 } else {
                     // Split user:group if present
                     let username = resolved.split(':').next().unwrap_or(&resolved);
-                    contract.assertions.push(ContractAssertion {
-                        kind: AssertionKind::UserExists {
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::UserExists {
                             username: username.to_string(),
                         },
-                        provenance: format!("USER {}", user),
-                        source_line: inst.line_number,
-                        confidence: Confidence::High,
-                    });
+                        format!("USER {}", user),
+                        inst.line_number,
+                        Confidence::High,
+                    ));
                 }
             }
 
             Instruction::Expose(ports) => {
                 for port_spec in ports {
                     contract.exposed_ports.push(port_spec.clone());
-                    contract.assertions.push(ContractAssertion {
-                        kind: AssertionKind::PortListening {
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::PortListening {
                             protocol: port_spec.protocol.clone(),
                             port: port_spec.port,
                         },
-                        provenance: format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
-                        source_line: inst.line_number,
-                        confidence: Confidence::Medium,
-                    });
+                        format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
+                        inst.line_number,
+                        Confidence::Medium,
+                    ));
                 }
             }
 
@@ -120,14 +120,14 @@ pub fn extract_contract(
                     };
                     // Don't assert process for shell interpreters
                     if !is_shell_interpreter(&binary) {
-                        contract.assertions.push(ContractAssertion {
-                            kind: AssertionKind::ProcessRunning {
+                        contract.assertions.push(ContractAssertion::new(
+                            AssertionKind::ProcessRunning {
                                 name: binary.clone(),
                             },
-                            provenance: format!("ENTRYPOINT {}", cmd.to_string_lossy()),
-                            source_line: inst.line_number,
+                            format!("ENTRYPOINT {}", cmd.to_string_lossy()),
+                            inst.line_number,
                             confidence,
-                        });
+                        ));
                     }
                 }
             }
@@ -142,14 +142,14 @@ pub fn extract_contract(
                             CommandForm::Shell(_) => Confidence::Low,
                         };
                         if !is_shell_interpreter(&binary) {
-                            contract.assertions.push(ContractAssertion {
-                                kind: AssertionKind::ProcessRunning {
+                            contract.assertions.push(ContractAssertion::new(
+                                AssertionKind::ProcessRunning {
                                     name: binary.clone(),
                                 },
-                                provenance: format!("CMD {}", cmd.to_string_lossy()),
-                                source_line: inst.line_number,
+                                format!("CMD {}", cmd.to_string_lossy()),
+                                inst.line_number,
                                 confidence,
-                            });
+                            ));
                         }
                     }
                 }
@@ -170,14 +170,14 @@ pub fn extract_contract(
                     retries: *retries,
                 });
                 // Healthcheck-derived wait assertion
-                contract.assertions.push(ContractAssertion {
-                    kind: AssertionKind::HealthcheckPasses {
+                contract.assertions.push(ContractAssertion::new(
+                    AssertionKind::HealthcheckPasses {
                         command: cmd.to_string_lossy(),
                     },
-                    provenance: format!("HEALTHCHECK CMD {}", cmd.to_string_lossy()),
-                    source_line: inst.line_number,
-                    confidence: Confidence::High,
-                });
+                    format!("HEALTHCHECK CMD {}", cmd.to_string_lossy()),
+                    inst.line_number,
+                    Confidence::High,
+                ));
             }
 
             Instruction::Copy {
@@ -231,16 +231,16 @@ pub fn extract_contract(
                     .to_string()
                 };
 
-                contract.assertions.push(ContractAssertion {
-                    kind: AssertionKind::FileExists {
+                contract.assertions.push(ContractAssertion::new(
+                    AssertionKind::FileExists {
                         path: full_dest.clone(),
                         filetype,
                         mode,
                     },
                     provenance,
-                    source_line: inst.line_number,
+                    inst.line_number,
                     confidence,
-                });
+                ));
 
                 contract.filesystem_paths.push(full_dest);
             }
@@ -261,16 +261,16 @@ pub fn extract_contract(
                     )
                 };
 
-                contract.assertions.push(ContractAssertion {
-                    kind: AssertionKind::FileExists {
+                contract.assertions.push(ContractAssertion::new(
+                    AssertionKind::FileExists {
                         path: full_dest.clone(),
                         filetype: None,
                         mode: chmod.clone(),
                     },
-                    provenance: format!("ADD {}", dest),
-                    source_line: inst.line_number,
-                    confidence: Confidence::Medium,
-                });
+                    format!("ADD {}", dest),
+                    inst.line_number,
+                    Confidence::Medium,
+                ));
 
                 contract.filesystem_paths.push(full_dest);
             }
@@ -295,13 +295,6 @@ pub fn extract_contract(
     contract.assertions.extend(service_assertions);
 
     contract
-}
-
-fn is_shell_interpreter(name: &str) -> bool {
-    matches!(
-        name,
-        "sh" | "bash" | "dash" | "zsh" | "ash" | "/bin/sh" | "/bin/bash"
-    )
 }
 
 fn is_entrypoint_path(path: &str) -> bool {
