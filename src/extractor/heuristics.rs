@@ -360,36 +360,36 @@ fn extract_package_assertions(
     }
 }
 
+fn make_package_assertion(
+    pkg_name: &str,
+    manager: PackageManager,
+    provenance_prefix: &str,
+    source_line: usize,
+) -> ContractAssertion {
+    ContractAssertion::new(
+        AssertionKind::PackageInstalled {
+            package: pkg_name.to_string(),
+            manager,
+            version_cmd: known_version_cmd(pkg_name),
+        },
+        format!("{} {}", provenance_prefix, pkg_name),
+        source_line,
+        Confidence::Low,
+    )
+}
+
 fn detect_apt_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(ContractAssertion::new(
-        AssertionKind::PackageInstalled {
-            package: pkg.to_string(),
-            manager: PackageManager::Apt,
-            version_cmd: known_version_cmd(pkg),
-        },
-        format!("RUN apt-get install {}", pkg),
-        source_line,
-        Confidence::Low,
-    ))
+    Some(make_package_assertion(pkg, PackageManager::Apt, "RUN apt-get install", source_line))
 }
 
 fn detect_apk_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
     if is_low_value_package(pkg) {
         return None;
     }
-    Some(ContractAssertion::new(
-        AssertionKind::PackageInstalled {
-            package: pkg.to_string(),
-            manager: PackageManager::Apk,
-            version_cmd: known_version_cmd(pkg),
-        },
-        format!("RUN apk add {}", pkg),
-        source_line,
-        Confidence::Low,
-    ))
+    Some(make_package_assertion(pkg, PackageManager::Apk, "RUN apk add", source_line))
 }
 
 fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -406,16 +406,7 @@ fn detect_pip_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(ContractAssertion::new(
-        AssertionKind::PackageInstalled {
-            package: pkg_name.to_string(),
-            manager: PackageManager::Pip,
-            version_cmd: known_version_cmd(pkg_name),
-        },
-        format!("RUN pip install {}", pkg_name),
-        source_line,
-        Confidence::Low,
-    ))
+    Some(make_package_assertion(pkg_name, PackageManager::Pip, "RUN pip install", source_line))
 }
 
 fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -436,16 +427,7 @@ fn detect_npm_package(pkg: &str, source_line: usize) -> Option<ContractAssertion
     if pkg_name.is_empty() {
         return None;
     }
-    Some(ContractAssertion::new(
-        AssertionKind::PackageInstalled {
-            package: pkg_name.to_string(),
-            manager: PackageManager::Npm,
-            version_cmd: known_version_cmd(pkg_name),
-        },
-        format!("RUN npm install {}", pkg_name),
-        source_line,
-        Confidence::Low,
-    ))
+    Some(make_package_assertion(pkg_name, PackageManager::Npm, "RUN npm install", source_line))
 }
 
 fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAssertion> {
@@ -456,16 +438,7 @@ fn detect_composer_package(pkg: &str, source_line: usize) -> Option<ContractAsse
     if pkg_name.is_empty() || !pkg_name.contains('/') {
         return None;
     }
-    Some(ContractAssertion::new(
-        AssertionKind::PackageInstalled {
-            package: pkg_name.to_string(),
-            manager: PackageManager::Composer,
-            version_cmd: None,
-        },
-        format!("RUN composer require {}", pkg_name),
-        source_line,
-        Confidence::Low,
-    ))
+    Some(make_package_assertion(pkg_name, PackageManager::Composer, "RUN composer require", source_line))
 }
 
 /// Detect user creation commands.
