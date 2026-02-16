@@ -3,7 +3,9 @@ mod render;
 pub use render::*;
 
 use crate::config::PolicyConfig;
-use crate::extractor::{AssertionKind, ContractAssertion, PackageManager, RuntimeContract};
+use crate::extractor::{
+    is_shell_interpreter, AssertionKind, ContractAssertion, PackageManager, RuntimeContract,
+};
 use crate::{Confidence, Profile};
 
 /// Output of the goss generator.
@@ -149,7 +151,7 @@ fn build_wait_resources(
     {
         if let Some(ep) = &contract.entrypoint {
             if let Some(binary) = ep.primary_binary() {
-                if !is_shell_name(&binary) {
+                if !is_shell_interpreter(&binary) {
                     resources.push(GossResource::Process {
                         name: binary,
                         running: true,
@@ -411,10 +413,6 @@ fn sanitize_shell_arg(arg: &str) -> String {
     } else {
         format!("'{}'", arg.replace('\'', "'\\''"))
     }
-}
-
-fn is_shell_name(name: &str) -> bool {
-    matches!(name, "sh" | "bash" | "dash" | "zsh" | "ash")
 }
 
 /// A typed goss resource for rendering.
