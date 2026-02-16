@@ -167,17 +167,16 @@ Checks for:
 
 ### Architecture
 
-```
-Dockerfile ──> [Parser] ──> AST
-                              │
-                              v
-                    [Contract Extractor] ──> Runtime Contract Model (RCM)
-                              │                        │
-                              v                        v
-                    [Evidence Engine]          [Goss Generator]
-                    (optional probe)                   │
-                              │                        v
-                              └──────────> goss.yml + goss_wait.yml
+```mermaid
+flowchart TD
+    A[Dockerfile] --> B[Parser]
+    B --> C[AST]
+    C --> D[Contract Extractor]
+    D --> E[Runtime Contract Model]
+    E --> F["Evidence Engine<br/>(optional probe)"]
+    F -- merges back --> E
+    E --> G[Goss Generator]
+    G --> H[goss.yml + goss_wait.yml]
 ```
 
 1. **Dockerfile Parser**: Parses the Dockerfile into an AST, handling multi-stage builds, continuation lines, variable substitution (`$VAR`, `${VAR:-default}`), and all instruction types.
