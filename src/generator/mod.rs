@@ -98,6 +98,24 @@ fn is_wait_assertion(assertion: &ContractAssertion) -> bool {
     )
 }
 
+/// Returns `true` if the assertion passes the confidence threshold; logs a warning if not.
+fn passes_confidence(
+    assertion: &ContractAssertion,
+    min_confidence: Confidence,
+    context: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if assertion.confidence < min_confidence {
+        warnings.push(format!(
+            "Skipped {} (confidence too low): {}",
+            context, assertion.provenance
+        ));
+        false
+    } else {
+        true
+    }
+}
+
 /// Build wait file resources.
 fn build_wait_resources(
     assertions: &[&ContractAssertion],
@@ -110,11 +128,7 @@ fn build_wait_resources(
 
     // Healthcheck-derived command (highest priority)
     for assertion in assertions {
-        if assertion.confidence < min_confidence {
-            warnings.push(format!(
-                "Skipped wait assertion (confidence too low): {}",
-                assertion.provenance
-            ));
+        if !passes_confidence(assertion, min_confidence, "wait assertion", warnings) {
             continue;
         }
 
@@ -177,11 +191,7 @@ fn build_main_resources(
     let mut resources = Vec::new();
 
     for assertion in assertions {
-        if assertion.confidence < min_confidence {
-            warnings.push(format!(
-                "Skipped assertion (confidence too low): {}",
-                assertion.provenance
-            ));
+        if !passes_confidence(assertion, min_confidence, "assertion", warnings) {
             continue;
         }
 
