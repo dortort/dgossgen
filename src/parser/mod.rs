@@ -36,6 +36,17 @@ fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
         let line_num = idx + 1; // 1-based
         let trimmed = line.trim_end();
 
+        // Strip whole-line comments before joining continuations, matching
+        // BuildKit's order of operations (remove comment lines first, then join).
+        // A comment line neither opens nor extends a continuation, regardless of
+        // whether it ends in a backslash. Only whole-line comments are stripped:
+        // a `#` appearing mid-line inside shell text is not a Dockerfile comment.
+        // Parser directives (`# syntax=`, `# escape=`) are comment-shaped and are
+        // harmlessly ignored here as well.
+        if trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+
         if !in_continuation {
             start_line_num = line_num;
             current_line.clear();
@@ -606,6 +617,76 @@ EXPOSE 80
             .filter(|i| matches!(i.instruction, Instruction::Run(_)))
             .count();
         assert_eq!(run_count, 1);
+    }
+
+    #[test]
+    fn test_comment_inside_continuation_is_stripped() {
+        // A comment line inside a backslash-continued RUN must be removed, not
+        // terminate the continuation. Otherwise the trailing physical line
+        // (`apt-get install ...`) is dropped and package evidence is lost.
+        let content = r#"
+FROM ubuntu:22.04
+RUN apt-get update && \
+    # install deps
+    apt-get install -y nginx
+EXPOSE 80
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs: Vec<String> = df.stages[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match &i.instruction {
+                Instruction::Run(cmd) => Some(cmd.to_string_lossy()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1, "the RUN must remain a single instruction");
+        // Both halves of the continuation must survive the comment.
+        assert!(
+            runs[0].contains("apt-get update"),
+            "first half lost: {}",
+            runs[0]
+        );
+        assert!(
+            runs[0].contains("apt-get install -y nginx"),
+            "second half (after the comment) was dropped: {}",
+            runs[0]
+        );
+        // The comment text itself must not leak into the merged command.
+        assert!(
+            !runs[0].contains("install deps"),
+            "comment text leaked into the command: {}",
+            runs[0]
+        );
+        // EXPOSE that follows must still parse.
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_comment_ending_in_backslash_does_not_open_continuation() {
+        // `# ... \` is a whole-line comment; Docker never continues a comment
+        // line, so the following instruction must not be swallowed.
+        let content = r#"
+FROM nginx
+# pin base image \
+EXPOSE 8080
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let expose = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Expose(ports) => Some(ports.clone()),
+                _ => None,
+            });
+        assert!(
+            expose.is_some(),
+            "EXPOSE after a backslash-terminated comment was swallowed"
+        );
+        assert_eq!(expose.unwrap()[0].port, 8080);
     }
 
     #[test]
