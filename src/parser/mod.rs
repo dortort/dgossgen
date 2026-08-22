@@ -264,9 +264,16 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
         while let Some((i, c)) = chars.next() {
             match c {
                 '\\' => {
-                    // Escape: emit the next char literally (if any).
-                    if let Some((_, next)) = chars.next() {
-                        val.push(next);
+                    // Inside double quotes, a backslash escapes only `"`, `\`
+                    // and `$` (matching Docker/BuildKit); before any other
+                    // character it is a literal backslash, so a value such as
+                    // `"\d+\w"` is preserved rather than mangled to `d+w`.
+                    match chars.clone().next() {
+                        Some((_, next)) if matches!(next, '"' | '\\' | '$') => {
+                            val.push(next);
+                            chars.next();
+                        }
+                        _ => val.push('\\'),
                     }
                 }
                 '"' => return (val, &stripped[i + 1..]),
@@ -833,6 +840,21 @@ ENV OLD_STYLE value
             envs,
             vec![vec![("MSG".to_string(), "say \"hi\"".to_string())]]
         );
+    }
+
+    #[test]
+    fn test_parse_env_double_quoted_value_keeps_literal_backslashes() {
+        // A backslash before an ordinary char is literal (not an escape), so
+        // regex/path-like values survive intact.
+        let envs = env_pairs("FROM alpine\nENV RE=\"\\d+\\w\"\n");
+        assert_eq!(envs, vec![vec![("RE".to_string(), "\\d+\\w".to_string())]]);
+    }
+
+    #[test]
+    fn test_parse_env_double_quoted_value_escapes_backslash_and_dollar() {
+        // `\\` collapses to one backslash; `\$` drops the escape.
+        let envs = env_pairs("FROM alpine\nENV P=\"a\\\\b\\$c\"\n");
+        assert_eq!(envs, vec![vec![("P".to_string(), "a\\b$c".to_string())]]);
     }
 
     #[test]
