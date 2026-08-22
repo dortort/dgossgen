@@ -234,6 +234,37 @@ fn test_complex_healthcheck_service_detection() {
     )));
 }
 
+#[test]
+fn test_healthcheck_unknown_flag_not_in_wait_file() {
+    // A HEALTHCHECK using --start-interval (Docker Engine 25+) must yield a
+    // wait-file command with no flag tokens and no literal CMD keyword, so the
+    // generated readiness gate can actually pass.
+    let df =
+        parser::parse_dockerfile(&fixture_path("healthcheck_start_interval.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+    let wait = output
+        .goss_wait_yml
+        .expect("healthcheck fixture should generate a wait file");
+    assert!(
+        wait.contains("healthcheck"),
+        "wait file should contain the healthcheck command"
+    );
+    assert!(
+        wait.contains("curl -f http://localhost:8080/"),
+        "wait file should carry the real healthcheck command, got:\n{wait}"
+    );
+    assert!(
+        !wait.contains("--start-interval"),
+        "unknown flag must not leak into the wait command, got:\n{wait}"
+    );
+    assert!(
+        !wait.contains("CMD"),
+        "literal CMD keyword must not leak into the wait command, got:\n{wait}"
+    );
+}
+
 // --- Profile behavior tests ---
 
 #[test]
