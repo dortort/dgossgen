@@ -789,6 +789,118 @@ ENV OLD_STYLE value
         );
     }
 
+    /// Collect all `ENV` pairs from the first stage of a parsed Dockerfile.
+    fn env_pairs(content: &str) -> Vec<Vec<(String, String)>> {
+        let df = parse_dockerfile_content(content).unwrap();
+        df.stages[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match &i.instruction {
+                Instruction::Env(pairs) => Some(pairs.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_env_legacy_value_with_equals() {
+        // Legacy form: value itself contains '='; must not be split mid-value.
+        let envs = env_pairs("FROM alpine\nENV JAVA_OPTS -Dfoo=bar\n");
+        assert_eq!(
+            envs,
+            vec![vec![("JAVA_OPTS".to_string(), "-Dfoo=bar".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_legacy_value_with_multiple_tokens_and_equals() {
+        let envs = env_pairs(
+            "FROM alpine\nENV JAVA_TOOL_OPTIONS -Xmx512m -Dspring.profiles.active=prod\n",
+        );
+        assert_eq!(
+            envs,
+            vec![vec![(
+                "JAVA_TOOL_OPTIONS".to_string(),
+                "-Xmx512m -Dspring.profiles.active=prod".to_string()
+            )]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_double_quoted_value_with_escaped_quotes() {
+        let envs = env_pairs("FROM alpine\nENV MSG=\"say \\\"hi\\\"\"\n");
+        assert_eq!(
+            envs,
+            vec![vec![("MSG".to_string(), "say \"hi\"".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_single_quoted_value_with_spaces() {
+        let envs = env_pairs("FROM alpine\nENV KEY='a b'\n");
+        assert_eq!(envs, vec![vec![("KEY".to_string(), "a b".to_string())]]);
+    }
+
+    #[test]
+    fn test_parse_env_empty_value() {
+        let envs = env_pairs("FROM alpine\nENV KEY=\n");
+        assert_eq!(envs, vec![vec![("KEY".to_string(), String::new())]]);
+    }
+
+    #[test]
+    fn test_parse_env_multiple_pairs_after_quoted_value() {
+        let envs = env_pairs("FROM alpine\nENV A=\"x y\" B=z\n");
+        assert_eq!(
+            envs,
+            vec![vec![
+                ("A".to_string(), "x y".to_string()),
+                ("B".to_string(), "z".to_string())
+            ]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_legacy_single_token() {
+        // `ENV KEY` (no value) is a legacy single pair with an empty value.
+        let envs = env_pairs("FROM alpine\nENV STANDALONE\n");
+        assert_eq!(envs, vec![vec![("STANDALONE".to_string(), String::new())]]);
+    }
+
+    #[test]
+    fn test_parse_healthcheck_unknown_flag_does_not_leak_into_command() {
+        // --start-interval (Docker Engine 25+) is unknown to us; it and the
+        // literal `CMD` keyword must not leak into the parsed command, and the
+        // later known --interval flag must still be captured.
+        let content = r#"
+FROM nginx
+HEALTHCHECK --start-interval=5s --interval=30s CMD curl -f http://localhost/
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let hc = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Healthcheck { cmd, interval, .. } => {
+                    Some((cmd.clone(), interval.clone()))
+                }
+                _ => None,
+            })
+            .expect("healthcheck instruction");
+
+        let (cmd, interval) = hc;
+        assert_eq!(interval, Some("30s".to_string()));
+        let cmd_str = cmd.to_string_lossy();
+        assert_eq!(cmd_str, "curl -f http://localhost/");
+        assert!(
+            !cmd_str.contains("--"),
+            "command must not contain flag tokens: {cmd_str}"
+        );
+        assert!(
+            !cmd_str.contains("CMD"),
+            "command must not contain the CMD keyword: {cmd_str}"
+        );
+    }
+
     #[test]
     fn test_parse_healthcheck() {
         let content = r#"
