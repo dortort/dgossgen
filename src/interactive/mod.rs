@@ -136,7 +136,7 @@ pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession>
 pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
     println!();
     println!("{}", style("=== Generated goss.yml ===").bold().green());
-    println!("{}", &output.goss_yml);
+    println!("{}", output.goss_yml);
 
     if let Some(wait) = &output.goss_wait_yml {
         println!(
