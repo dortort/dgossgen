@@ -690,6 +690,47 @@ EXPOSE 8080
     }
 
     #[test]
+    fn test_continuation_body_after_comment_is_not_a_phantom_instruction() {
+        // The more insidious variant of the comment-in-continuation bug: when the
+        // dropped body line happens to start with a Dockerfile keyword, the old
+        // parser fabricated a phantom instruction (e.g. `env FOO=bar` -> ENV).
+        // The body line must stay part of the single RUN, and no ENV may appear.
+        let content = r#"
+FROM alpine
+RUN echo start && \
+    # note
+    env FOO=bar
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::Env(_))),
+            "continuation body line was fabricated into a phantom ENV instruction"
+        );
+        let runs: Vec<String> = df.stages[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match &i.instruction {
+                Instruction::Run(cmd) => Some(cmd.to_string_lossy()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1, "the RUN must remain a single instruction");
+        assert!(
+            runs[0].contains("echo start"),
+            "first half lost: {}",
+            runs[0]
+        );
+        assert!(
+            runs[0].contains("env FOO=bar"),
+            "continuation body after the comment was dropped: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
     fn test_parse_env_forms() {
         let content = r#"
 FROM alpine
