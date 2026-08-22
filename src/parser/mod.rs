@@ -206,54 +206,39 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
     let mut pairs = Vec::new();
 
     // ENV supports two forms:
-    // ENV KEY=VALUE KEY2=VALUE2
-    // ENV KEY VALUE (legacy single pair)
-    if args.contains('=') {
+    //   ENV KEY=VALUE KEY2=VALUE2   (modern)
+    //   ENV KEY VALUE               (legacy single pair)
+    //
+    // Docker selects the modern form iff the FIRST whitespace-delimited token
+    // contains '='. Testing for '=' *anywhere* in the args is wrong: a legacy
+    // value may itself contain '=' (e.g. `ENV JAVA_OPTS -Dfoo=bar`, which
+    // Docker parses as key `JAVA_OPTS`, value `-Dfoo=bar`).
+    let first_token = args.split_whitespace().next().unwrap_or("");
+    if first_token.contains('=') {
         // Modern form with = sign(s)
-        let mut remaining = args.to_string();
-        while !remaining.is_empty() {
-            remaining = remaining.trim_start().to_string();
+        let mut remaining = args;
+        loop {
+            remaining = remaining.trim_start();
             if remaining.is_empty() {
                 break;
             }
 
-            if let Some(eq_pos) = remaining.find('=') {
-                let key = remaining[..eq_pos].trim().to_string();
-                let after_eq = &remaining[eq_pos + 1..];
-
-                let (value, rest) = if let Some(stripped) = after_eq.strip_prefix('"') {
-                    // Quoted value
-                    if let Some(end_quote) = stripped.find('"') {
-                        let val = stripped[..end_quote].to_string();
-                        let rest = stripped[end_quote + 1..].to_string();
-                        (val, rest)
-                    } else {
-                        (stripped.to_string(), String::new())
-                    }
-                } else {
-                    // Unquoted value - goes until next whitespace
-                    match after_eq.find(|c: char| c.is_whitespace()) {
-                        Some(pos) => {
-                            let val = after_eq[..pos].to_string();
-                            let rest = after_eq[pos..].to_string();
-                            (val, rest)
-                        }
-                        None => (after_eq.to_string(), String::new()),
-                    }
-                };
-
-                pairs.push((key, value));
-                remaining = rest;
-            } else {
+            let Some(eq_pos) = remaining.find('=') else {
                 break;
-            }
+            };
+            let key = remaining[..eq_pos].trim().to_string();
+            let after_eq = &remaining[eq_pos + 1..];
+            let (value, rest) = parse_env_value(after_eq);
+            pairs.push((key, value));
+            remaining = rest;
         }
     } else {
-        // Legacy form: ENV KEY VALUE
+        // Legacy form: ENV KEY VALUE — the value is the entire remainder,
+        // verbatim, even if it contains '='.
         let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
         if parts.len() == 2 {
             pairs.push((parts[0].to_string(), parts[1].trim().to_string()));
-        } else if parts.len() == 1 {
+        } else if parts.len() == 1 && !parts[0].is_empty() {
             pairs.push((parts[0].to_string(), String::new()));
         }
     }
@@ -262,6 +247,44 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
         line_number: line_num,
         instruction: Instruction::Env(pairs),
         raw: format!("ENV {args}"),
+    }
+}
+
+/// Parse a single modern-form ENV value beginning immediately after the `=`.
+///
+/// Handles three cases and returns the decoded value plus the unconsumed
+/// remainder (which holds any further `KEY=VALUE` pairs):
+///   - double-quoted, honoring backslash escapes (`"say \"hi\""` → `say "hi"`)
+///   - single-quoted, taken literally (`'a b'` → `a b`)
+///   - unquoted, terminated by the next whitespace
+fn parse_env_value(after_eq: &str) -> (String, &str) {
+    if let Some(stripped) = after_eq.strip_prefix('"') {
+        let mut val = String::new();
+        let mut chars = stripped.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    // Escape: emit the next char literally (if any).
+                    if let Some((_, next)) = chars.next() {
+                        val.push(next);
+                    }
+                }
+                '"' => return (val, &stripped[i + 1..]),
+                _ => val.push(c),
+            }
+        }
+        // Unterminated quote: take the rest as the value.
+        (val, "")
+    } else if let Some(stripped) = after_eq.strip_prefix('\'') {
+        match stripped.find('\'') {
+            Some(end) => (stripped[..end].to_string(), &stripped[end + 1..]),
+            None => (stripped.to_string(), ""),
+        }
+    } else {
+        match after_eq.find(char::is_whitespace) {
+            Some(pos) => (after_eq[..pos].to_string(), &after_eq[pos..]),
+            None => (after_eq.to_string(), ""),
+        }
     }
 }
 
