@@ -143,15 +143,13 @@ fn build_wait_resources(
                     confidence: assertion.confidence,
                 });
             }
-            AssertionKind::PortListening { protocol, port } => {
-                if policy.assert_ports_enabled() {
-                    resources.push(GossResource::Port {
-                        address: format!("{}:{}", protocol, port),
-                        listening: true,
-                        provenance: assertion.provenance.clone(),
-                        confidence: assertion.confidence,
-                    });
-                }
+            AssertionKind::PortListening { protocol, port } if policy.assert_ports_enabled() => {
+                resources.push(GossResource::Port {
+                    address: format!("{}:{}", protocol, port),
+                    listening: true,
+                    provenance: assertion.provenance.clone(),
+                    confidence: assertion.confidence,
+                });
             }
             _ => {}
         }

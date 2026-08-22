@@ -424,14 +424,13 @@ pub fn merge_evidence(contract: &mut RuntimeContract, evidence: &ProbeEvidence) 
                     assertion.confidence = Confidence::High;
                 }
             }
-            AssertionKind::ProcessRunning { name } => {
+            AssertionKind::ProcessRunning { name }
                 if evidence
                     .running_processes
                     .iter()
-                    .any(|p| p.contains(name.as_str()))
-                {
-                    assertion.confidence = Confidence::High;
-                }
+                    .any(|p| p.contains(name.as_str())) =>
+            {
+                assertion.confidence = Confidence::High;
             }
             _ => {}
         }
