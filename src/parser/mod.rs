@@ -428,29 +428,35 @@ fn parse_healthcheck(args: &str, line_num: usize, raw: &str) -> RawInstruction {
     let mut retries = None;
     let mut remaining = args.to_string();
 
-    // Parse optional flags before CMD
+    // Parse optional flags before CMD. Consume ANY leading `--name[=value]`
+    // token: the four flags below are recorded, and any other flag (e.g.
+    // `--start-interval=`, added in Docker Engine 25) is dropped rather than
+    // left to leak into the command string.
     loop {
         remaining = remaining.trim_start().to_string();
-        if remaining.is_empty() {
+        if remaining.is_empty() || !remaining.starts_with("--") {
             break;
         }
 
-        let end = remaining.find(' ').unwrap_or(remaining.len());
-        if remaining.starts_with("--interval=") {
-            interval = Some(remaining[11..end].to_string());
-            remaining = remaining[end..].to_string();
-        } else if remaining.starts_with("--timeout=") {
-            timeout = Some(remaining[10..end].to_string());
-            remaining = remaining[end..].to_string();
-        } else if remaining.starts_with("--start-period=") {
-            start_period = Some(remaining[15..end].to_string());
-            remaining = remaining[end..].to_string();
-        } else if remaining.starts_with("--retries=") {
-            retries = remaining[10..end].parse().ok();
-            remaining = remaining[end..].to_string();
-        } else {
-            break;
+        let end = remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len());
+        let token = &remaining[..end];
+        let (name, value) = match token.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (token, None),
+        };
+
+        match name {
+            "--interval" => interval = value.map(|v| v.to_string()),
+            "--timeout" => timeout = value.map(|v| v.to_string()),
+            "--start-period" => start_period = value.map(|v| v.to_string()),
+            "--retries" => retries = value.and_then(|v| v.parse().ok()),
+            // Unknown flag (e.g. --start-interval): ignore so it does not
+            // corrupt the parsed command.
+            _ => {}
         }
+        remaining = remaining[end..].to_string();
     }
 
     // After flags, expect CMD
