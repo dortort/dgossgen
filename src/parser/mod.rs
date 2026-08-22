@@ -256,7 +256,8 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
 /// remainder (which holds any further `KEY=VALUE` pairs):
 ///   - double-quoted, honoring backslash escapes (`"say \"hi\""` → `say "hi"`)
 ///   - single-quoted, taken literally (`'a b'` → `a b`)
-///   - unquoted, terminated by the next whitespace
+///   - unquoted, where `\` escapes the next char and an unescaped whitespace
+///     ends the value (`Rex\ The\ Dog` → `Rex The Dog`)
 fn parse_env_value(after_eq: &str) -> (String, &str) {
     if let Some(stripped) = after_eq.strip_prefix('"') {
         let mut val = String::new();
@@ -288,10 +289,24 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
             None => (stripped.to_string(), ""),
         }
     } else {
-        match after_eq.find(char::is_whitespace) {
-            Some(pos) => (after_eq[..pos].to_string(), &after_eq[pos..]),
-            None => (after_eq.to_string(), ""),
+        // Unquoted: a backslash escapes the following character (so the
+        // documented `ENV MY_DOG=Rex\ The\ Dog` idiom keeps its spaces); the
+        // value ends at the first *unescaped* whitespace.
+        let mut val = String::new();
+        let mut chars = after_eq.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                if let Some((_, next)) = chars.next() {
+                    val.push(next);
+                }
+                // A trailing backslash with nothing after it is dropped.
+            } else if c.is_whitespace() {
+                return (val, &after_eq[i..]);
+            } else {
+                val.push(c);
+            }
         }
+        (val, "")
     }
 }
 
@@ -861,6 +876,30 @@ ENV OLD_STYLE value
     fn test_parse_env_single_quoted_value_with_spaces() {
         let envs = env_pairs("FROM alpine\nENV KEY='a b'\n");
         assert_eq!(envs, vec![vec![("KEY".to_string(), "a b".to_string())]]);
+    }
+
+    #[test]
+    fn test_parse_env_unquoted_backslash_escaped_space() {
+        // Documented Dockerfile idiom: a backslash escapes a space in an
+        // unquoted value, so the whole thing is a single pair.
+        let envs = env_pairs("FROM alpine\nENV MY_DOG=Rex\\ The\\ Dog\n");
+        assert_eq!(
+            envs,
+            vec![vec![("MY_DOG".to_string(), "Rex The Dog".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_unquoted_escape_does_not_bleed_into_next_pair() {
+        // An escaped space must not corrupt a following KEY=VALUE pair.
+        let envs = env_pairs("FROM alpine\nENV A=x\\ y B=z\n");
+        assert_eq!(
+            envs,
+            vec![vec![
+                ("A".to_string(), "x y".to_string()),
+                ("B".to_string(), "z".to_string())
+            ]]
+        );
     }
 
     #[test]
