@@ -62,7 +62,9 @@ pub enum Instruction {
     Env(Vec<(String, String)>),
     Workdir(String),
     User(String),
-    Expose(Vec<PortSpec>),
+    /// Raw EXPOSE tokens (e.g. `["${PORT}", "8000-8010/udp"]`), kept unparsed so
+    /// variable resolution and range expansion can run at extraction time.
+    Expose(Vec<String>),
     Volume(Vec<String>),
     Copy {
         from_stage: Option<String>,

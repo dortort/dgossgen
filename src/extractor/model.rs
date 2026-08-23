@@ -29,6 +29,9 @@ pub struct RuntimeContract {
     pub installed_components: Vec<InstalledComponent>,
     /// All generated assertions with provenance
     pub assertions: Vec<ContractAssertion>,
+    /// Non-fatal diagnostics raised during extraction (e.g. an EXPOSE token that
+    /// could not be resolved to a concrete port). Surfaced through generator output.
+    pub warnings: Vec<String>,
 }
 
 /// Healthcheck details from the Dockerfile.
