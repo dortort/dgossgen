@@ -725,7 +725,7 @@ EXPOSE 8080
             expose.is_some(),
             "EXPOSE after a backslash-terminated comment was swallowed"
         );
-        assert_eq!(expose.unwrap()[0].port, 8080);
+        assert_eq!(expose.unwrap()[0], "8080");
     }
 
     #[test]

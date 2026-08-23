@@ -539,6 +539,47 @@ fn test_cmd_before_entrypoint_process_names_entrypoint_binary() {
     );
 }
 
+// --- Variable-driven / range EXPOSE fixture tests ---
+
+#[test]
+fn test_variable_port_contract_resolves_exposed_port() {
+    let df = parser::parse_dockerfile(&fixture_path("variable_port.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    // ARG PORT=8000 flows into ENV APP_PORT, which drives EXPOSE ${APP_PORT}.
+    assert_eq!(contract.exposed_ports.len(), 1);
+    assert_eq!(contract.exposed_ports[0].port, 8000);
+    assert!(
+        contract.warnings.is_empty(),
+        "a resolvable variable port should not warn"
+    );
+    assert!(contract
+        .assertions
+        .iter()
+        .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: 8000, .. })));
+}
+
+#[test]
+fn test_variable_port_generates_single_port_wait_file() {
+    let df = parser::parse_dockerfile(&fixture_path("variable_port.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+    // The single-port wait-file auto-generation heuristic must still fire once the
+    // variable EXPOSE resolves to exactly one port.
+    let wait = output
+        .goss_wait_yml
+        .expect("single resolved port should trigger wait-file auto-generation");
+    assert!(
+        wait.contains("8000"),
+        "wait file should reference port 8000"
+    );
+    assert!(
+        wait.contains("port:"),
+        "wait file should contain a port readiness gate"
+    );
+}
+
 // --- Secret redaction tests ---
 
 #[test]
