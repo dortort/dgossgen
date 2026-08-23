@@ -36,7 +36,9 @@ pub fn generate(
         Profile::Strict => Confidence::Low,
     };
 
-    let mut warnings = Vec::new();
+    // Seed with diagnostics raised during extraction (e.g. dropped EXPOSE tokens)
+    // so they surface to the user instead of being silently discarded.
+    let mut warnings = contract.warnings.clone();
     let mut notes = Vec::new();
 
     // Partition assertions into wait vs. main
