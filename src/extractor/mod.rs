@@ -4,8 +4,13 @@ mod model;
 pub use heuristics::*;
 pub use model::*;
 
-use crate::parser::{CommandForm, Dockerfile, Instruction, VariableResolver};
+use crate::parser::{CommandForm, Dockerfile, Instruction, PortSpec, VariableResolver};
 use crate::Confidence;
+
+/// Maximum number of individual ports expanded from a single `EXPOSE low-high`
+/// range. Wider ranges are dropped with a warning rather than exploded into
+/// thousands of assertions.
+const MAX_EXPOSE_RANGE: u32 = 128;
 
 /// Extract a RuntimeContract from a parsed Dockerfile.
 pub fn extract_contract(
@@ -92,18 +97,34 @@ pub fn extract_contract(
                 }
             }
 
-            Instruction::Expose(ports) => {
-                for port_spec in ports {
-                    contract.exposed_ports.push(port_spec.clone());
-                    contract.assertions.push(ContractAssertion::new(
-                        AssertionKind::PortListening {
-                            protocol: port_spec.protocol.clone(),
-                            port: port_spec.port,
-                        },
-                        format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
-                        inst.line_number,
-                        Confidence::Medium,
-                    ));
+            Instruction::Expose(tokens) => {
+                for raw_token in tokens {
+                    if resolver.has_unresolved(raw_token) {
+                        contract.warnings.push(format!(
+                            "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
+                             in scope); no port assertion generated",
+                            raw_token
+                        ));
+                        continue;
+                    }
+
+                    let resolved = resolver.resolve(raw_token);
+                    let (specs, warning) = parse_expose_token(&resolved);
+                    if let Some(w) = warning {
+                        contract.warnings.push(w);
+                    }
+                    for port_spec in specs {
+                        contract.exposed_ports.push(port_spec.clone());
+                        contract.assertions.push(ContractAssertion::new(
+                            AssertionKind::PortListening {
+                                protocol: port_spec.protocol.clone(),
+                                port: port_spec.port,
+                            },
+                            format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
+                            inst.line_number,
+                            Confidence::Medium,
+                        ));
+                    }
                 }
             }
 
@@ -307,6 +328,69 @@ fn is_reset_exec(cmd: &CommandForm) -> bool {
             inner.starts_with('[')
                 && inner.ends_with(']')
                 && inner[1..inner.len() - 1].trim().is_empty()
+        }
+    }
+}
+
+/// Parse a single, already variable-resolved EXPOSE token into zero or more
+/// `PortSpec`s. Supports `PORT`, `PORT/proto`, and inclusive `LOW-HIGH[/proto]`
+/// ranges. Returns any concrete specs plus an optional warning for tokens that
+/// could not be interpreted (unparseable, inverted, or over-wide ranges).
+fn parse_expose_token(token: &str) -> (Vec<PortSpec>, Option<String>) {
+    let (port_part, protocol) = match token.split_once('/') {
+        Some((p, proto)) => (p, proto.to_lowercase()),
+        None => (token, "tcp".to_string()),
+    };
+
+    if let Some((lo_str, hi_str)) = port_part.split_once('-') {
+        let (lo, hi) = match (lo_str.parse::<u16>(), hi_str.parse::<u16>()) {
+            (Ok(lo), Ok(hi)) => (lo, hi),
+            _ => {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "EXPOSE '{token}' is not a valid port range; no port assertion generated"
+                    )),
+                );
+            }
+        };
+
+        if lo > hi {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "EXPOSE range '{token}' is inverted (start > end); no port assertion generated"
+                )),
+            );
+        }
+
+        let span = u32::from(hi) - u32::from(lo) + 1;
+        if span > MAX_EXPOSE_RANGE {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "EXPOSE range '{token}' spans {span} ports (> {MAX_EXPOSE_RANGE}); \
+                     skipped to avoid assertion explosion"
+                )),
+            );
+        }
+
+        let specs = (lo..=hi)
+            .map(|port| PortSpec {
+                port,
+                protocol: protocol.clone(),
+            })
+            .collect();
+        (specs, None)
+    } else {
+        match port_part.parse::<u16>() {
+            Ok(port) => (vec![PortSpec { port, protocol }], None),
+            Err(_) => (
+                Vec::new(),
+                Some(format!(
+                    "EXPOSE '{token}' is not a valid port; no port assertion generated"
+                )),
+            ),
         }
     }
 }
@@ -591,6 +675,127 @@ CMD ["--port", "8080"]
         let contract = extract_contract(&df, None, &[]);
 
         assert_eq!(process_names(&contract), vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn test_expose_resolves_arg_driven_port() {
+        let content = r#"
+FROM alpine
+ARG PORT=8080
+EXPOSE ${PORT}
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.exposed_ports.len(), 1);
+        assert_eq!(contract.exposed_ports[0].port, 8080);
+        assert_eq!(contract.exposed_ports[0].protocol, "tcp");
+        assert!(contract.warnings.is_empty());
+
+        let port_assertion = contract
+            .assertions
+            .iter()
+            .find(|a| matches!(a.kind, AssertionKind::PortListening { port: 8080, .. }))
+            .expect("expected a PortListening assertion for the resolved port");
+        assert_eq!(port_assertion.confidence, Confidence::Medium);
+    }
+
+    #[test]
+    fn test_expose_resolves_env_driven_port() {
+        let content = r#"
+FROM alpine
+ENV PORT=9000
+EXPOSE $PORT/udp
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.exposed_ports.len(), 1);
+        assert_eq!(contract.exposed_ports[0].port, 9000);
+        assert_eq!(contract.exposed_ports[0].protocol, "udp");
+        assert!(contract.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_expose_expands_port_range() {
+        let content = r#"
+FROM alpine
+EXPOSE 8000-8002
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![8000, 8001, 8002]);
+        assert!(contract.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_expose_expands_port_range_with_protocol() {
+        let content = r#"
+FROM alpine
+EXPOSE 8000-8001/udp
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.exposed_ports.len(), 2);
+        assert!(contract.exposed_ports.iter().all(|p| p.protocol == "udp"));
+    }
+
+    #[test]
+    fn test_expose_undefined_variable_warns_instead_of_dropping_silently() {
+        let content = r#"
+FROM alpine
+EXPOSE $UNDEFINED
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(contract.exposed_ports.is_empty());
+        assert_eq!(contract.warnings.len(), 1);
+        assert!(contract.warnings[0].contains("UNDEFINED"));
+    }
+
+    #[test]
+    fn test_expose_overwide_range_is_capped_with_warning() {
+        let content = r#"
+FROM alpine
+EXPOSE 1024-65535
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(contract.exposed_ports.is_empty());
+        assert_eq!(contract.warnings.len(), 1);
+        assert!(contract.warnings[0].contains("spans"));
+    }
+
+    #[test]
+    fn test_parse_expose_token_variants() {
+        assert_eq!(
+            parse_expose_token("8080").0,
+            vec![PortSpec {
+                port: 8080,
+                protocol: "tcp".to_string()
+            }]
+        );
+        assert_eq!(
+            parse_expose_token("53/udp").0,
+            vec![PortSpec {
+                port: 53,
+                protocol: "udp".to_string()
+            }]
+        );
+        assert_eq!(parse_expose_token("8000-8002").0.len(), 3);
+
+        let (specs, warning) = parse_expose_token("8010-8000");
+        assert!(specs.is_empty());
+        assert!(warning.unwrap().contains("inverted"));
+
+        let (specs, warning) = parse_expose_token("notaport");
+        assert!(specs.is_empty());
+        assert!(warning.unwrap().contains("not a valid port"));
     }
 
     #[test]

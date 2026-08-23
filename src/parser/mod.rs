@@ -311,25 +311,13 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
 }
 
 fn parse_expose(args: &str, line_num: usize, raw: &str) -> RawInstruction {
-    let ports: Vec<PortSpec> = args
-        .split_whitespace()
-        .filter_map(|p| {
-            let (port_str, protocol) = if let Some(slash) = p.find('/') {
-                (&p[..slash], p[slash + 1..].to_lowercase())
-            } else {
-                (p, "tcp".to_string())
-            };
-
-            port_str
-                .parse::<u16>()
-                .ok()
-                .map(|port| PortSpec { port, protocol })
-        })
-        .collect();
+    // Keep the raw tokens intact. Port parsing, variable resolution, and range
+    // expansion all happen later at extraction time, once ARG/ENV values are known.
+    let tokens: Vec<String> = args.split_whitespace().map(|t| t.to_string()).collect();
 
     RawInstruction {
         line_number: line_num,
-        instruction: Instruction::Expose(ports),
+        instruction: Instruction::Expose(tokens),
         raw: raw.to_string(),
     }
 }
@@ -1019,16 +1007,31 @@ EXPOSE 8080/tcp 9090/udp 3000
             .instructions
             .iter()
             .find_map(|i| match &i.instruction {
-                Instruction::Expose(ports) => Some(ports.clone()),
+                Instruction::Expose(tokens) => Some(tokens.clone()),
                 _ => None,
             });
         assert!(expose.is_some());
-        let ports = expose.unwrap();
-        assert_eq!(ports.len(), 3);
-        assert_eq!(ports[0].port, 8080);
-        assert_eq!(ports[0].protocol, "tcp");
-        assert_eq!(ports[1].port, 9090);
-        assert_eq!(ports[1].protocol, "udp");
+        // Tokens are preserved verbatim; port/protocol parsing happens at extraction time.
+        let tokens = expose.unwrap();
+        assert_eq!(tokens, vec!["8080/tcp", "9090/udp", "3000"]);
+    }
+
+    #[test]
+    fn test_parse_expose_preserves_variable_and_range_tokens() {
+        let content = r#"
+FROM alpine
+EXPOSE ${PORT} 8000-8010/udp $APP_PORT
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let tokens = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Expose(tokens) => Some(tokens.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tokens, vec!["${PORT}", "8000-8010/udp", "$APP_PORT"]);
     }
 
     #[test]
