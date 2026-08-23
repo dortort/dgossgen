@@ -190,6 +190,73 @@ fn test_init_empty_contract_exits_two_with_diagnostic() {
 }
 
 #[test]
+fn test_init_resolves_variable_expose_into_port_assertions() {
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    // Variable-driven EXPOSE: previously dropped silently, producing no port assertion.
+    fs::write(&dockerfile, "FROM alpine\nARG PORT=8080\nEXPOSE ${PORT}\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--profile",
+            "standard",
+        ])
+        .assert()
+        .success();
+
+    // A single exposed port is emitted as a readiness gate in goss_wait.yml (this is
+    // exactly the wait-file heuristic the silent drop used to suppress).
+    let wait = fs::read_to_string(output_dir.join("goss_wait.yml"))
+        .expect("single resolved port should trigger goss_wait.yml generation");
+    assert!(
+        wait.contains("8080"),
+        "goss_wait.yml should contain the resolved variable port, got:\n{wait}"
+    );
+
+    // goss.yml must still be written (the port lives in the wait gate for the
+    // single-port case), proving the run produced output rather than erroring.
+    assert!(output_dir.join("goss.yml").exists());
+}
+
+#[test]
+fn test_init_warns_on_unresolvable_expose_variable() {
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    // No ARG/ENV default for PORT: the token must warn, not vanish silently.
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE ${PORT}\n").unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--profile",
+            "standard",
+        ])
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("PORT") && stderr.to_lowercase().contains("unresolved"),
+        "expected a warning about the unresolved EXPOSE variable, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_probe_with_warnings_code_path() {
     // Note: This test validates that cmd_probe now uses emit_output helper which ensures
     // output files are written BEFORE returning exit code 2 on warnings (fixing the latent bug).
