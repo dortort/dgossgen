@@ -442,6 +442,65 @@ fn test_php_composer_goss_output() {
     );
 }
 
+// --- Multiple same-manager install tests ---
+
+#[test]
+fn test_multiple_apt_installs_across_continuation() {
+    // A backslash-continued RUN chaining two apt-get install invocations of the
+    // same manager should yield PackageInstalled assertions for both packages
+    // after continuation merging. Regression test for issue #9.
+    let content = "FROM debian:12\n\
+RUN apt-get update && \\\n\
+    apt-get install -y git && \\\n\
+    apt-get install -y jq\n";
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    assert!(
+        contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: extractor::PackageManager::Apt,
+                ..
+            } if package == "git"
+        )),
+        "first apt-get install (git) should be detected"
+    );
+    assert!(
+        contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: extractor::PackageManager::Apt,
+                ..
+            } if package == "jq"
+        )),
+        "second apt-get install (jq) should also be detected"
+    );
+}
+
+#[test]
+fn test_multiple_installs_appear_in_rendered_goss_yml() {
+    let content = "FROM debian:12\n\
+RUN apt-get update && \\\n\
+    apt-get install -y git && \\\n\
+    apt-get install -y jq\n";
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+
+    let yml = &output.goss_yml;
+    assert!(
+        yml.contains("dpkg -s git"),
+        "rendered goss.yml should contain a check for git"
+    );
+    assert!(
+        yml.contains("dpkg -s jq"),
+        "rendered goss.yml should contain a check for the second install (jq)"
+    );
+}
+
 // --- Secret redaction tests ---
 
 #[test]
