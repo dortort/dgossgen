@@ -7,16 +7,23 @@ use super::model::{
 use regex::Regex;
 use std::sync::LazyLock;
 
-static APT_INSTALL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"apt-get\s+install\s+(?:-y\s+)?(.+?)(?:\s*&&|\s*$)").unwrap());
-static APK_ADD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"apk\s+add\s+(?:--no-cache\s+)?(.+?)(?:\s*&&|\s*$)").unwrap());
+// Each install regex captures the package list lazily and terminates it at the
+// next shell boundary — `&&`, `||`, `;`, `|`, a background `&`, or a subshell
+// `(`/`)` — or end of string. Bounding on all of these (not just `&&`/`$`)
+// keeps shell control syntax out of the captured package names, both for the
+// first invocation and for every later one scanned by `captures_iter`.
+static APT_INSTALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"apt-get\s+install\s+(?:-y\s+)?(.+?)(?:\s*[;|&()]|\s*$)").unwrap()
+});
+static APK_ADD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"apk\s+add\s+(?:--no-cache\s+)?(.+?)(?:\s*[;|&()]|\s*$)").unwrap()
+});
 static PIP_INSTALL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"pip3?\s+install\s+(.+?)(?:\s*&&|\s*$)").unwrap());
+    LazyLock::new(|| Regex::new(r"pip3?\s+install\s+(.+?)(?:\s*[;|&()]|\s*$)").unwrap());
 static NPM_INSTALL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"npm\s+(?:install|ci)(?:\s+(.+?))?(?:\s*&&|\s*$)").unwrap());
+    LazyLock::new(|| Regex::new(r"npm\s+(?:install|ci)(?:\s+(.+?))?(?:\s*[;|&()]|\s*$)").unwrap());
 static COMPOSER_REQUIRE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"composer\s+require\s+(.+?)(?:\s*&&|\s*$)").unwrap());
+    LazyLock::new(|| Regex::new(r"composer\s+require\s+(.+?)(?:\s*[;|&()]|\s*$)").unwrap());
 static USERADD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:useradd|adduser)\s+(?:[^\s]+\s+)*?(\w+)\s*$").unwrap());
 static COMPONENT_PATTERNS: LazyLock<Vec<(Regex, &'static str, ComponentKind)>> =
@@ -622,6 +629,39 @@ mod tests {
             )),
             "second apk add should also be detected"
         );
+    }
+
+    #[test]
+    fn test_install_capture_stops_at_shell_boundaries() {
+        // A later same-manager install ending at a shell boundary other than
+        // `&&` (a subshell close, or `;` inside if/then/fi) must not capture
+        // shell syntax as part of the package name.
+        for cmd_str in [
+            "apt-get install -y git && (apt-get install -y curl)",
+            "apt-get install -y git ; then apt-get install -y curl ; fi",
+        ] {
+            let cmd = CommandForm::Shell(cmd_str.to_string());
+            let assertions = analyze_run_command(&cmd, 5);
+            // The real package names are present...
+            assert!(
+                assertions.iter().any(|a| matches!(
+                    &a.kind,
+                    AssertionKind::PackageInstalled { package, .. } if package == "curl"
+                )),
+                "curl should be detected cleanly in: {cmd_str}"
+            );
+            // ...and no assertion carries shell punctuation as a package name.
+            assert!(
+                assertions.iter().all(|a| {
+                    if let AssertionKind::PackageInstalled { package, .. } = &a.kind {
+                        !package.contains([';', '|', '&', '(', ')'])
+                    } else {
+                        true
+                    }
+                }),
+                "no package name should contain shell syntax in: {cmd_str}"
+            );
+        }
     }
 
     #[test]
