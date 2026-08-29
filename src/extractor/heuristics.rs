@@ -345,7 +345,12 @@ fn extract_package_assertions(
     pattern: &Regex,
     detector: fn(&str, usize) -> Option<ContractAssertion>,
 ) {
-    if let Some(captures) = pattern.captures(command) {
+    // Iterate over every match so repeated same-manager invocations in one
+    // RUN line (e.g. `apt-get install -y git && apt-get install -y curl`) are
+    // all scanned, not just the first. Each regex's package-list capture
+    // terminates at the next `&&` or end of string, so successive matches
+    // delimit each invocation.
+    for captures in pattern.captures_iter(command) {
         if let Some(pkgs) = captures.get(1) {
             for pkg in pkgs.as_str().split_whitespace() {
                 let pkg_clean = pkg.trim_start_matches('-');
@@ -557,6 +562,88 @@ mod tests {
                 manager: PackageManager::Pip,
                 ..
             } if package == "requests"
+        )));
+    }
+
+    #[test]
+    fn test_detect_multiple_apt_installs_in_one_run() {
+        let cmd = CommandForm::Shell(
+            "apt-get update && apt-get install -y git && apt-get install -y curl".to_string(),
+        );
+        let assertions = analyze_run_command(&cmd, 5);
+        assert!(
+            assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled {
+                    package,
+                    manager: PackageManager::Apt,
+                    ..
+                } if package == "git"
+            )),
+            "first apt-get install should be detected"
+        );
+        assert!(
+            assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled {
+                    package,
+                    manager: PackageManager::Apt,
+                    ..
+                } if package == "curl"
+            )),
+            "second apt-get install should also be detected"
+        );
+    }
+
+    #[test]
+    fn test_detect_multiple_apk_adds_in_one_run() {
+        let cmd =
+            CommandForm::Shell("apk add --no-cache git && apk add --no-cache curl".to_string());
+        let assertions = analyze_run_command(&cmd, 5);
+        assert!(
+            assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled {
+                    package,
+                    manager: PackageManager::Apk,
+                    ..
+                } if package == "git"
+            )),
+            "first apk add should be detected"
+        );
+        assert!(
+            assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled {
+                    package,
+                    manager: PackageManager::Apk,
+                    ..
+                } if package == "curl"
+            )),
+            "second apk add should also be detected"
+        );
+    }
+
+    #[test]
+    fn test_cross_manager_installs_still_detected() {
+        // Pins the already-working cross-manager behavior against regressions.
+        let cmd = CommandForm::Shell("apt-get install -y git && pip install flask".to_string());
+        let assertions = analyze_run_command(&cmd, 5);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Apt,
+                ..
+            } if package == "git"
+        )));
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled {
+                package,
+                manager: PackageManager::Pip,
+                ..
+            } if package == "flask"
         )));
     }
 
