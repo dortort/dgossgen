@@ -222,7 +222,7 @@ fn emit_output(output_dir: &Path, output: &generator::GeneratorOutput) -> Result
 
 fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
     let (profile, _build_args, mut contract) = load_contract(&common)?;
-    let policy = PolicyConfig::load_or_default(&common.context);
+    let policy = PolicyConfig::load_or_default(&common.context)?;
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     if interactive {
@@ -347,7 +347,7 @@ fn cmd_probe(
     eprintln!("{}", style("Probe complete. Evidence merged.").green());
 
     // Generate
-    let policy = PolicyConfig::load_or_default(&common.context);
+    let policy = PolicyConfig::load_or_default(&common.context)?;
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
