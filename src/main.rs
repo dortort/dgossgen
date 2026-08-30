@@ -405,15 +405,15 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
 
     // Lint wait file if present
     if let Some(wait_path) = &wait_file {
-        if wait_path.exists() {
-            let wait_content = std::fs::read_to_string(wait_path)
-                .with_context(|| format!("reading {}", wait_path.display()))?;
-            lint::lint_goss_content(
-                &wait_content,
-                wait_path.to_str().unwrap_or("goss_wait.yml"),
-                &mut issues,
-            );
-        }
+        // An explicit --wait-file path is a user instruction: a missing file is
+        // an error, not a silent skip that would print a false "No issues found."
+        let wait_content = std::fs::read_to_string(wait_path)
+            .with_context(|| format!("reading {}", wait_path.display()))?;
+        lint::lint_goss_content(
+            &wait_content,
+            wait_path.to_str().unwrap_or("goss_wait.yml"),
+            &mut issues,
+        );
     } else {
         // Auto-detect goss_wait.yml next to the main file
         let wait_path = file
