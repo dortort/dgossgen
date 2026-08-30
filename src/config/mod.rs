@@ -4,6 +4,7 @@ use std::path::Path;
 
 /// Policy configuration loaded from .dgossgen.yml or defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Port assertion policy: required, optional, off
     #[serde(default = "default_optional")]
@@ -68,18 +69,21 @@ impl PolicyConfig {
         Ok(config)
     }
 
-    /// Try to load from default locations, falling back to defaults.
-    pub fn load_or_default(dir: &Path) -> Self {
+    /// Try to load from default locations.
+    ///
+    /// Returns the built-in defaults only when no config file is present. A
+    /// file that exists but fails to parse is a hard error: silently reverting
+    /// to defaults would run generation under a policy the user did not intend
+    /// (dropped port requirements, custom `secret_patterns`, wait tuning).
+    pub fn load_or_default(dir: &Path) -> Result<Self> {
         let candidates = [".dgossgen.yml", ".dgossgen.yaml"];
         for name in &candidates {
             let path = dir.join(name);
             if path.exists() {
-                if let Ok(config) = Self::load(&path) {
-                    return config;
-                }
+                return Self::load(&path);
             }
         }
-        Self::default()
+        Ok(Self::default())
     }
 
     pub fn assert_ports_enabled(&self) -> bool {
@@ -110,6 +114,7 @@ pub enum AssertionPolicy {
 
 /// Wait configuration for goss_wait.yml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaitConfig {
     /// Number of retries before giving up
     #[serde(default = "default_retries")]
@@ -199,6 +204,59 @@ mod tests {
         assert!(config.is_secret_key("SECRET_KEY"));
         assert!(!config.is_secret_key("APP_PORT"));
         assert!(!config.is_secret_key("LOG_LEVEL"));
+    }
+
+    #[test]
+    fn test_load_or_default_absent_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PolicyConfig::load_or_default(dir.path()).unwrap();
+        assert_eq!(config.assert_ports, AssertionPolicy::Optional);
+    }
+
+    #[test]
+    fn test_load_or_default_malformed_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Broken YAML: unterminated flow sequence.
+        std::fs::write(dir.path().join(".dgossgen.yml"), "assert_ports: [\n").unwrap();
+        let err = PolicyConfig::load_or_default(dir.path())
+            .expect_err("malformed config must be a hard error, not silent defaults");
+        assert!(
+            err.to_string().contains("config") || format!("{err:#}").contains("config"),
+            "error should mention the config file: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_load_or_default_type_mismatch_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".dgossgen.yml"),
+            "wait:\n  retries: \"abc\"\n",
+        )
+        .unwrap();
+        assert!(
+            PolicyConfig::load_or_default(dir.path()).is_err(),
+            "a type mismatch must not silently revert to defaults"
+        );
+    }
+
+    #[test]
+    fn test_load_or_default_unknown_key_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Misspelled key must be rejected rather than silently defaulted.
+        std::fs::write(dir.path().join(".dgossgen.yml"), "asert_ports: required\n").unwrap();
+        assert!(
+            PolicyConfig::load_or_default(dir.path()).is_err(),
+            "an unknown/misspelled key must be rejected under deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_load_or_default_prefers_yml_then_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".dgossgen.yaml"), "assert_ports: off\n").unwrap();
+        let config = PolicyConfig::load_or_default(dir.path()).unwrap();
+        assert_eq!(config.assert_ports, AssertionPolicy::Off);
     }
 
     #[test]
