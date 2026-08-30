@@ -252,11 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn test_load_or_default_prefers_yml_then_yaml() {
+    fn test_load_or_default_falls_back_to_yaml_extension() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".dgossgen.yaml"), "assert_ports: off\n").unwrap();
         let config = PolicyConfig::load_or_default(dir.path()).unwrap();
         assert_eq!(config.assert_ports, AssertionPolicy::Off);
+    }
+
+    #[test]
+    fn test_load_or_default_prefers_yml_over_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        // When both extensions exist, .yml wins (candidate array order).
+        std::fs::write(dir.path().join(".dgossgen.yml"), "assert_ports: required\n").unwrap();
+        std::fs::write(dir.path().join(".dgossgen.yaml"), "assert_ports: off\n").unwrap();
+        let config = PolicyConfig::load_or_default(dir.path()).unwrap();
+        assert_eq!(config.assert_ports, AssertionPolicy::Required);
     }
 
     #[test]
