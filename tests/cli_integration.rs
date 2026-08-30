@@ -44,6 +44,55 @@ fn test_init_with_warnings_still_writes_output() {
 }
 
 #[test]
+fn test_init_with_malformed_config_fails_loudly() {
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE 8080\n").unwrap();
+    // A config file that exists but does not parse must be a hard error,
+    // not a silent revert to built-in defaults.
+    fs::write(temp.path().join(".dgossgen.yml"), "assert_ports: [\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("config"));
+}
+
+#[test]
+fn test_lint_missing_explicit_wait_file_fails_loudly() {
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    // A clean main file so that, before the fix, lint would print
+    // "No issues found." for a wait file it never read.
+    fs::write(&goss, "port: {}\n").unwrap();
+
+    let missing_wait = temp.path().join("does_not_exist_goss_wait.yml");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args([
+            "lint",
+            goss.to_str().unwrap(),
+            "--wait-file",
+            missing_wait.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            missing_wait.file_name().unwrap().to_str().unwrap(),
+        ));
+}
+
+#[test]
 fn test_probe_with_warnings_code_path() {
     // Note: This test validates that cmd_probe now uses emit_output helper which ensures
     // output files are written BEFORE returning exit code 2 on warnings (fixing the latent bug).
