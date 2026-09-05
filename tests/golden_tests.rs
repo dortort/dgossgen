@@ -501,6 +501,44 @@ RUN apt-get update && \\\n\
     );
 }
 
+// --- Last-wins CMD/ENTRYPOINT semantics ---
+
+#[test]
+fn test_cmd_before_entrypoint_process_names_entrypoint_binary() {
+    let df = parser::parse_dockerfile(&fixture_path("cmd_before_entrypoint.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    // Contract-level: exactly one process assertion, named after the entrypoint binary;
+    // the CMD flag `--port` must not appear as a process.
+    let procs: Vec<_> = contract
+        .assertions
+        .iter()
+        .filter_map(|a| match &a.kind {
+            AssertionKind::ProcessRunning { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        procs,
+        vec!["server"],
+        "process should be the entrypoint binary"
+    );
+
+    // Rendered output: the process section names `server`, never `--port`.
+    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+    let yml = &output.goss_yml;
+    assert!(
+        yml.contains("process:") && yml.contains("server"),
+        "goss.yml process section should name the entrypoint binary:\n{}",
+        yml
+    );
+    assert!(
+        !yml.contains("--port"),
+        "goss.yml must not contain a process assertion for the CMD flag:\n{}",
+        yml
+    );
+}
+
 // --- Secret redaction tests ---
 
 #[test]
