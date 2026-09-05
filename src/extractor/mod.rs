@@ -30,6 +30,16 @@ pub fn extract_contract(
 
     let mut current_workdir = String::from("/");
 
+    // Docker applies last-wins semantics to ENTRYPOINT, CMD, and HEALTHCHECK: only the
+    // final occurrence in a stage takes effect. Rather than emit an assertion at each
+    // encounter (which accumulates stale assertions from overridden instructions and can
+    // emit a CMD-derived process before a later ENTRYPOINT is seen), we fold these three
+    // instructions into their effective final state during the walk and emit their
+    // assertions once, afterward, from the winning occurrence.
+    let mut fold_entrypoint: Option<(CommandForm, usize)> = None;
+    let mut fold_cmd: Option<(CommandForm, usize)> = None;
+    let mut fold_healthcheck: Option<(HealthcheckInfo, usize)> = None;
+
     for inst in &stage.instructions {
         match &inst.instruction {
             Instruction::Workdir(dir) => {
@@ -112,19 +122,21 @@ pub fn extract_contract(
             }
 
             Instruction::Entrypoint(cmd) => {
-                contract.entrypoint = Some(cmd.clone());
-                if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", inst.line_number)
-                {
-                    contract.assertions.push(assertion);
+                // Docker treats an empty exec form (`ENTRYPOINT []`) as clearing the
+                // entrypoint; any other form overrides the previous one (last wins).
+                if is_reset_exec(cmd) {
+                    fold_entrypoint = None;
+                } else {
+                    fold_entrypoint = Some((cmd.clone(), inst.line_number));
                 }
             }
 
             Instruction::Cmd(cmd) => {
-                contract.cmd = Some(cmd.clone());
-                if contract.entrypoint.is_none() {
-                    if let Some(assertion) = make_process_assertion(cmd, "CMD", inst.line_number) {
-                        contract.assertions.push(assertion);
-                    }
+                // `CMD []` clears the command; anything else overrides (last wins).
+                if is_reset_exec(cmd) {
+                    fold_cmd = None;
+                } else {
+                    fold_cmd = Some((cmd.clone(), inst.line_number));
                 }
             }
 
@@ -135,22 +147,22 @@ pub fn extract_contract(
                 start_period,
                 retries,
             } => {
-                contract.healthcheck = Some(HealthcheckInfo {
-                    cmd: cmd.clone(),
-                    interval: interval.clone(),
-                    timeout: timeout.clone(),
-                    start_period: start_period.clone(),
-                    retries: *retries,
-                });
-                // Healthcheck-derived wait assertion
-                contract.assertions.push(ContractAssertion::new(
-                    AssertionKind::HealthcheckPasses {
-                        command: cmd.to_string_lossy(),
+                fold_healthcheck = Some((
+                    HealthcheckInfo {
+                        cmd: cmd.clone(),
+                        interval: interval.clone(),
+                        timeout: timeout.clone(),
+                        start_period: start_period.clone(),
+                        retries: *retries,
                     },
-                    format!("HEALTHCHECK CMD {}", cmd.to_string_lossy()),
                     inst.line_number,
-                    Confidence::High,
                 ));
+            }
+
+            // `HEALTHCHECK NONE` disables any healthcheck inherited from an earlier
+            // instruction, so it must clear the folded state (and thus the wait assertion).
+            Instruction::HealthcheckNone => {
+                fold_healthcheck = None;
             }
 
             Instruction::Copy {
@@ -244,12 +256,59 @@ pub fn extract_contract(
         }
     }
 
+    // Emit phase: generate process and healthcheck assertions once, from the folded
+    // final state. Docker's interaction rule: when an ENTRYPOINT is set, CMD supplies its
+    // arguments rather than a process of its own, so a process assertion comes from the
+    // entrypoint; only in the absence of an entrypoint does CMD name the process.
+    contract.entrypoint = fold_entrypoint.as_ref().map(|(cmd, _)| cmd.clone());
+    contract.cmd = fold_cmd.as_ref().map(|(cmd, _)| cmd.clone());
+
+    if let Some((cmd, line)) = &fold_entrypoint {
+        if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", *line) {
+            contract.assertions.push(assertion);
+        }
+    } else if let Some((cmd, line)) = &fold_cmd {
+        if let Some(assertion) = make_process_assertion(cmd, "CMD", *line) {
+            contract.assertions.push(assertion);
+        }
+    }
+
+    if let Some((info, line)) = &fold_healthcheck {
+        contract.healthcheck = Some(info.clone());
+        contract.assertions.push(ContractAssertion::new(
+            AssertionKind::HealthcheckPasses {
+                command: info.cmd.to_string_lossy(),
+            },
+            format!("HEALTHCHECK CMD {}", info.cmd.to_string_lossy()),
+            *line,
+            Confidence::High,
+        ));
+    }
+
     // Add service-specific assertions based on detected components
     let service_assertions =
         heuristics::generate_service_assertions(&contract.installed_components);
     contract.assertions.extend(service_assertions);
 
     contract
+}
+
+/// Whether a command form is an empty exec form (`[]`), which Docker treats as clearing
+/// a previously-set ENTRYPOINT or CMD.
+///
+/// The parser lowers an empty JSON array to a `Shell("[]")` form rather than
+/// `Exec(vec![])`, so both shapes are recognized here; without this, `ENTRYPOINT []`
+/// would otherwise be mistaken for a process named `[]`.
+fn is_reset_exec(cmd: &CommandForm) -> bool {
+    match cmd {
+        CommandForm::Exec(parts) => parts.is_empty(),
+        CommandForm::Shell(s) => {
+            let inner = s.trim();
+            inner.starts_with('[')
+                && inner.ends_with(']')
+                && inner[1..inner.len() - 1].trim().is_empty()
+        }
+    }
 }
 
 fn make_process_assertion(
@@ -399,6 +458,139 @@ FROM ${BASE_IMAGE}
             &[("BASE_IMAGE".to_string(), "alpine:3.20".to_string())],
         );
         assert_eq!(contract.base_image, "alpine:3.20");
+    }
+
+    fn process_names(contract: &RuntimeContract) -> Vec<String> {
+        contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::ProcessRunning { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn healthcheck_assertions(contract: &RuntimeContract) -> Vec<String> {
+        contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::HealthcheckPasses { command } => Some(command.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_cmd_before_entrypoint_uses_entrypoint_binary() {
+        // Legal Dockerfile ordering: CMD (which supplies entrypoint arguments) appears
+        // before ENTRYPOINT. Docker treats `--port`/`8080` as arguments, so the process
+        // is the entrypoint binary, never the flag.
+        let content = r#"
+FROM alpine
+CMD ["--port", "8080"]
+ENTRYPOINT ["/usr/local/bin/server"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let procs = process_names(&contract);
+        assert_eq!(procs, vec!["server".to_string()]);
+        assert!(
+            !procs.iter().any(|n| n == "--port"),
+            "flag must not become a process assertion"
+        );
+    }
+
+    #[test]
+    fn test_repeated_entrypoint_keeps_only_last() {
+        let content = r#"
+FROM alpine
+ENTRYPOINT ["/usr/local/bin/first"]
+ENTRYPOINT ["/usr/local/bin/second"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(process_names(&contract), vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn test_repeated_cmd_keeps_only_last() {
+        let content = r#"
+FROM alpine
+CMD ["/usr/local/bin/first"]
+CMD ["/usr/local/bin/second"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(process_names(&contract), vec!["second".to_string()]);
+    }
+
+    #[test]
+    fn test_repeated_healthcheck_keeps_only_last() {
+        let content = r#"
+FROM alpine
+HEALTHCHECK CMD curl -f http://localhost/first
+HEALTHCHECK CMD curl -f http://localhost/second
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let hc = healthcheck_assertions(&contract);
+        assert_eq!(hc.len(), 1);
+        assert!(
+            hc[0].contains("second"),
+            "healthcheck should be from the last instruction: {}",
+            hc[0]
+        );
+        assert!(!hc[0].contains("first"));
+    }
+
+    #[test]
+    fn test_healthcheck_none_clears_earlier_healthcheck() {
+        let content = r#"
+FROM alpine
+HEALTHCHECK --interval=30s CMD curl -f http://localhost/
+HEALTHCHECK NONE
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(contract.healthcheck.is_none());
+        assert!(healthcheck_assertions(&contract).is_empty());
+    }
+
+    #[test]
+    fn test_empty_entrypoint_exec_clears_entrypoint_and_falls_back_to_cmd() {
+        // `ENTRYPOINT []` resets the entrypoint; the process then derives from CMD.
+        let content = r#"
+FROM alpine
+ENTRYPOINT ["/usr/local/bin/server"]
+ENTRYPOINT []
+CMD ["/usr/local/bin/app"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(contract.entrypoint.is_none());
+        assert_eq!(process_names(&contract), vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn test_entrypoint_supplies_process_when_cmd_after() {
+        // Standard ordering: ENTRYPOINT then CMD. Only the entrypoint names the process.
+        let content = r#"
+FROM alpine
+ENTRYPOINT ["/usr/local/bin/server"]
+CMD ["--port", "8080"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(process_names(&contract), vec!["server".to_string()]);
     }
 
     #[test]
