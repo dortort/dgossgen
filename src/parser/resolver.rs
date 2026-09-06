@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ast::{ArgInstruction, Instruction, Stage};
+use super::ast::ArgInstruction;
 
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
@@ -32,27 +32,21 @@ impl VariableResolver {
         }
     }
 
-    /// Process a stage's instructions, collecting ARG/ENV values.
-    pub fn process_stage(&mut self, stage: &Stage) {
-        for inst in &stage.instructions {
-            match &inst.instruction {
-                Instruction::Arg { name, default } => {
-                    // Only set if not already provided by build args
-                    if !self.vars.contains_key(name) {
-                        if let Some(val) = default {
-                            self.vars.insert(name.clone(), val.clone());
-                        }
-                    }
-                }
-                Instruction::Env(pairs) => {
-                    for (key, value) in pairs {
-                        let resolved = self.resolve(value);
-                        self.vars.insert(key.clone(), resolved);
-                    }
-                }
-                _ => {}
+    /// Declare a stage-body ARG, adopting its default only when the name is not
+    /// already bound. A build arg or an earlier declaration therefore wins, and a
+    /// bare `ARG NAME` (no default) leaves any prior binding untouched.
+    pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
+        if !self.vars.contains_key(name) {
+            if let Some(val) = default {
+                self.vars.insert(name.to_string(), val.to_string());
             }
         }
+    }
+
+    /// Bind an ENV variable to an already-resolved value, overwriting any prior
+    /// binding. The binding takes effect only for instructions that follow it.
+    pub fn set_var(&mut self, key: &str, value: &str) {
+        self.vars.insert(key.to_string(), value.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string.
