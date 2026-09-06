@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*;
+use predicates::prelude::*;
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
@@ -90,6 +91,97 @@ fn test_lint_missing_explicit_wait_file_fails_loudly() {
         .stderr(predicates::str::contains(
             missing_wait.file_name().unwrap().to_str().unwrap(),
         ));
+}
+
+#[test]
+fn test_init_confidence_skips_are_notes_exit_zero() {
+    // Under the default `standard` profile, package installs are filtered by
+    // confidence. That is routine, so the run must exit 0 with the skips
+    // reported as notes (not warnings), and both files written.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(
+        &dockerfile,
+        "FROM debian:12\nEXPOSE 8080\nCMD [\"nginx\", \"-g\", \"daemon off;\"]\nRUN apt-get install -y nginx curl git\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("note:"))
+        .stderr(predicates::str::contains("warning:").not());
+
+    assert!(output_dir.join("goss.yml").exists());
+}
+
+#[test]
+fn test_init_strict_warnings_promotes_notes_to_exit_two() {
+    // The same routine run fails under --strict-warnings.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(
+        &dockerfile,
+        "FROM debian:12\nEXPOSE 8080\nCMD [\"nginx\", \"-g\", \"daemon off;\"]\nRUN apt-get install -y nginx curl git\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--strict-warnings",
+        ])
+        .assert()
+        .code(2);
+
+    assert!(output_dir.join("goss.yml").exists());
+}
+
+#[test]
+fn test_init_empty_contract_exits_two_with_diagnostic() {
+    // A Dockerfile with no runtime signals must not silently exit 0 with a
+    // useless `command: {}`. It exits 2 and explains what was missing.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(&dockerfile, "FROM alpine:3.19\nRUN echo hello\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("no assertions"))
+        .stderr(predicates::str::contains("EXPOSE"));
+
+    assert!(
+        output_dir.join("goss.yml").exists(),
+        "output is still written so the user can inspect it"
+    );
 }
 
 #[test]
