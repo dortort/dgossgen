@@ -153,6 +153,13 @@ pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
         }
     }
 
+    if !output.notes.is_empty() {
+        println!("\n{}", style("Notes:").bold().cyan());
+        for n in &output.notes {
+            println!("  - {}", n);
+        }
+    }
+
     println!();
 
     let actions = vec![

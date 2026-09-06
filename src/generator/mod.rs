@@ -13,7 +13,14 @@ use crate::{Confidence, Profile};
 pub struct GeneratorOutput {
     pub goss_yml: String,
     pub goss_wait_yml: Option<String>,
+    /// Genuine anomalies that should influence the exit code (e.g. an empty
+    /// contract that produces a `goss.yml` asserting nothing).
     pub warnings: Vec<String>,
+    /// Informational notes about routine, expected behavior — chiefly
+    /// assertions dropped because they fell below the profile's confidence
+    /// cutoff. Notes are surfaced to the user but do not, on their own, affect
+    /// the exit code (unless `--strict-warnings` is requested).
+    pub notes: Vec<String>,
 }
 
 /// Generate goss.yml and optional goss_wait.yml from a RuntimeContract.
@@ -30,6 +37,7 @@ pub fn generate(
     };
 
     let mut warnings = Vec::new();
+    let mut notes = Vec::new();
 
     // Partition assertions into wait vs. main
     let (wait_assertions, main_assertions): (Vec<_>, Vec<_>) = contract
@@ -56,7 +64,7 @@ pub fn generate(
             contract,
             min_confidence,
             policy,
-            &mut warnings,
+            &mut notes,
         );
         if wait_resources.is_empty() {
             // Generate minimal viable wait from port check
@@ -79,14 +87,49 @@ pub fn generate(
         min_confidence,
         profile,
         policy,
-        &mut warnings,
+        &mut notes,
     );
+
+    // An empty main file is a genuine anomaly, not routine filtering: dgoss
+    // would "pass" while asserting nothing. Surface it as a warning (exit 2)
+    // with guidance on how to produce assertions, rather than silently writing
+    // a bare `command: {}` and exiting 0.
+    if main_resources.is_empty() {
+        warnings.push(empty_contract_diagnostic(contract, profile));
+    }
+
     let goss_yml = render_goss(&main_resources);
 
     GeneratorOutput {
         goss_yml,
         goss_wait_yml,
         warnings,
+        notes,
+    }
+}
+
+/// Build a diagnostic message explaining why `goss.yml` ended up empty and how
+/// to fix it, tailored to whether the Dockerfile carried any runtime signals.
+fn empty_contract_diagnostic(contract: &RuntimeContract, profile: Profile) -> String {
+    let has_signals = !contract.exposed_ports.is_empty()
+        || contract.cmd.is_some()
+        || contract.entrypoint.is_some()
+        || contract.healthcheck.is_some()
+        || contract.assertions.iter().any(|a| !is_wait_assertion(a));
+
+    if has_signals {
+        format!(
+            "goss.yml has no assertions: every candidate was below the '{profile}' \
+             profile's confidence cutoff or routed to goss_wait.yml. Try a lower \
+             cutoff with --profile strict, refine interactively with --interactive, \
+             or gather runtime evidence with the `probe` subcommand."
+        )
+    } else {
+        "goss.yml has no assertions: no EXPOSE, CMD, ENTRYPOINT, or HEALTHCHECK \
+         was found, so there is nothing to assert. Provide runtime signals with \
+         --health-path/--primary-port, refine interactively with --interactive, \
+         or gather runtime evidence with the `probe` subcommand."
+            .to_string()
     }
 }
 
@@ -98,15 +141,18 @@ fn is_wait_assertion(assertion: &ContractAssertion) -> bool {
     )
 }
 
-/// Returns `true` if the assertion passes the confidence threshold; logs a warning if not.
+/// Returns `true` if the assertion passes the confidence threshold; records an
+/// informational note if not. Confidence filtering is routine, documented
+/// behavior, so a skip is a note rather than a warning and does not affect the
+/// exit code.
 fn passes_confidence(
     assertion: &ContractAssertion,
     min_confidence: Confidence,
     context: &str,
-    warnings: &mut Vec<String>,
+    notes: &mut Vec<String>,
 ) -> bool {
     if assertion.confidence < min_confidence {
-        warnings.push(format!(
+        notes.push(format!(
             "Skipped {} (confidence too low): {}",
             context, assertion.provenance
         ));
@@ -122,13 +168,13 @@ fn build_wait_resources(
     contract: &RuntimeContract,
     min_confidence: Confidence,
     policy: &PolicyConfig,
-    warnings: &mut Vec<String>,
+    notes: &mut Vec<String>,
 ) -> Vec<GossResource> {
     let mut resources = Vec::new();
 
     // Healthcheck-derived command (highest priority)
     for assertion in assertions {
-        if !passes_confidence(assertion, min_confidence, "wait assertion", warnings) {
+        if !passes_confidence(assertion, min_confidence, "wait assertion", notes) {
             continue;
         }
 
@@ -184,12 +230,12 @@ fn build_main_resources(
     min_confidence: Confidence,
     profile: Profile,
     policy: &PolicyConfig,
-    warnings: &mut Vec<String>,
+    notes: &mut Vec<String>,
 ) -> Vec<GossResource> {
     let mut resources = Vec::new();
 
     for assertion in assertions {
-        if !passes_confidence(assertion, min_confidence, "assertion", warnings) {
+        if !passes_confidence(assertion, min_confidence, "assertion", notes) {
             continue;
         }
 
