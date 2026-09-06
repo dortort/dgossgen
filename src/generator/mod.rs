@@ -90,11 +90,16 @@ pub fn generate(
         &mut notes,
     );
 
-    // An empty main file is a genuine anomaly, not routine filtering: dgoss
-    // would "pass" while asserting nothing. Surface it as a warning (exit 2)
-    // with guidance on how to produce assertions, rather than silently writing
-    // a bare `command: {}` and exiting 0.
-    if main_resources.is_empty() {
+    // A run that produces no assertions at all — an empty goss.yml AND no
+    // readiness gate — is a genuine anomaly, not routine filtering: dgoss would
+    // "pass" while asserting nothing. Surface it as a warning (exit 2) with
+    // guidance, rather than silently writing a bare `command: {}` and exiting 0.
+    //
+    // A contract whose only signal is a port or a healthcheck yields an empty
+    // main file but a fully valid `goss_wait.yml`; that is NOT an anomaly, so
+    // the wait file must be considered here (`goss_wait.yml` is `Some` only when
+    // it carries at least one resource).
+    if main_resources.is_empty() && goss_wait_yml.is_none() {
         warnings.push(empty_contract_diagnostic(contract, profile));
     }
 
@@ -118,11 +123,17 @@ fn empty_contract_diagnostic(contract: &RuntimeContract, profile: Profile) -> St
         || contract.assertions.iter().any(|a| !is_wait_assertion(a));
 
     if has_signals {
+        // Signals were declared but nothing survived to the output. The cause
+        // may be confidence filtering, a policy toggle (.dgossgen.yml, e.g.
+        // http_checks defaults off), or --no-wait suppressing a readiness gate,
+        // so the message enumerates the levers rather than asserting one cause.
         format!(
-            "goss.yml has no assertions: every candidate was below the '{profile}' \
-             profile's confidence cutoff or routed to goss_wait.yml. Try a lower \
-             cutoff with --profile strict, refine interactively with --interactive, \
-             or gather runtime evidence with the `probe` subcommand."
+            "goss.yml has no assertions: the Dockerfile's runtime signals were all \
+             filtered out — below the '{profile}' profile's confidence cutoff, \
+             disabled by policy (.dgossgen.yml), or suppressed by --no-wait. Relax \
+             filtering with --profile strict, enable the relevant checks in \
+             .dgossgen.yml, drop --no-wait, refine interactively with \
+             --interactive, or gather runtime evidence with the `probe` subcommand."
         )
     } else {
         "goss.yml has no assertions: no EXPOSE, CMD, ENTRYPOINT, or HEALTHCHECK \
@@ -670,6 +681,80 @@ RUN apt-get install -y nginx curl git
         assert!(
             w.contains("confidence cutoff"),
             "warning should reference the profile cutoff: {w}"
+        );
+    }
+
+    #[test]
+    fn test_wait_only_contract_is_not_an_anomaly() {
+        // A port-only Dockerfile produces an empty goss.yml but a valid
+        // goss_wait.yml (the port routes to the readiness gate). That is not
+        // "nothing to assert" and must not warn.
+        let content = "FROM nginx\nEXPOSE 80\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+        assert!(
+            output.goss_wait_yml.is_some(),
+            "a port signal should produce a readiness gate"
+        );
+        assert!(
+            output.warnings.is_empty(),
+            "a populated wait file means the run is not empty: {:?}",
+            output.warnings
+        );
+    }
+
+    #[test]
+    fn test_healthcheck_only_contract_is_not_an_anomaly() {
+        // A healthcheck-only Dockerfile routes its assertion to the wait file;
+        // the empty main must not be flagged as an anomaly.
+        let content =
+            "FROM alpine\nHEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+        assert!(output.goss_wait_yml.is_some());
+        assert!(
+            output.warnings.is_empty(),
+            "a healthcheck readiness gate means the run is not empty: {:?}",
+            output.warnings
+        );
+    }
+
+    #[test]
+    fn test_policy_emptied_output_warns_without_claiming_confidence_only() {
+        // A High-confidence HttpStatus assertion dropped purely by policy
+        // (http_checks defaults off), with no wait gate, empties the whole run.
+        // It must warn, and the message must not mislead by blaming confidence
+        // alone — it should mention policy too.
+        let mut contract = RuntimeContract {
+            base_image: "nginx".to_string(),
+            ..Default::default()
+        };
+        contract.assertions.push(ContractAssertion::new(
+            AssertionKind::HttpStatus {
+                url: "http://127.0.0.1:8080/healthz".to_string(),
+                status: 200,
+            },
+            "CLI: --health-path flag",
+            0,
+            Confidence::High,
+        ));
+        // Default policy has http_checks = false, so the assertion is dropped.
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            Some(false),
+        );
+
+        assert_eq!(output.warnings.len(), 1, "policy-emptied run should warn");
+        let w = &output.warnings[0];
+        assert!(
+            w.contains("policy"),
+            "message must acknowledge the policy cause, not only confidence: {w}"
         );
     }
 

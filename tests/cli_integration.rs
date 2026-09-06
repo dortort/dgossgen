@@ -13,7 +13,11 @@ fn test_cli_help_exits_success() {
 }
 
 #[test]
-fn test_init_with_warnings_still_writes_output() {
+fn test_init_wait_only_contract_exits_zero() {
+    // A port signal routes to goss_wait.yml, leaving goss.yml empty. That is a
+    // valid readiness gate, not an anomaly, so the run must exit 0 (regression
+    // guard: an earlier revision wrongly flagged the empty main as "nothing to
+    // assert" even though the wait file was populated).
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
     let output_dir = temp.path().join("generated");
@@ -36,11 +40,12 @@ fn test_init_with_warnings_still_writes_output() {
             "minimal",
         ])
         .assert()
-        .code(2);
+        .success();
 
+    assert!(output_dir.join("goss.yml").exists());
     assert!(
-        output_dir.join("goss.yml").exists(),
-        "goss.yml should still be written even when warnings cause exit code 2"
+        output_dir.join("goss_wait.yml").exists(),
+        "the port signal should produce a readiness gate"
     );
 }
 
