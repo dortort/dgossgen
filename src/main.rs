@@ -233,11 +233,19 @@ fn emit_output(
 
     output::write_output(output_dir, output)?;
 
+    Ok(warning_exit_code(output, strict_warnings))
+}
+
+/// Decide the process exit code from a generator result: 2 for a genuine
+/// warning (or, under `strict_warnings`, any informational note), else success.
+/// This is the single source of truth shared by the interactive and
+/// non-interactive paths so they cannot drift.
+fn warning_exit_code(output: &generator::GeneratorOutput, strict_warnings: bool) -> ExitCode {
     let anomalous = !output.warnings.is_empty() || (strict_warnings && !output.notes.is_empty());
     if anomalous {
-        Ok(ExitCode::from(2))
+        ExitCode::from(2)
     } else {
-        Ok(ExitCode::SUCCESS)
+        ExitCode::SUCCESS
     }
 }
 
@@ -246,7 +254,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
     let policy = PolicyConfig::load_or_default(&common.context)?;
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
-    if interactive {
+    let exit_code = if interactive {
         let session = interactive::run_interactive(&contract)?;
 
         // Apply session overrides
@@ -289,7 +297,12 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             }
         }
 
+        // The preview already displayed notes and warnings; write the accepted
+        // output and let the same exit-code rule as non-interactive mode apply,
+        // so --strict-warnings and the empty-contract anomaly are honored here
+        // too.
         output::write_output(&common.output_dir, &output)?;
+        warning_exit_code(&output, common.strict_warnings)
     } else {
         // Apply CLI overrides for health path
         if let Some(path) = &common.health_path {
@@ -309,18 +322,15 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
-        let exit_code = emit_output(&common.output_dir, &output, common.strict_warnings)?;
-        if exit_code != ExitCode::SUCCESS {
-            return Ok(exit_code);
-        }
-    }
+        emit_output(&common.output_dir, &output, common.strict_warnings)?
+    };
 
     if common.editor {
         let goss_path = common.output_dir.join("goss.yml");
         interactive::open_in_editor(goss_path.to_str().unwrap_or("goss.yml"))?;
     }
 
-    Ok(ExitCode::SUCCESS)
+    Ok(exit_code)
 }
 
 fn cmd_probe(
