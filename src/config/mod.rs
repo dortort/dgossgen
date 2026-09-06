@@ -141,6 +141,7 @@ impl Default for WaitConfig {
 
 /// A known service pattern mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServicePattern {
     /// Service name to match (e.g., "nginx")
     pub name: String,
@@ -248,6 +249,17 @@ mod tests {
         assert!(
             PolicyConfig::load_or_default(dir.path()).is_err(),
             "an unknown/misspelled key must be rejected under deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_unknown_service_pattern_field_is_error() {
+        // deny_unknown_fields must recurse into nested ServicePattern entries: a
+        // misspelled key there would otherwise silently drop the assertion.
+        let yaml = "service_patterns:\n  - name: nginx\n    proces: nginx\n";
+        assert!(
+            serde_yml::from_str::<PolicyConfig>(yaml).is_err(),
+            "a misspelled nested service_patterns key must be rejected"
         );
     }
 
