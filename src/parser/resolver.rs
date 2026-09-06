@@ -2,6 +2,12 @@ use std::collections::HashMap;
 
 use super::ast::ArgInstruction;
 
+/// Internal marker the parser substitutes for an escaped `\$` in an ENV value so
+/// resolution treats it as a literal `$` instead of a variable reference. Uses a
+/// Unicode noncharacter (never valid for interchange) to avoid colliding with
+/// real Dockerfile text.
+pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
+
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
 #[derive(Default)]
@@ -55,6 +61,11 @@ impl VariableResolver {
         let mut iter = input.char_indices().peekable();
 
         while let Some((idx, ch)) = iter.next() {
+            if ch == ESCAPED_DOLLAR {
+                result.push('$');
+                continue;
+            }
+
             if ch != '$' {
                 result.push(ch);
                 continue;
@@ -235,6 +246,17 @@ mod tests {
             .vars
             .insert("APP".to_string(), "servico".to_string());
         assert_eq!(resolver.resolve("π/$APP/ß"), "π/servico/ß");
+    }
+
+    #[test]
+    fn test_resolve_escaped_dollar_marker_stays_literal() {
+        // The marker must resolve to a literal `$` and must NOT expand, even when
+        // a matching variable is defined.
+        let mut resolver = VariableResolver::new();
+        resolver
+            .vars
+            .insert("ROOT".to_string(), "/data".to_string());
+        assert_eq!(resolver.resolve(&format!("{ESCAPED_DOLLAR}ROOT")), "$ROOT");
     }
 
     #[test]

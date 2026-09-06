@@ -269,8 +269,14 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
                     // and `$` (matching Docker/BuildKit); before any other
                     // character it is a literal backslash, so a value such as
                     // `"\d+\w"` is preserved rather than mangled to `d+w`.
+                    // An escaped `$` becomes a marker so later variable
+                    // resolution keeps it literal instead of expanding it.
                     match chars.clone().next() {
-                        Some((_, next)) if matches!(next, '"' | '\\' | '$') => {
+                        Some((_, '$')) => {
+                            val.push(ESCAPED_DOLLAR);
+                            chars.next();
+                        }
+                        Some((_, next)) if matches!(next, '"' | '\\') => {
                             val.push(next);
                             chars.next();
                         }
@@ -297,7 +303,9 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
         while let Some((i, c)) = chars.next() {
             if c == '\\' {
                 if let Some((_, next)) = chars.next() {
-                    val.push(next);
+                    // An escaped `$` becomes a marker so later variable
+                    // resolution keeps it literal instead of expanding it.
+                    val.push(if next == '$' { ESCAPED_DOLLAR } else { next });
                 }
                 // A trailing backslash with nothing after it is dropped.
             } else if c.is_whitespace() {
@@ -854,10 +862,26 @@ ENV OLD_STYLE value
     }
 
     #[test]
-    fn test_parse_env_double_quoted_value_escapes_backslash_and_dollar() {
-        // `\\` collapses to one backslash; `\$` drops the escape.
+    fn test_parse_env_double_quoted_value_marks_escaped_dollar() {
+        // `\\` collapses to one backslash; `\$` becomes the internal marker so
+        // resolution later keeps it a literal `$` rather than expanding it.
         let envs = env_pairs("FROM alpine\nENV P=\"a\\\\b\\$c\"\n");
-        assert_eq!(envs, vec![vec![("P".to_string(), "a\\b$c".to_string())]]);
+        assert_eq!(
+            envs,
+            vec![vec![("P".to_string(), format!("a\\b{ESCAPED_DOLLAR}c"))]]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_unquoted_marks_escaped_dollar() {
+        let envs = env_pairs("FROM alpine\nENV LITERAL=\\$ROOT\n");
+        assert_eq!(
+            envs,
+            vec![vec![(
+                "LITERAL".to_string(),
+                format!("{ESCAPED_DOLLAR}ROOT")
+            )]]
+        );
     }
 
     #[test]
