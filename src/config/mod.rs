@@ -79,8 +79,13 @@ impl PolicyConfig {
         let candidates = [".dgossgen.yml", ".dgossgen.yaml"];
         for name in &candidates {
             let path = dir.join(name);
-            if path.exists() {
-                return Self::load(&path);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => return Self::load(&path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("inspecting config file {}", path.display()));
+                }
             }
         }
         Ok(Self::default())
@@ -260,6 +265,20 @@ mod tests {
         assert!(
             serde_yml::from_str::<PolicyConfig>(yaml).is_err(),
             "a misspelled nested service_patterns key must be rejected"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_load_or_default_dangling_symlink_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A present-but-unreadable config (dangling symlink) must fail loudly,
+        // not be mistaken for an absent file and reverted to defaults.
+        std::os::unix::fs::symlink("nonexistent_target.yml", dir.path().join(".dgossgen.yml"))
+            .unwrap();
+        assert!(
+            PolicyConfig::load_or_default(dir.path()).is_err(),
+            "a dangling config symlink must not silently revert to defaults"
         );
     }
 
