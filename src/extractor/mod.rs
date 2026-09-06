@@ -26,8 +26,9 @@ pub fn extract_contract(
     let mut resolver = VariableResolver::new();
     resolver.load_build_args(build_args);
     resolver.load_global_args(&dockerfile.global_args);
-    resolver.process_stage(stage);
 
+    // Resolve the base image against build args and pre-FROM globals only: a stage-body
+    // ARG/ENV appears after FROM and cannot influence how the image reference resolved.
     let mut contract = RuntimeContract {
         base_image: resolver.resolve(&stage.image),
         ..Default::default()
@@ -45,6 +46,9 @@ pub fn extract_contract(
     let mut fold_cmd: Option<(CommandForm, usize)> = None;
     let mut fold_healthcheck: Option<(HealthcheckInfo, usize)> = None;
 
+    // Walk instructions in source order, updating the variable map as ARG/ENV are seen so
+    // every instruction resolves against the variables defined above it. A later ENV
+    // redefinition therefore cannot retroactively change how an earlier instruction resolved.
     for inst in &stage.instructions {
         match &inst.instruction {
             Instruction::Workdir(dir) => {
@@ -135,9 +139,14 @@ pub fn extract_contract(
                 }
             }
 
+            Instruction::Arg { name, default } => {
+                resolver.declare_arg(name, default.as_deref());
+            }
+
             Instruction::Env(pairs) => {
                 for (key, value) in pairs {
                     let resolved_val = resolver.resolve(value);
+                    resolver.set_var(key, &resolved_val);
                     contract.env.push((key.clone(), resolved_val));
                 }
             }
@@ -796,6 +805,71 @@ EXPOSE 1024-65535
         let (specs, warning) = parse_expose_token("notaport");
         assert!(specs.is_empty());
         assert!(warning.unwrap().contains("not a valid port"));
+    }
+
+    #[test]
+    fn test_instruction_resolves_variable_in_effect_at_its_position() {
+        // WORKDIR, EXPOSE, and USER each read a variable that is redefined *below* them.
+        // Docker resolves each against the value in effect at its own position, so the
+        // later redefinitions must not leak upward into the earlier instructions.
+        let content = r#"
+FROM alpine
+ENV APPDIR=/srv/app
+WORKDIR $APPDIR
+ENV PORT=8080
+EXPOSE $PORT
+ENV APPUSER=alice
+USER $APPUSER
+ENV APPDIR=/wrong
+ENV PORT=9090
+ENV APPUSER=bob
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, Some("/srv/app".to_string()));
+        assert_eq!(contract.exposed_ports.len(), 1);
+        assert_eq!(contract.exposed_ports[0].port, 8080);
+        assert_eq!(contract.user, Some("alice".to_string()));
+        assert!(contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::UserExists { username } if username == "alice"
+        )));
+    }
+
+    #[test]
+    fn test_later_redefinition_does_not_change_earlier_resolution() {
+        // Two EXPOSE instructions straddle a redefinition of PORT. The first resolves
+        // against the value above it (8080), the second against the redefined value (9090);
+        // the redefinition must not retroactively rewrite the first.
+        let content = r#"
+FROM alpine
+ENV PORT=8080
+EXPOSE $PORT
+ENV PORT=9090
+EXPOSE $PORT
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![8080, 9090]);
+    }
+
+    #[test]
+    fn test_base_image_ignores_stage_body_env_redefinition() {
+        // FROM is the first instruction of a stage; a stage-body ENV that shadows the
+        // ARG used in the image reference appears afterward and cannot change how the base
+        // image resolved.
+        let content = r#"
+ARG TAG=1.0
+FROM alpine:${TAG}
+ENV TAG=2.0
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.base_image, "alpine:1.0");
     }
 
     #[test]
