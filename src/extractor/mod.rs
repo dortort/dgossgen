@@ -807,6 +807,52 @@ EXPOSE 1024-65535
         assert!(warning.unwrap().contains("not a valid port"));
     }
 
+    fn env_value<'a>(contract: &'a RuntimeContract, key: &str) -> Option<&'a str> {
+        contract
+            .env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn test_env_escaped_dollar_quoted_stays_literal() {
+        // `ENV LITERAL="\$ROOT"` must yield the literal `$ROOT`, not the value of
+        // ROOT, even though ROOT is defined in scope.
+        let content = "FROM alpine\nENV ROOT=/data\nENV LITERAL=\"\\$ROOT\"\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(env_value(&contract, "LITERAL"), Some("$ROOT"));
+    }
+
+    #[test]
+    fn test_env_escaped_dollar_unquoted_stays_literal() {
+        let content = "FROM alpine\nENV ROOT=/data\nENV LITERAL=\\$ROOT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(env_value(&contract, "LITERAL"), Some("$ROOT"));
+    }
+
+    #[test]
+    fn test_env_normal_expansion_still_works() {
+        let content = "FROM alpine\nENV FOO=bar\nENV A=$FOO\nENV B=${FOO}\nENV C=\"$FOO\"\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(env_value(&contract, "A"), Some("bar"));
+        assert_eq!(env_value(&contract, "B"), Some("bar"));
+        assert_eq!(env_value(&contract, "C"), Some("bar"));
+    }
+
+    #[test]
+    fn test_env_escaped_dollar_does_not_break_adjacent_expansion() {
+        // A literal `$` next to a real expansion in the same value: the escaped
+        // one stays literal, the unescaped one expands.
+        let content = "FROM alpine\nENV FOO=bar\nENV MIX=\"\\$FOO=$FOO\"\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(env_value(&contract, "MIX"), Some("$FOO=bar"));
+    }
+
     #[test]
     fn test_instruction_resolves_variable_in_effect_at_its_position() {
         // WORKDIR, EXPOSE, and USER each read a variable that is redefined *below* them.
