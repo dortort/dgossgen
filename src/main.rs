@@ -311,6 +311,10 @@ fn cmd_probe(
 ) -> Result<ExitCode> {
     let (profile, build_args, mut contract) = load_contract(&common)?;
 
+    // Validate the policy before any expensive, side-effecting container work:
+    // a malformed .dgossgen.yml is now a hard error and must fail before build+run.
+    let policy = PolicyConfig::load_or_default(&common.context)?;
+
     let rt: ContainerRuntime = runtime
         .parse()
         .map_err(|e: String| anyhow::anyhow!("{}", e))?;
@@ -347,7 +351,6 @@ fn cmd_probe(
     eprintln!("{}", style("Probe complete. Evidence merged.").green());
 
     // Generate
-    let policy = PolicyConfig::load_or_default(&common.context)?;
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
