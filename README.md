@@ -110,6 +110,8 @@ Options:
       --profile <PROFILE>    Generation profile: minimal|standard|strict [default: standard]
       --no-wait              Do not generate goss_wait.yml
       --force-wait           Force generation of goss_wait.yml
+      --strict-warnings      Treat informational notes (e.g. confidence-filtered
+                             assertions) as warnings, so any note yields exit 2
       --primary-port <N>     Override primary service port
       --health-path <PATH>   Health check endpoint path (e.g., /healthz)
       --health-status <CODE> Expected HTTP status [default: 200]
@@ -358,11 +360,18 @@ command:
 
 ## Exit codes
 
-| Code | Meaning                               |
-|------|---------------------------------------|
-| 0    | Success                               |
-| 2    | Generation completed with warnings    |
-| 1    | Fatal error (parse failure, etc.)     |
+| Code | Meaning                                                        |
+|------|----------------------------------------------------------------|
+| 0    | Success (may include informational `note:` lines on stderr)    |
+| 2    | Completed with a warning — a genuine anomaly, e.g. an empty contract that asserts nothing |
+| 1    | Fatal error (parse failure, etc.)                              |
+
+Routine, expected behavior — chiefly assertions dropped because they fall below
+the active profile's confidence cutoff — is reported as `note:` lines on stderr
+and does **not** change the exit code, so confidence filtering never fails a CI
+build. Exit code 2 is reserved for genuine anomalies such as a contract that
+produces no assertions at all. Pass `--strict-warnings` to promote notes to
+warnings if you want any confidence-filtered skip to fail the build.
 
 ## Security
 
