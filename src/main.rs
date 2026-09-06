@@ -112,6 +112,11 @@ struct CommonArgs {
     #[arg(long)]
     force_wait: bool,
 
+    /// Treat informational notes (e.g. confidence-filtered assertions) as
+    /// warnings, so any note also yields exit code 2
+    #[arg(long)]
+    strict_warnings: bool,
+
     /// Override primary service port
     #[arg(long)]
     primary_port: Option<u16>,
@@ -207,17 +212,33 @@ fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
     Ok((profile, build_args, contract))
 }
 
-fn emit_output(output_dir: &Path, output: &generator::GeneratorOutput) -> Result<ExitCode> {
-    if !output.warnings.is_empty() {
-        for w in &output.warnings {
-            eprintln!("{} {}", style("warning:").yellow(), w);
-        }
+/// Write the generated files and report notes/warnings on stderr.
+///
+/// Exit code 2 is reserved for genuine anomalies (`output.warnings`), such as a
+/// contract that produced no assertions. Routine confidence-filter skips are
+/// carried as `output.notes` and are purely informational — unless the user
+/// opts into `strict_warnings`, which promotes notes to warnings for the exit
+/// code. Files are always written before the exit code is decided.
+fn emit_output(
+    output_dir: &Path,
+    output: &generator::GeneratorOutput,
+    strict_warnings: bool,
+) -> Result<ExitCode> {
+    for n in &output.notes {
+        eprintln!("{} {}", style("note:").cyan(), n);
     }
+    for w in &output.warnings {
+        eprintln!("{} {}", style("warning:").yellow(), w);
+    }
+
     output::write_output(output_dir, output)?;
-    if !output.warnings.is_empty() {
-        return Ok(ExitCode::from(2));
+
+    let anomalous = !output.warnings.is_empty() || (strict_warnings && !output.notes.is_empty());
+    if anomalous {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
@@ -288,7 +309,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
-        let exit_code = emit_output(&common.output_dir, &output)?;
+        let exit_code = emit_output(&common.output_dir, &output, common.strict_warnings)?;
         if exit_code != ExitCode::SUCCESS {
             return Ok(exit_code);
         }
@@ -354,7 +375,7 @@ fn cmd_probe(
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let output = generator::generate(&contract, profile, &policy, force_wait);
-    emit_output(&common.output_dir, &output)
+    emit_output(&common.output_dir, &output, common.strict_warnings)
 }
 
 fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
