@@ -603,6 +603,95 @@ EXPOSE 80
     }
 
     #[test]
+    fn test_confidence_skips_are_notes_not_warnings() {
+        // Package installs are Confidence::Low; under `standard` (Medium cutoff)
+        // they are filtered. That filtering is routine and must land in `notes`,
+        // never in `warnings` (which drive exit code 2).
+        let content = r#"
+FROM debian:12
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]
+RUN apt-get install -y nginx curl git
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+        assert!(
+            !output.notes.is_empty(),
+            "confidence-filtered assertions should produce notes"
+        );
+        assert!(
+            output
+                .notes
+                .iter()
+                .any(|n| n.contains("confidence too low")),
+            "notes should describe the confidence skip"
+        );
+        assert!(
+            output.warnings.is_empty(),
+            "routine confidence filtering must not populate warnings, got: {:?}",
+            output.warnings
+        );
+    }
+
+    #[test]
+    fn test_empty_contract_no_signals_warns() {
+        // No EXPOSE/CMD/ENTRYPOINT/HEALTHCHECK: nothing to assert. This is the
+        // silent-wrong-output case and must surface as a warning (exit 2), with
+        // a message naming the absent signals.
+        let content = "FROM alpine:3.19\nRUN echo hello\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+        assert_eq!(output.warnings.len(), 1, "expected one anomaly warning");
+        let w = &output.warnings[0];
+        assert!(w.contains("no assertions"), "warning: {w}");
+        assert!(
+            w.contains("EXPOSE") && w.contains("HEALTHCHECK"),
+            "warning should name the absent signals: {w}"
+        );
+    }
+
+    #[test]
+    fn test_empty_contract_with_filtered_signals_warns_differently() {
+        // Signals exist but every candidate was filtered by confidence. The
+        // diagnostic should point at the profile cutoff rather than claim no
+        // signals were found.
+        let content = "FROM alpine:3.19\nRUN apk add --no-cache curl\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        // Minimal profile => High cutoff => the Low-confidence package is filtered.
+        let output = generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
+
+        assert_eq!(output.warnings.len(), 1, "expected one anomaly warning");
+        let w = &output.warnings[0];
+        assert!(
+            w.contains("confidence cutoff"),
+            "warning should reference the profile cutoff: {w}"
+        );
+    }
+
+    #[test]
+    fn test_nonempty_contract_has_no_anomaly_warning() {
+        let content = r#"
+FROM nginx
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+        assert!(
+            output.warnings.is_empty(),
+            "a contract with real assertions must not warn: {:?}",
+            output.warnings
+        );
+    }
+
+    #[test]
     fn test_deduplicate_file_resources_prefers_mode_and_filetype() {
         let mut resources = vec![
             GossResource::File {
