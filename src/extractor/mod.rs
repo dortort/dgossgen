@@ -903,6 +903,21 @@ EXPOSE $PORT
     }
 
     #[test]
+    fn test_escaped_literal_and_instruction_order_resolution_coexist() {
+        // Interaction of the two features that landed together: escape-aware `$` and
+        // instruction-order resolution. An escaped `\$PORT` stays literal even though
+        // PORT is live, while the unescaped EXPOSE instructions resolve against the
+        // value in effect above each one (8080 then, after redefinition, 9090).
+        let content = "FROM alpine\nENV PORT=8080\nENV LITERAL=\"\\$PORT\"\nEXPOSE $PORT\nENV PORT=9090\nEXPOSE $PORT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(env_value(&contract, "LITERAL"), Some("$PORT"));
+        let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![8080, 9090]);
+    }
+
+    #[test]
     fn test_base_image_ignores_stage_body_env_redefinition() {
         // FROM is the first instruction of a stage; a stage-body ENV that shadows the
         // ARG used in the image reference appears afterward and cannot change how the base
