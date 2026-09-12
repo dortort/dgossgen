@@ -739,7 +739,9 @@ RUN apt-get install -y nginx curl git
         // A High-confidence HttpStatus assertion dropped purely by policy
         // (http_checks defaults off), with no wait gate, empties the whole run.
         // It must warn, and the message must not mislead by blaming confidence
-        // alone — it should mention policy too.
+        // alone — it should mention policy too. Note this models an *inferred*
+        // HTTP check (not user_requested); an explicit --health-path assertion
+        // is marked user_requested and would bypass the gate instead.
         let mut contract = RuntimeContract {
             base_image: "nginx".to_string(),
             ..Default::default()
@@ -749,7 +751,7 @@ RUN apt-get install -y nginx curl git
                 url: "http://127.0.0.1:8080/healthz".to_string(),
                 status: 200,
             },
-            "CLI: --health-path flag",
+            "inferred: service health probe",
             0,
             Confidence::High,
         ));
