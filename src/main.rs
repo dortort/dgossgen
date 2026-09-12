@@ -303,8 +303,27 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
                 .retain(|a| !matches!(a.kind, AssertionKind::ProcessRunning { .. }));
         }
 
-        if let Some(path) = &session.health_path {
-            let status = session.health_status.unwrap_or(200);
+        // Resolve the health endpoint. A --health-path flag is explicit intent
+        // and must win even in interactive mode — otherwise it is silently
+        // dropped whenever the health prompt is skipped (e.g. the Dockerfile
+        // already declares a HEALTHCHECK, so run_interactive never asks). The
+        // interactive answer is the fallback when no flag was given.
+        let health = if let Some(path) = &common.health_path {
+            Some((
+                path.clone(),
+                common.health_status,
+                "CLI: --health-path flag",
+            ))
+        } else {
+            session.health_path.as_ref().map(|path| {
+                (
+                    path.clone(),
+                    session.health_status.unwrap_or(200),
+                    "interactive: user-provided health endpoint",
+                )
+            })
+        };
+        if let Some((path, status, provenance)) = health {
             contract.assertions.push(
                 extractor::ContractAssertion::new(
                     AssertionKind::HttpStatus {
@@ -317,7 +336,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
                         ),
                         status,
                     },
-                    "interactive: user-provided health endpoint",
+                    provenance,
                     0,
                     Confidence::High,
                 )
