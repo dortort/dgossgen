@@ -138,18 +138,15 @@ fn empty_contract_diagnostic(contract: &RuntimeContract, profile: Profile) -> St
              --interactive, or gather runtime evidence with the `probe` subcommand."
         )
     } else {
-        // No runtime signals at all. Advise only levers that actually produce a
-        // main-file assertion under the default policy: a CMD/ENTRYPOINT yields
-        // a process check and an EXPOSE yields a readiness gate, whereas
-        // --health-path relies on http_checks, which defaults off — so it is
-        // qualified rather than offered bare (making it effective on its own is
-        // tracked separately).
+        // No runtime signals at all. Advise levers that produce a main-file
+        // assertion: a CMD/ENTRYPOINT yields a process check, an EXPOSE yields
+        // a readiness gate, and --health-path now emits an HTTP check on its
+        // own (explicit user intent overrides the default http_checks policy).
         "goss.yml has no assertions: no EXPOSE, CMD, ENTRYPOINT, or HEALTHCHECK \
          was found, so there is nothing to assert. Add a CMD/ENTRYPOINT (a \
          process check) or an EXPOSE (a readiness gate) to the image, gather \
          runtime evidence with the `probe` subcommand, or supply a health \
-         endpoint with --health-path (which also needs http_checks enabled in \
-         .dgossgen.yml)."
+         endpoint with --health-path."
             .to_string()
     }
 }
