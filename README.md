@@ -235,6 +235,9 @@ Create a `.dgossgen.yml` file in your project root:
 assert_ports: optional
 assert_process: optional
 assert_file_modes: false
+# Reserved to gate HTTP checks that dgossgen infers on its own. An HTTP check
+# you request explicitly (via --health-path or the interactive health prompt)
+# is always emitted, regardless of this setting.
 http_checks: false
 
 # Wait configuration

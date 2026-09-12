@@ -212,6 +212,45 @@ fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
     Ok((profile, build_args, contract))
 }
 
+/// Translate a `--health-path` CLI flag into a user-requested `HttpStatus`
+/// assertion on the contract. Shared by the non-interactive `init` and `probe`
+/// paths so the flag behaves identically in both (the interactive path builds
+/// its own assertion from session answers). The assertion is marked
+/// `user_requested`, so the generator emits it regardless of the default
+/// `http_checks` policy. No-op when `--health-path` was not supplied.
+fn apply_cli_health_path(contract: &mut extractor::RuntimeContract, common: &CommonArgs) {
+    if let Some(path) = &common.health_path {
+        // Port precedence: an explicit --primary-port, else a declared EXPOSE,
+        // else a port the probe discovered the container listening on (merged
+        // in as a PortListening assertion), else the conventional 80. Consulting
+        // the discovered evidence matters for `probe`, where the real service
+        // port is often not in EXPOSE — falling straight to 80 would emit an
+        // HTTP check against the wrong endpoint.
+        let port = common
+            .primary_port
+            .or_else(|| contract.exposed_ports.first().map(|p| p.port))
+            .or_else(|| {
+                contract.assertions.iter().find_map(|a| match &a.kind {
+                    AssertionKind::PortListening { port, .. } => Some(*port),
+                    _ => None,
+                })
+            })
+            .unwrap_or(80);
+        contract.assertions.push(
+            extractor::ContractAssertion::new(
+                AssertionKind::HttpStatus {
+                    url: format!("http://127.0.0.1:{}{path}", port),
+                    status: common.health_status,
+                },
+                "CLI: --health-path flag",
+                0,
+                Confidence::High,
+            )
+            .user_requested(),
+        );
+    }
+}
+
 /// Write the generated files and report notes/warnings on stderr.
 ///
 /// Exit code 2 is reserved for genuine anomalies (`output.warnings`), such as a
@@ -255,7 +294,11 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let exit_code = if interactive {
-        let session = interactive::run_interactive(&contract)?;
+        let session = interactive::run_interactive(
+            &contract,
+            common.primary_port.is_some(),
+            common.health_path.is_some(),
+        )?;
 
         // Apply session overrides
         if !session.confirm_process {
@@ -264,20 +307,45 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
                 .retain(|a| !matches!(a.kind, AssertionKind::ProcessRunning { .. }));
         }
 
-        if let Some(path) = &session.health_path {
-            let status = session.health_status.unwrap_or(200);
-            contract.assertions.push(extractor::ContractAssertion::new(
-                AssertionKind::HttpStatus {
-                    url: format!(
-                        "http://127.0.0.1:{}{path}",
-                        session.primary_port.unwrap_or(80)
-                    ),
-                    status,
-                },
-                "interactive: user-provided health endpoint",
-                0,
-                Confidence::High,
-            ));
+        // Resolve the health endpoint. A --health-path flag is explicit intent
+        // and must win even in interactive mode — otherwise it is silently
+        // dropped whenever the health prompt is skipped (e.g. the Dockerfile
+        // already declares a HEALTHCHECK, so run_interactive never asks). The
+        // interactive answer is the fallback when no flag was given.
+        let health = if let Some(path) = &common.health_path {
+            Some((
+                path.clone(),
+                common.health_status,
+                "CLI: --health-path flag",
+            ))
+        } else {
+            session.health_path.as_ref().map(|path| {
+                (
+                    path.clone(),
+                    session.health_status.unwrap_or(200),
+                    "interactive: user-provided health endpoint",
+                )
+            })
+        };
+        if let Some((path, status, provenance)) = health {
+            contract.assertions.push(
+                extractor::ContractAssertion::new(
+                    AssertionKind::HttpStatus {
+                        url: format!(
+                            "http://127.0.0.1:{}{path}",
+                            // An explicit --primary-port wins, matching the
+                            // non-interactive path; otherwise use the port the
+                            // session selected (or the sole EXPOSE), then 80.
+                            common.primary_port.or(session.primary_port).unwrap_or(80)
+                        ),
+                        status,
+                    },
+                    provenance,
+                    0,
+                    Confidence::High,
+                )
+                .user_requested(),
+            );
         }
 
         // Generate
@@ -305,20 +373,7 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         warning_exit_code(&output, common.strict_warnings)
     } else {
         // Apply CLI overrides for health path
-        if let Some(path) = &common.health_path {
-            let port = common
-                .primary_port
-                .unwrap_or_else(|| contract.exposed_ports.first().map(|p| p.port).unwrap_or(80));
-            contract.assertions.push(extractor::ContractAssertion::new(
-                AssertionKind::HttpStatus {
-                    url: format!("http://127.0.0.1:{}{path}", port),
-                    status: common.health_status,
-                },
-                "CLI: --health-path flag",
-                0,
-                Confidence::High,
-            ));
-        }
+        apply_cli_health_path(&mut contract, &common);
 
         // Non-interactive generation
         let output = generator::generate(&contract, profile, &policy, force_wait);
@@ -380,6 +435,11 @@ fn cmd_probe(
     probe::merge_evidence(&mut contract, &evidence);
 
     eprintln!("{}", style("Probe complete. Evidence merged.").green());
+
+    // Honor an explicit --health-path here too: probe shares CommonArgs with
+    // init, so the flag must produce the same HTTP check rather than being
+    // silently dropped after a full build+run.
+    apply_cli_health_path(&mut contract, &common);
 
     // Generate
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
@@ -477,5 +537,132 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
             style(issues.len().to_string()).yellow().bold()
         );
         Ok(ExitCode::from(2))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use dgossgen::extractor::RuntimeContract;
+
+    fn common_from(args: &[&str]) -> CommonArgs {
+        let mut argv = vec!["dgossgen"];
+        argv.extend_from_slice(args);
+        CommonArgs::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_adds_user_requested_http_assertion() {
+        // The shared helper drives both `init` and `probe`, so this covers the
+        // flag's behavior in either command: the flag becomes a High-confidence,
+        // user_requested HttpStatus that will bypass the default policy gate.
+        let common = common_from(&["--health-path", "/healthz", "--primary-port", "9000"]);
+        let mut contract = RuntimeContract::default();
+
+        apply_cli_health_path(&mut contract, &common);
+
+        assert_eq!(contract.assertions.len(), 1);
+        let a = &contract.assertions[0];
+        assert!(
+            a.user_requested,
+            "an explicit --health-path must be marked user_requested"
+        );
+        assert_eq!(a.confidence, Confidence::High);
+        match &a.kind {
+            AssertionKind::HttpStatus { url, status } => {
+                assert_eq!(url, "http://127.0.0.1:9000/healthz");
+                assert_eq!(*status, 200);
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_defaults_port_to_80() {
+        // No --primary-port and no exposed ports: the conventional port 80.
+        let common = common_from(&["--health-path", "/ready", "--health-status", "204"]);
+        let mut contract = RuntimeContract::default();
+
+        apply_cli_health_path(&mut contract, &common);
+
+        match &contract.assertions[0].kind {
+            AssertionKind::HttpStatus { url, status } => {
+                assert_eq!(url, "http://127.0.0.1:80/ready");
+                assert_eq!(*status, 204);
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_uses_discovered_port_over_default() {
+        // Probe scenario: no --primary-port and no EXPOSE, but the probe merged
+        // in a discovered listening port as a PortListening assertion. The
+        // health URL must target that port, not fall back to 80.
+        let common = common_from(&["--health-path", "/healthz"]);
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(extractor::ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 8080,
+            },
+            "probe: discovered listening port",
+            0,
+            Confidence::High,
+        ));
+
+        apply_cli_health_path(&mut contract, &common);
+
+        let http = contract
+            .assertions
+            .iter()
+            .find_map(|a| match &a.kind {
+                AssertionKind::HttpStatus { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("an HttpStatus assertion should be added");
+        assert_eq!(http, "http://127.0.0.1:8080/healthz");
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_prefers_primary_port_over_discovered() {
+        // An explicit --primary-port always wins over a discovered port.
+        let common = common_from(&["--health-path", "/healthz", "--primary-port", "9000"]);
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(extractor::ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 8080,
+            },
+            "probe: discovered listening port",
+            0,
+            Confidence::High,
+        ));
+
+        apply_cli_health_path(&mut contract, &common);
+
+        let http = contract
+            .assertions
+            .iter()
+            .find_map(|a| match &a.kind {
+                AssertionKind::HttpStatus { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("an HttpStatus assertion should be added");
+        assert_eq!(http, "http://127.0.0.1:9000/healthz");
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_is_noop_without_flag() {
+        let common = common_from(&[]);
+        let mut contract = RuntimeContract::default();
+
+        apply_cli_health_path(&mut contract, &common);
+
+        assert!(
+            contract.assertions.is_empty(),
+            "no --health-path means no assertion is added"
+        );
     }
 }

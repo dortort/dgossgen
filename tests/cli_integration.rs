@@ -257,6 +257,50 @@ fn test_init_warns_on_unresolvable_expose_variable() {
 }
 
 #[test]
+fn test_init_health_path_emits_http_check_under_default_policy() {
+    // Regression guard for the silent-wrong-output bug: --health-path pushed a
+    // High-confidence HttpStatus assertion, but the generator's policy gate
+    // (http_checks defaults off) dropped it, so the tool exited 0 with a
+    // "wrote goss.yml" that never tested the endpoint. Explicit user intent
+    // must now override the default policy.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(&dockerfile, "FROM nginx:1.25\nEXPOSE 80\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--health-path",
+            "/healthz",
+            "--primary-port",
+            "80",
+        ])
+        .assert()
+        .success();
+
+    let goss = fs::read_to_string(output_dir.join("goss.yml")).expect("goss.yml should be written");
+    assert!(
+        goss.contains("http"),
+        "the explicitly-requested health check must be emitted, got:\n{goss}"
+    );
+    assert!(
+        goss.contains("http://127.0.0.1:80/healthz"),
+        "the health URL must reflect the port and path, got:\n{goss}"
+    );
+    assert!(
+        goss.contains("status: 200"),
+        "the default expected status must be rendered, got:\n{goss}"
+    );
+}
+
+#[test]
 fn test_probe_with_warnings_code_path() {
     // Note: This test validates that cmd_probe now uses emit_output helper which ensures
     // output files are written BEFORE returning exit code 2 on warnings (fixing the latent bug).

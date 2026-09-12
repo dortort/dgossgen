@@ -138,18 +138,15 @@ fn empty_contract_diagnostic(contract: &RuntimeContract, profile: Profile) -> St
              --interactive, or gather runtime evidence with the `probe` subcommand."
         )
     } else {
-        // No runtime signals at all. Advise only levers that actually produce a
-        // main-file assertion under the default policy: a CMD/ENTRYPOINT yields
-        // a process check and an EXPOSE yields a readiness gate, whereas
-        // --health-path relies on http_checks, which defaults off — so it is
-        // qualified rather than offered bare (making it effective on its own is
-        // tracked separately).
+        // No runtime signals at all. Advise levers that produce a main-file
+        // assertion: a CMD/ENTRYPOINT yields a process check, an EXPOSE yields
+        // a readiness gate, and --health-path now emits an HTTP check on its
+        // own (explicit user intent overrides the default http_checks policy).
         "goss.yml has no assertions: no EXPOSE, CMD, ENTRYPOINT, or HEALTHCHECK \
          was found, so there is nothing to assert. Add a CMD/ENTRYPOINT (a \
          process check) or an EXPOSE (a readiness gate) to the image, gather \
          runtime evidence with the `probe` subcommand, or supply a health \
-         endpoint with --health-path (which also needs http_checks enabled in \
-         .dgossgen.yml)."
+         endpoint with --health-path."
             .to_string()
     }
 }
@@ -350,7 +347,11 @@ fn build_main_resources(
             }
 
             AssertionKind::HttpStatus { url, status } => {
-                if policy.http_checks {
+                // HTTP checks are gated off by default policy, but an assertion
+                // the user explicitly asked for (--health-path, or the
+                // interactive health prompt) must not be silently discarded:
+                // explicit intent overrides the policy default.
+                if policy.http_checks || assertion.user_requested {
                     resources.push(GossResource::Http {
                         url: url.clone(),
                         status: *status,
@@ -738,7 +739,9 @@ RUN apt-get install -y nginx curl git
         // A High-confidence HttpStatus assertion dropped purely by policy
         // (http_checks defaults off), with no wait gate, empties the whole run.
         // It must warn, and the message must not mislead by blaming confidence
-        // alone — it should mention policy too.
+        // alone — it should mention policy too. Note this models an *inferred*
+        // HTTP check (not user_requested); an explicit --health-path assertion
+        // is marked user_requested and would bypass the gate instead.
         let mut contract = RuntimeContract {
             base_image: "nginx".to_string(),
             ..Default::default()
@@ -748,7 +751,7 @@ RUN apt-get install -y nginx curl git
                 url: "http://127.0.0.1:8080/healthz".to_string(),
                 status: 200,
             },
-            "CLI: --health-path flag",
+            "inferred: service health probe",
             0,
             Confidence::High,
         ));
@@ -765,6 +768,53 @@ RUN apt-get install -y nginx curl git
         assert!(
             w.contains("policy"),
             "message must acknowledge the policy cause, not only confidence: {w}"
+        );
+    }
+
+    #[test]
+    fn test_user_requested_http_check_overrides_default_policy() {
+        // A user who passes --health-path (or answers the interactive health
+        // prompt) explicitly asked for the HTTP check. Even though the default
+        // policy has http_checks = false, the assertion must appear in the
+        // output rather than being silently dropped.
+        let mut contract = RuntimeContract {
+            base_image: "nginx".to_string(),
+            ..Default::default()
+        };
+        contract.assertions.push(
+            ContractAssertion::new(
+                AssertionKind::HttpStatus {
+                    url: "http://127.0.0.1:80/healthz".to_string(),
+                    status: 200,
+                },
+                "CLI: --health-path flag",
+                0,
+                Confidence::High,
+            )
+            .user_requested(),
+        );
+
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            Some(false),
+        );
+
+        assert!(
+            output.goss_yml.contains("http"),
+            "user-requested http check must survive the default policy gate: {}",
+            output.goss_yml
+        );
+        assert!(
+            output.goss_yml.contains("/healthz"),
+            "the health path must be rendered: {}",
+            output.goss_yml
+        );
+        assert!(
+            output.warnings.is_empty(),
+            "a rendered http check means the run is not empty: {:?}",
+            output.warnings
         );
     }
 
