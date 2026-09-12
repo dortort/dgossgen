@@ -73,6 +73,11 @@ pub struct ContractAssertion {
     pub source_line: usize,
     /// Confidence level
     pub confidence: Confidence,
+    /// Whether the user explicitly asked for this assertion (e.g. via a CLI
+    /// flag or an interactive answer) rather than it being inferred
+    /// heuristically. Explicit intent overrides policy gates that would
+    /// otherwise silently drop the assertion (see the generator's HTTP gate).
+    pub user_requested: bool,
 }
 
 impl ContractAssertion {
@@ -87,7 +92,15 @@ impl ContractAssertion {
             provenance: provenance.into(),
             source_line,
             confidence,
+            user_requested: false,
         }
+    }
+
+    /// Mark this assertion as explicitly requested by the user, so that
+    /// policy gates cannot silently discard it.
+    pub fn user_requested(mut self) -> Self {
+        self.user_requested = true;
+        self
     }
 }
 
