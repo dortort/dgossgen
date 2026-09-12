@@ -266,18 +266,21 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
 
         if let Some(path) = &session.health_path {
             let status = session.health_status.unwrap_or(200);
-            contract.assertions.push(extractor::ContractAssertion::new(
-                AssertionKind::HttpStatus {
-                    url: format!(
-                        "http://127.0.0.1:{}{path}",
-                        session.primary_port.unwrap_or(80)
-                    ),
-                    status,
-                },
-                "interactive: user-provided health endpoint",
-                0,
-                Confidence::High,
-            ));
+            contract.assertions.push(
+                extractor::ContractAssertion::new(
+                    AssertionKind::HttpStatus {
+                        url: format!(
+                            "http://127.0.0.1:{}{path}",
+                            session.primary_port.unwrap_or(80)
+                        ),
+                        status,
+                    },
+                    "interactive: user-provided health endpoint",
+                    0,
+                    Confidence::High,
+                )
+                .user_requested(),
+            );
         }
 
         // Generate
@@ -309,15 +312,18 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             let port = common
                 .primary_port
                 .unwrap_or_else(|| contract.exposed_ports.first().map(|p| p.port).unwrap_or(80));
-            contract.assertions.push(extractor::ContractAssertion::new(
-                AssertionKind::HttpStatus {
-                    url: format!("http://127.0.0.1:{}{path}", port),
-                    status: common.health_status,
-                },
-                "CLI: --health-path flag",
-                0,
-                Confidence::High,
-            ));
+            contract.assertions.push(
+                extractor::ContractAssertion::new(
+                    AssertionKind::HttpStatus {
+                        url: format!("http://127.0.0.1:{}{path}", port),
+                        status: common.health_status,
+                    },
+                    "CLI: --health-path flag",
+                    0,
+                    Confidence::High,
+                )
+                .user_requested(),
+            );
         }
 
         // Non-interactive generation
