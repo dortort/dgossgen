@@ -350,7 +350,11 @@ fn build_main_resources(
             }
 
             AssertionKind::HttpStatus { url, status } => {
-                if policy.http_checks {
+                // HTTP checks are gated off by default policy, but an assertion
+                // the user explicitly asked for (--health-path, or the
+                // interactive health prompt) must not be silently discarded:
+                // explicit intent overrides the policy default.
+                if policy.http_checks || assertion.user_requested {
                     resources.push(GossResource::Http {
                         url: url.clone(),
                         status: *status,
@@ -765,6 +769,53 @@ RUN apt-get install -y nginx curl git
         assert!(
             w.contains("policy"),
             "message must acknowledge the policy cause, not only confidence: {w}"
+        );
+    }
+
+    #[test]
+    fn test_user_requested_http_check_overrides_default_policy() {
+        // A user who passes --health-path (or answers the interactive health
+        // prompt) explicitly asked for the HTTP check. Even though the default
+        // policy has http_checks = false, the assertion must appear in the
+        // output rather than being silently dropped.
+        let mut contract = RuntimeContract {
+            base_image: "nginx".to_string(),
+            ..Default::default()
+        };
+        contract.assertions.push(
+            ContractAssertion::new(
+                AssertionKind::HttpStatus {
+                    url: "http://127.0.0.1:80/healthz".to_string(),
+                    status: 200,
+                },
+                "CLI: --health-path flag",
+                0,
+                Confidence::High,
+            )
+            .user_requested(),
+        );
+
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            Some(false),
+        );
+
+        assert!(
+            output.goss_yml.contains("http"),
+            "user-requested http check must survive the default policy gate: {}",
+            output.goss_yml
+        );
+        assert!(
+            output.goss_yml.contains("/healthz"),
+            "the health path must be rendered: {}",
+            output.goss_yml
+        );
+        assert!(
+            output.warnings.is_empty(),
+            "a rendered http check means the run is not empty: {:?}",
+            output.warnings
         );
     }
 
