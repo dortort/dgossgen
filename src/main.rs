@@ -220,9 +220,22 @@ fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
 /// `http_checks` policy. No-op when `--health-path` was not supplied.
 fn apply_cli_health_path(contract: &mut extractor::RuntimeContract, common: &CommonArgs) {
     if let Some(path) = &common.health_path {
+        // Port precedence: an explicit --primary-port, else a declared EXPOSE,
+        // else a port the probe discovered the container listening on (merged
+        // in as a PortListening assertion), else the conventional 80. Consulting
+        // the discovered evidence matters for `probe`, where the real service
+        // port is often not in EXPOSE — falling straight to 80 would emit an
+        // HTTP check against the wrong endpoint.
         let port = common
             .primary_port
-            .unwrap_or_else(|| contract.exposed_ports.first().map(|p| p.port).unwrap_or(80));
+            .or_else(|| contract.exposed_ports.first().map(|p| p.port))
+            .or_else(|| {
+                contract.assertions.iter().find_map(|a| match &a.kind {
+                    AssertionKind::PortListening { port, .. } => Some(*port),
+                    _ => None,
+                })
+            })
+            .unwrap_or(80);
         contract.assertions.push(
             extractor::ContractAssertion::new(
                 AssertionKind::HttpStatus {
@@ -297,9 +310,10 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
                     AssertionKind::HttpStatus {
                         url: format!(
                             "http://127.0.0.1:{}{path}",
-                            // Prefer the interactively-chosen port, then an
-                            // explicit --primary-port, then the conventional 80.
-                            session.primary_port.or(common.primary_port).unwrap_or(80)
+                            // An explicit --primary-port wins, matching the
+                            // non-interactive path; otherwise use the port the
+                            // session selected (or the sole EXPOSE), then 80.
+                            common.primary_port.or(session.primary_port).unwrap_or(80)
                         ),
                         status,
                     },
@@ -556,6 +570,64 @@ mod tests {
             }
             other => panic!("expected HttpStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_uses_discovered_port_over_default() {
+        // Probe scenario: no --primary-port and no EXPOSE, but the probe merged
+        // in a discovered listening port as a PortListening assertion. The
+        // health URL must target that port, not fall back to 80.
+        let common = common_from(&["--health-path", "/healthz"]);
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(extractor::ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 8080,
+            },
+            "probe: discovered listening port",
+            0,
+            Confidence::High,
+        ));
+
+        apply_cli_health_path(&mut contract, &common);
+
+        let http = contract
+            .assertions
+            .iter()
+            .find_map(|a| match &a.kind {
+                AssertionKind::HttpStatus { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("an HttpStatus assertion should be added");
+        assert_eq!(http, "http://127.0.0.1:8080/healthz");
+    }
+
+    #[test]
+    fn test_apply_cli_health_path_prefers_primary_port_over_discovered() {
+        // An explicit --primary-port always wins over a discovered port.
+        let common = common_from(&["--health-path", "/healthz", "--primary-port", "9000"]);
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(extractor::ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 8080,
+            },
+            "probe: discovered listening port",
+            0,
+            Confidence::High,
+        ));
+
+        apply_cli_health_path(&mut contract, &common);
+
+        let http = contract
+            .assertions
+            .iter()
+            .find_map(|a| match &a.kind {
+                AssertionKind::HttpStatus { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("an HttpStatus assertion should be added");
+        assert_eq!(http, "http://127.0.0.1:9000/healthz");
     }
 
     #[test]
