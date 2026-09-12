@@ -294,7 +294,11 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let exit_code = if interactive {
-        let session = interactive::run_interactive(&contract)?;
+        let session = interactive::run_interactive(
+            &contract,
+            common.primary_port.is_some(),
+            common.health_path.is_some(),
+        )?;
 
         // Apply session overrides
         if !session.confirm_process {

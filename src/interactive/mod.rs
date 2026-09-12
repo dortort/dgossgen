@@ -16,7 +16,17 @@ pub struct InteractiveSession {
 }
 
 /// Run interactive Q&A to refine the contract and generation.
-pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession> {
+///
+/// `primary_port_provided` / `health_path_provided` report whether the user
+/// already supplied the corresponding value on the CLI (`--primary-port` /
+/// `--health-path`). When set, the matching prompt is skipped: an explicit flag
+/// is authoritative and takes precedence over any answer, so asking a question
+/// whose answer would then be discarded only misleads the user.
+pub fn run_interactive(
+    contract: &RuntimeContract,
+    primary_port_provided: bool,
+    health_path_provided: bool,
+) -> Result<InteractiveSession> {
     println!();
     println!(
         "{}",
@@ -39,8 +49,9 @@ pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession>
         volume_mounts: Vec::new(),
     };
 
-    // Q1: Primary port selection (if multiple)
-    if contract.exposed_ports.len() > 1 {
+    // Q1: Primary port selection (if multiple). Skipped when --primary-port was
+    // given, since that flag overrides any selection here.
+    if contract.exposed_ports.len() > 1 && !primary_port_provided {
         let port_names: Vec<String> = contract
             .exposed_ports
             .iter()
@@ -58,8 +69,9 @@ pub fn run_interactive(contract: &RuntimeContract) -> Result<InteractiveSession>
         session.primary_port = Some(contract.exposed_ports[0].port);
     }
 
-    // Q2: Health endpoint
-    if contract.healthcheck.is_none() {
+    // Q2: Health endpoint. Skipped when --health-path was given, since the flag
+    // is authoritative and its answer would override anything typed here.
+    if contract.healthcheck.is_none() && !health_path_provided {
         let has_health = Confirm::new()
             .with_prompt("Does the service have a health endpoint?")
             .default(false)
