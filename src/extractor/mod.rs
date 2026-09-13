@@ -4,6 +4,7 @@ mod model;
 pub use heuristics::*;
 pub use model::*;
 
+use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
 use crate::parser::{CommandForm, Dockerfile, Instruction, PortSpec, VariableResolver};
 use crate::Confidence;
 
@@ -13,10 +14,20 @@ use crate::Confidence;
 const MAX_EXPOSE_RANGE: u32 = 128;
 
 /// Extract a RuntimeContract from a parsed Dockerfile.
+///
+/// `policy` governs secret redaction: any `ENV` value whose key
+/// [`PolicyConfig::is_secret_key`] matches is replaced with
+/// [`REDACTED_PLACEHOLDER`] before it is stored anywhere — both in the contract
+/// and in the variable resolver's map. Redacting in the resolver too means a
+/// later instruction that substitutes the secret variable (e.g. `WORKDIR
+/// /$DB_PASSWORD`, `EXPOSE $DB_PASSWORD`, or another `ENV` referencing it) sees
+/// the placeholder, so the cleartext value never enters the contract or any
+/// derived assertion or diagnostic.
 pub fn extract_contract(
     dockerfile: &Dockerfile,
     target: Option<&str>,
     build_args: &[(String, String)],
+    policy: &PolicyConfig,
 ) -> RuntimeContract {
     let stage = match dockerfile.resolve_target(target) {
         Some(s) => s,
@@ -146,8 +157,23 @@ pub fn extract_contract(
             Instruction::Env(pairs) => {
                 for (key, value) in pairs {
                     let resolved_val = resolver.resolve(value);
-                    resolver.set_var(key, &resolved_val);
-                    contract.env.push((key.clone(), resolved_val));
+                    // Redact a secret value *before* it is stored anywhere,
+                    // including in the resolver's variable map. Feeding the
+                    // placeholder (not the real value) back to the resolver is
+                    // what keeps a later `$SECRET` substitution — e.g.
+                    // `WORKDIR /$DB_PASSWORD` or an unparseable `EXPOSE
+                    // $DB_PASSWORD` warning — from leaking the secret into a
+                    // derived assertion or diagnostic. The trade-off is that a
+                    // non-secret field derived from a secret-keyed variable sees
+                    // the placeholder rather than the real value, which is the
+                    // safe direction.
+                    let stored_val = if policy.is_secret_key(key) {
+                        REDACTED_PLACEHOLDER.to_string()
+                    } else {
+                        resolved_val
+                    };
+                    resolver.set_var(key, &stored_val);
+                    contract.env.push((key.clone(), stored_val));
                 }
             }
 
@@ -450,6 +476,7 @@ fn is_entrypoint_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PolicyConfig;
     use crate::parser::parse_dockerfile_content;
 
     #[test]
@@ -462,7 +489,7 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.base_image, "node:18-alpine");
         assert_eq!(contract.workdir, Some("/app".to_string()));
@@ -479,7 +506,7 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost/ || exit 1
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(contract.healthcheck.is_some());
         let has_healthcheck_assertion = contract
@@ -503,7 +530,7 @@ EXPOSE 8080
 ENTRYPOINT ["/app/app"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.base_image, "alpine:3.18");
         assert_eq!(contract.workdir, Some("/app".to_string()));
@@ -516,7 +543,7 @@ FROM alpine
 USER 1001
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert!(contract.assertions.iter().any(|a| matches!(
             &a.kind,
             AssertionKind::CommandOutput {
@@ -534,7 +561,7 @@ ARG BASE_IMAGE=ubuntu:22.04
 FROM $BASE_IMAGE
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert_eq!(contract.base_image, "ubuntu:22.04");
     }
 
@@ -549,6 +576,7 @@ FROM ${BASE_IMAGE}
             &df,
             None,
             &[("BASE_IMAGE".to_string(), "alpine:3.20".to_string())],
+            &PolicyConfig::default(),
         );
         assert_eq!(contract.base_image, "alpine:3.20");
     }
@@ -586,7 +614,7 @@ CMD ["--port", "8080"]
 ENTRYPOINT ["/usr/local/bin/server"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         let procs = process_names(&contract);
         assert_eq!(procs, vec!["server".to_string()]);
@@ -604,7 +632,7 @@ ENTRYPOINT ["/usr/local/bin/first"]
 ENTRYPOINT ["/usr/local/bin/second"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(process_names(&contract), vec!["second".to_string()]);
     }
@@ -617,7 +645,7 @@ CMD ["/usr/local/bin/first"]
 CMD ["/usr/local/bin/second"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(process_names(&contract), vec!["second".to_string()]);
     }
@@ -630,7 +658,7 @@ HEALTHCHECK CMD curl -f http://localhost/first
 HEALTHCHECK CMD curl -f http://localhost/second
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         let hc = healthcheck_assertions(&contract);
         assert_eq!(hc.len(), 1);
@@ -650,7 +678,7 @@ HEALTHCHECK --interval=30s CMD curl -f http://localhost/
 HEALTHCHECK NONE
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(contract.healthcheck.is_none());
         assert!(healthcheck_assertions(&contract).is_empty());
@@ -666,7 +694,7 @@ ENTRYPOINT []
 CMD ["/usr/local/bin/app"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(contract.entrypoint.is_none());
         assert_eq!(process_names(&contract), vec!["app".to_string()]);
@@ -681,7 +709,7 @@ ENTRYPOINT ["/usr/local/bin/server"]
 CMD ["--port", "8080"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(process_names(&contract), vec!["server".to_string()]);
     }
@@ -694,7 +722,7 @@ ARG PORT=8080
 EXPOSE ${PORT}
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.exposed_ports.len(), 1);
         assert_eq!(contract.exposed_ports[0].port, 8080);
@@ -717,7 +745,7 @@ ENV PORT=9000
 EXPOSE $PORT/udp
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.exposed_ports.len(), 1);
         assert_eq!(contract.exposed_ports[0].port, 9000);
@@ -732,7 +760,7 @@ FROM alpine
 EXPOSE 8000-8002
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
         assert_eq!(ports, vec![8000, 8001, 8002]);
@@ -746,7 +774,7 @@ FROM alpine
 EXPOSE 8000-8001/udp
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.exposed_ports.len(), 2);
         assert!(contract.exposed_ports.iter().all(|p| p.protocol == "udp"));
@@ -759,7 +787,7 @@ FROM alpine
 EXPOSE $UNDEFINED
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(contract.exposed_ports.is_empty());
         assert_eq!(contract.warnings.len(), 1);
@@ -773,7 +801,7 @@ FROM alpine
 EXPOSE 1024-65535
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(contract.exposed_ports.is_empty());
         assert_eq!(contract.warnings.len(), 1);
@@ -821,7 +849,7 @@ EXPOSE 1024-65535
         // ROOT, even though ROOT is defined in scope.
         let content = "FROM alpine\nENV ROOT=/data\nENV LITERAL=\"\\$ROOT\"\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert_eq!(env_value(&contract, "LITERAL"), Some("$ROOT"));
     }
 
@@ -829,7 +857,7 @@ EXPOSE 1024-65535
     fn test_env_escaped_dollar_unquoted_stays_literal() {
         let content = "FROM alpine\nENV ROOT=/data\nENV LITERAL=\\$ROOT\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert_eq!(env_value(&contract, "LITERAL"), Some("$ROOT"));
     }
 
@@ -837,7 +865,7 @@ EXPOSE 1024-65535
     fn test_env_normal_expansion_still_works() {
         let content = "FROM alpine\nENV FOO=bar\nENV A=$FOO\nENV B=${FOO}\nENV C=\"$FOO\"\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert_eq!(env_value(&contract, "A"), Some("bar"));
         assert_eq!(env_value(&contract, "B"), Some("bar"));
         assert_eq!(env_value(&contract, "C"), Some("bar"));
@@ -849,7 +877,7 @@ EXPOSE 1024-65535
         // one stays literal, the unescaped one expands.
         let content = "FROM alpine\nENV FOO=bar\nENV MIX=\"\\$FOO=$FOO\"\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         assert_eq!(env_value(&contract, "MIX"), Some("$FOO=bar"));
     }
 
@@ -871,7 +899,7 @@ ENV PORT=9090
 ENV APPUSER=bob
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.workdir, Some("/srv/app".to_string()));
         assert_eq!(contract.exposed_ports.len(), 1);
@@ -896,7 +924,7 @@ ENV PORT=9090
 EXPOSE $PORT
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
         assert_eq!(ports, vec![8080, 9090]);
@@ -910,7 +938,7 @@ EXPOSE $PORT
         // value in effect above each one (8080 then, after redefinition, 9090).
         let content = "FROM alpine\nENV PORT=8080\nENV LITERAL=\"\\$PORT\"\nEXPOSE $PORT\nENV PORT=9090\nEXPOSE $PORT\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(env_value(&contract, "LITERAL"), Some("$PORT"));
         let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
@@ -928,7 +956,7 @@ FROM alpine:${TAG}
 ENV TAG=2.0
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.base_image, "alpine:1.0");
     }
@@ -940,7 +968,7 @@ FROM alpine
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         let entrypoint_assertions: Vec<_> = contract
             .assertions
@@ -961,5 +989,100 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
                 ..
             } if ft == "file" && mode == "0755"
         ));
+    }
+
+    #[test]
+    fn test_secret_env_value_is_redacted_in_contract() {
+        // A key matching the default secret patterns must never keep its real
+        // value in the contract; a non-secret key is stored untouched.
+        let content = "FROM alpine\nENV DB_PASSWORD=hunter2\nENV APP_PORT=3000\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(
+            env_value(&contract, "DB_PASSWORD"),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        assert_eq!(env_value(&contract, "APP_PORT"), Some("3000"));
+        assert!(
+            !contract.env.iter().any(|(_, v)| v.contains("hunter2")),
+            "the real secret value must not survive anywhere in contract.env"
+        );
+    }
+
+    #[test]
+    fn test_custom_secret_pattern_drives_redaction() {
+        // The user-facing `secret_patterns` knob must feed enforcement: a custom
+        // pattern redacts a key the defaults would leave alone, and a default
+        // pattern absent from the custom list is no longer treated as secret.
+        let policy = PolicyConfig {
+            secret_patterns: vec!["INTERNAL".to_string()],
+            ..PolicyConfig::default()
+        };
+
+        let content = "FROM alpine\nENV INTERNAL_URL=https://svc.internal\nENV API_TOKEN=abc123\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &policy);
+
+        assert_eq!(
+            env_value(&contract, "INTERNAL_URL"),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        // TOKEN is a default secret pattern but not in the custom list, so it
+        // is now stored as-is — proving the custom list, not the defaults, is used.
+        assert_eq!(env_value(&contract, "API_TOKEN"), Some("abc123"));
+    }
+
+    #[test]
+    fn test_secret_value_does_not_leak_through_dependent_variables() {
+        // A non-secret key whose value references a secret-keyed variable must
+        // not resurrect the real secret: the resolver holds the placeholder, so
+        // the dependent value carries the placeholder, never the cleartext.
+        let content =
+            "FROM alpine\nENV DB_PASSWORD=hunter2\nENV DATABASE_URL=postgres://u:$DB_PASSWORD@h\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(
+            env_value(&contract, "DB_PASSWORD"),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        assert_eq!(
+            env_value(&contract, "DATABASE_URL"),
+            Some("postgres://u:***REDACTED***@h")
+        );
+        assert!(
+            !contract.env.iter().any(|(_, v)| v.contains("hunter2")),
+            "the real secret value must not survive anywhere in contract.env"
+        );
+    }
+
+    #[test]
+    fn test_secret_value_does_not_leak_into_derived_assertions_or_warnings() {
+        // A secret referenced by WORKDIR (rendered into goss.yml as a FileExists
+        // path) or by an unparseable EXPOSE (rendered into a warning) must not
+        // carry the cleartext into either derived output.
+        let content =
+            "FROM alpine\nENV DB_PASSWORD=hunter2\nWORKDIR /data/$DB_PASSWORD\nEXPOSE $DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let workdir = contract.workdir.as_deref().unwrap_or("");
+        assert!(
+            !workdir.contains("hunter2"),
+            "secret leaked into WORKDIR path"
+        );
+        assert!(workdir.contains(REDACTED_PLACEHOLDER));
+        assert!(
+            contract.warnings.iter().all(|w| !w.contains("hunter2")),
+            "secret leaked into an extraction warning"
+        );
+        assert!(
+            contract
+                .assertions
+                .iter()
+                .all(|a| !a.provenance.contains("hunter2")),
+            "secret leaked into an assertion's provenance"
+        );
     }
 }

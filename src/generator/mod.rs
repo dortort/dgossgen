@@ -569,7 +569,7 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(!output.goss_yml.is_empty());
@@ -585,7 +585,7 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost/ || exit 1
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(output.goss_wait_yml.is_some());
@@ -600,7 +600,7 @@ FROM nginx
 EXPOSE 80
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(
             &contract,
             Profile::Standard,
@@ -635,7 +635,7 @@ CMD ["nginx", "-g", "daemon off;"]
 RUN apt-get install -y nginx curl git
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(
@@ -663,7 +663,7 @@ RUN apt-get install -y nginx curl git
         // a message naming the absent signals.
         let content = "FROM alpine:3.19\nRUN echo hello\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert_eq!(output.warnings.len(), 1, "expected one anomaly warning");
@@ -682,7 +682,7 @@ RUN apt-get install -y nginx curl git
         // signals were found.
         let content = "FROM alpine:3.19\nRUN apk add --no-cache curl\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         // Minimal profile => High cutoff => the Low-confidence package is filtered.
         let output = generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
 
@@ -701,7 +701,7 @@ RUN apt-get install -y nginx curl git
         // "nothing to assert" and must not warn.
         let content = "FROM nginx\nEXPOSE 80\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(
@@ -722,7 +722,7 @@ RUN apt-get install -y nginx curl git
         let content =
             "FROM alpine\nHEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1\n";
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(output.goss_wait_yml.is_some());
@@ -776,7 +776,7 @@ EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
-        let contract = extract_contract(&df, None, &[]);
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
         assert!(
