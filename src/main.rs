@@ -201,15 +201,26 @@ fn resolve_force_wait(no_wait: bool, force_wait: bool) -> Option<bool> {
     }
 }
 
-type LoadedContract = (Profile, Vec<(String, String)>, extractor::RuntimeContract);
+type LoadedContract = (
+    Profile,
+    Vec<(String, String)>,
+    PolicyConfig,
+    extractor::RuntimeContract,
+);
 
 fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
     let profile = parse_profile(&common.profile)?;
     let build_args = parse_build_args(&common.build_args);
+    // Load the policy before extraction so secret redaction is applied as ENV
+    // values enter the contract, and validate it up front — a malformed
+    // .dgossgen.yml is a hard error, never a silent revert to defaults. The
+    // loaded policy is returned so callers reuse it rather than re-reading it.
+    let policy = PolicyConfig::load_or_default(&common.context)?;
     let dockerfile = parser::parse_dockerfile(&common.dockerfile)
         .with_context(|| format!("parsing {}", common.dockerfile.display()))?;
-    let contract = extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args);
-    Ok((profile, build_args, contract))
+    let contract =
+        extractor::extract_contract(&dockerfile, common.target.as_deref(), &build_args, &policy);
+    Ok((profile, build_args, policy, contract))
 }
 
 /// Write the generated files and report notes/warnings on stderr.
@@ -250,8 +261,7 @@ fn warning_exit_code(output: &generator::GeneratorOutput, strict_warnings: bool)
 }
 
 fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
-    let (profile, _build_args, mut contract) = load_contract(&common)?;
-    let policy = PolicyConfig::load_or_default(&common.context)?;
+    let (profile, _build_args, policy, mut contract) = load_contract(&common)?;
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
     let exit_code = if interactive {
@@ -340,11 +350,9 @@ fn cmd_probe(
     unsafe_run_arg: bool,
     allow_network: bool,
 ) -> Result<ExitCode> {
-    let (profile, build_args, mut contract) = load_contract(&common)?;
-
-    // Validate the policy before any expensive, side-effecting container work:
-    // a malformed .dgossgen.yml is now a hard error and must fail before build+run.
-    let policy = PolicyConfig::load_or_default(&common.context)?;
+    // load_contract validates the policy (a malformed .dgossgen.yml is a hard
+    // error) before any expensive, side-effecting container work.
+    let (profile, build_args, policy, mut contract) = load_contract(&common)?;
 
     let rt: ContainerRuntime = runtime
         .parse()
@@ -368,6 +376,7 @@ fn cmd_probe(
         run_args,
         allow_unsafe_run_args: unsafe_run_arg,
         network_isolation: !allow_network,
+        policy: policy.clone(),
         ..Default::default()
     };
 
@@ -389,7 +398,7 @@ fn cmd_probe(
 }
 
 fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
-    let (_profile, _build_args, contract) = load_contract(&common)?;
+    let (_profile, _build_args, _policy, contract) = load_contract(&common)?;
 
     println!("{}", style("=== dgossgen explain ===").bold().cyan());
     println!();

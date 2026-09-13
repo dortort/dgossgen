@@ -16,7 +16,7 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn test_nginx_contract_extraction() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert_eq!(contract.base_image, "nginx:alpine");
     assert_eq!(contract.exposed_ports.len(), 2);
@@ -38,7 +38,7 @@ fn test_nginx_contract_extraction() {
 #[test]
 fn test_nginx_generates_wait_file() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     assert!(
@@ -59,7 +59,7 @@ fn test_nginx_generates_wait_file() {
 #[test]
 fn test_nginx_goss_yml_content() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     let yml = &output.goss_yml;
@@ -75,7 +75,7 @@ fn test_nginx_goss_yml_content() {
 #[test]
 fn test_node_multistage_contract() {
     let df = parser::parse_dockerfile(&fixture_path("node_multistage.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should target the last stage (runtime)
     assert_eq!(contract.base_image, "node:18-alpine");
@@ -94,7 +94,7 @@ fn test_node_multistage_contract() {
 #[test]
 fn test_node_multistage_user_assertion() {
     let df = parser::parse_dockerfile(&fixture_path("node_multistage.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should have user assertion for "appuser"
     assert!(contract.assertions.iter().any(|a| matches!(
@@ -106,7 +106,7 @@ fn test_node_multistage_user_assertion() {
 #[test]
 fn test_node_generates_wait_for_single_port() {
     let df = parser::parse_dockerfile(&fixture_path("node_multistage.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     // With exactly one exposed port, should auto-generate wait
@@ -121,7 +121,7 @@ fn test_node_generates_wait_for_single_port() {
 #[test]
 fn test_python_simple_contract() {
     let df = parser::parse_dockerfile(&fixture_path("python_simple.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert_eq!(contract.base_image, "python:3.11-slim");
     assert_eq!(contract.workdir, Some("/app".to_string()));
@@ -138,7 +138,7 @@ fn test_python_simple_contract() {
 #[test]
 fn test_python_process_assertion() {
     let df = parser::parse_dockerfile(&fixture_path("python_simple.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // CMD ["python", ...] should generate a process assertion for "python"
     assert!(contract.assertions.iter().any(|a| matches!(
@@ -152,7 +152,7 @@ fn test_python_process_assertion() {
 #[test]
 fn test_go_minimal_contract() {
     let df = parser::parse_dockerfile(&fixture_path("go_minimal.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert_eq!(contract.base_image, "scratch");
     assert_eq!(contract.exposed_ports.len(), 1);
@@ -173,7 +173,7 @@ fn test_go_minimal_contract() {
 #[test]
 fn test_go_minimal_entrypoint_process() {
     let df = parser::parse_dockerfile(&fixture_path("go_minimal.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // ENTRYPOINT ["/server"] should generate process assertion for "server"
     assert!(contract.assertions.iter().any(|a| matches!(
@@ -187,7 +187,7 @@ fn test_go_minimal_entrypoint_process() {
 #[test]
 fn test_complex_healthcheck_contract() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert_eq!(contract.base_image, "ubuntu:22.04");
     assert_eq!(contract.workdir, Some("/var/www/html".to_string()));
@@ -201,7 +201,7 @@ fn test_complex_healthcheck_contract() {
 #[test]
 fn test_complex_healthcheck_entrypoint_script_detection() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should detect the entrypoint script and assert it exists with executable permission
     let entrypoint_assertions: Vec<_> = contract
@@ -221,7 +221,7 @@ fn test_complex_healthcheck_entrypoint_script_detection() {
 #[test]
 fn test_complex_healthcheck_service_detection() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should detect nginx installation and generate service-specific checks
     assert!(contract.assertions.iter().any(|a| matches!(
@@ -241,7 +241,7 @@ fn test_healthcheck_unknown_flag_not_in_wait_file() {
     // generated readiness gate can actually pass.
     let df =
         parser::parse_dockerfile(&fixture_path("healthcheck_start_interval.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     let wait = output
@@ -270,7 +270,7 @@ fn test_healthcheck_unknown_flag_not_in_wait_file() {
 #[test]
 fn test_minimal_profile_skips_low_confidence() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     let output_strict =
         generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
@@ -293,7 +293,7 @@ fn test_minimal_profile_skips_low_confidence() {
 #[test]
 fn test_generation_is_idempotent() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let policy = PolicyConfig::default();
 
     let output1 = generator::generate(&contract, Profile::Standard, &policy, None);
@@ -314,7 +314,7 @@ fn test_generation_is_idempotent() {
 #[test]
 fn test_output_has_stable_ordering() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let policy = PolicyConfig::default();
 
     let output = generator::generate(&contract, Profile::Standard, &policy, None);
@@ -338,7 +338,7 @@ fn test_output_has_stable_ordering() {
 #[test]
 fn test_no_wait_flag() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(
         &contract,
         Profile::Standard,
@@ -355,7 +355,7 @@ fn test_no_wait_flag() {
 #[test]
 fn test_force_wait_flag() {
     let df = parser::parse_dockerfile(&fixture_path("python_simple.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(
         &contract,
         Profile::Standard,
@@ -374,7 +374,7 @@ fn test_force_wait_flag() {
 #[test]
 fn test_php_composer_contract() {
     let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert_eq!(contract.base_image, "php:8.2-fpm");
     assert_eq!(contract.workdir, Some("/var/www/html".to_string()));
@@ -385,7 +385,7 @@ fn test_php_composer_contract() {
 #[test]
 fn test_php_composer_package_detection() {
     let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should detect monolog/monolog from composer require
     assert!(
@@ -404,7 +404,7 @@ fn test_php_composer_package_detection() {
 #[test]
 fn test_php_composer_apt_packages_detected() {
     let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Should detect git and unzip from apt-get install
     assert!(contract.assertions.iter().any(|a| matches!(
@@ -428,7 +428,7 @@ fn test_php_composer_apt_packages_detected() {
 #[test]
 fn test_php_composer_goss_output() {
     let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
 
     let yml = &output.goss_yml;
@@ -454,7 +454,7 @@ RUN apt-get update && \\\n\
     apt-get install -y git && \\\n\
     apt-get install -y jq\n";
     let df = parser::parse_dockerfile_content(content).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     assert!(
         contract.assertions.iter().any(|a| matches!(
@@ -487,7 +487,7 @@ RUN apt-get update && \\\n\
     apt-get install -y git && \\\n\
     apt-get install -y jq\n";
     let df = parser::parse_dockerfile_content(content).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
 
     let yml = &output.goss_yml;
@@ -506,7 +506,7 @@ RUN apt-get update && \\\n\
 #[test]
 fn test_cmd_before_entrypoint_process_names_entrypoint_binary() {
     let df = parser::parse_dockerfile(&fixture_path("cmd_before_entrypoint.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // Contract-level: exactly one process assertion, named after the entrypoint binary;
     // the CMD flag `--port` must not appear as a process.
@@ -544,7 +544,7 @@ fn test_cmd_before_entrypoint_process_names_entrypoint_binary() {
 #[test]
 fn test_variable_port_contract_resolves_exposed_port() {
     let df = parser::parse_dockerfile(&fixture_path("variable_port.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
     // ARG PORT=8000 flows into ENV APP_PORT, which drives EXPOSE ${APP_PORT}.
     assert_eq!(contract.exposed_ports.len(), 1);
@@ -562,7 +562,7 @@ fn test_variable_port_contract_resolves_exposed_port() {
 #[test]
 fn test_variable_port_generates_single_port_wait_file() {
     let df = parser::parse_dockerfile(&fixture_path("variable_port.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     // The single-port wait-file auto-generation heuristic must still fire once the
@@ -584,21 +584,87 @@ fn test_variable_port_generates_single_port_wait_file() {
 
 #[test]
 fn test_secret_keys_not_in_output() {
+    // End-to-end: a Dockerfile carrying secret ENV values, run through the full
+    // extract -> generate pipeline, must never emit those values into goss.yml,
+    // goss_wait.yml, or any diagnostic, and the contract itself must hold a
+    // redacted placeholder for secret keys while non-secret keys are untouched.
     let content = r#"
 FROM alpine
-ENV DB_PASSWORD=supersecret
+ENV DB_PASSWORD=hunter2
 ENV API_TOKEN=abc123
 ENV APP_PORT=3000
 EXPOSE 3000
 "#;
     let df = parser::parse_dockerfile_content(content).unwrap();
-    let _contract = extractor::extract_contract(&df, None, &[]);
     let policy = PolicyConfig::default();
+    let contract = extractor::extract_contract(&df, None, &[], &policy);
 
-    // Verify the config considers these as secrets
+    // Contract state: secrets redacted, non-secrets preserved.
+    let env_value = |key: &str| {
+        contract
+            .env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(env_value("DB_PASSWORD"), Some("***REDACTED***"));
+    assert_eq!(env_value("API_TOKEN"), Some("***REDACTED***"));
+    assert_eq!(env_value("APP_PORT"), Some("3000"));
+
+    // Full output artifacts must contain zero occurrences of any secret value.
+    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+    let mut haystack = output.goss_yml.clone();
+    if let Some(wait) = &output.goss_wait_yml {
+        haystack.push_str(wait);
+    }
+    for w in &output.warnings {
+        haystack.push_str(w);
+    }
+    for n in &output.notes {
+        haystack.push_str(n);
+    }
+    for secret in ["hunter2", "abc123"] {
+        assert!(
+            !haystack.contains(secret),
+            "secret value {secret:?} leaked into generated output"
+        );
+    }
+
+    // The classifier still recognizes these keys (guards against a defaults regression).
     assert!(policy.is_secret_key("DB_PASSWORD"));
     assert!(policy.is_secret_key("API_TOKEN"));
     assert!(!policy.is_secret_key("APP_PORT"));
+}
+
+#[test]
+fn test_custom_secret_patterns_feed_redaction_end_to_end() {
+    // The user-facing `secret_patterns` knob must actually drive enforcement:
+    // a custom pattern redacts a key the defaults would ignore.
+    let content = r#"
+FROM alpine
+ENV INTERNAL_URL=https://svc.internal:9000
+ENV APP_PORT=3000
+"#;
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let policy = PolicyConfig {
+        secret_patterns: vec!["INTERNAL".to_string()],
+        ..PolicyConfig::default()
+    };
+    let contract = extractor::extract_contract(&df, None, &[], &policy);
+
+    let env_value = |key: &str| {
+        contract
+            .env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(env_value("INTERNAL_URL"), Some("***REDACTED***"));
+    assert_eq!(env_value("APP_PORT"), Some("3000"));
+    assert!(
+        !contract.env.iter().any(|(_, v)| v.contains("svc.internal")),
+        "custom-pattern secret value must not survive in the contract"
+    );
 }
 
 // --- YAML validity tests ---
@@ -606,7 +672,7 @@ EXPOSE 3000
 #[test]
 fn test_output_is_parseable_yaml() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
     let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output.goss_yml);
