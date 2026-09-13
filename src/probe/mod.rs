@@ -3,6 +3,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
 use crate::extractor::{AssertionKind, ContractAssertion, RuntimeContract};
 use crate::Confidence;
 
@@ -46,6 +47,8 @@ pub struct ProbeConfig {
     pub allow_unsafe_run_args: bool,
     pub timeout: Duration,
     pub network_isolation: bool,
+    /// Policy governing secret redaction of collected environment variables.
+    pub policy: PolicyConfig,
 }
 
 impl Default for ProbeConfig {
@@ -60,6 +63,7 @@ impl Default for ProbeConfig {
             allow_unsafe_run_args: false,
             timeout: Duration::from_secs(60),
             network_isolation: true,
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -76,7 +80,10 @@ pub struct ProbeEvidence {
     /// User info
     pub user: Option<String>,
     pub uid: Option<u32>,
-    /// Environment variables (filtered)
+    /// Environment variables, with values redacted for keys the policy
+    /// classifies as secrets (see [`collect_evidence`]). The container's
+    /// runtime env can include secrets injected via `--env`/`--env-file`, so
+    /// this collection is sanitized at the point of capture.
     pub env_vars: Vec<(String, String)>,
     /// Image inspect data
     pub image_config: Option<serde_json::Value>,
@@ -151,7 +158,13 @@ pub fn run_probe(config: &ProbeConfig) -> Result<ProbeEvidence> {
     cleanup.mark_container_created();
 
     // Step 3: Collect evidence (with timeout)
-    collect_evidence(&rt, &container_name, &image_tag, config.timeout)
+    collect_evidence(
+        &rt,
+        &container_name,
+        &image_tag,
+        config.timeout,
+        &config.policy,
+    )
 }
 
 fn validate_run_args(run_args: &[String], allow_unsafe: bool) -> Result<()> {
@@ -319,6 +332,7 @@ fn collect_evidence(
     container: &str,
     image: &str,
     timeout: Duration,
+    policy: &PolicyConfig,
 ) -> Result<ProbeEvidence> {
     let mut evidence = ProbeEvidence::default();
 
@@ -381,7 +395,7 @@ fn collect_evidence(
         }
     }
 
-    // Check env (filtered)
+    // Check env, redacting secret values at the point of capture.
     let mut env_cmd = Command::new(runtime);
     env_cmd.args(["exec", container, "env"]);
     let env_output = run_command_with_timeout(env_cmd, timeout);
@@ -389,15 +403,29 @@ fn collect_evidence(
     if let Ok(output) = env_output {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if let Some((key, val)) = line.split_once('=') {
-                    evidence.env_vars.push((key.to_string(), val.to_string()));
-                }
-            }
+            evidence.env_vars = parse_env_output(&text, policy);
         }
     }
 
     Ok(evidence)
+}
+
+/// Parse `env` command output into key/value pairs, redacting the value of any
+/// key the policy classifies as a secret. This is the enforcement point that
+/// keeps [`ProbeEvidence::env_vars`] sanitized regardless of what the container
+/// exposes (Dockerfile `ENV` values or secrets injected via `--env`/`--env-file`).
+fn parse_env_output(text: &str, policy: &PolicyConfig) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, val)| {
+            let value = if policy.is_secret_key(key) {
+                REDACTED_PLACEHOLDER.to_string()
+            } else {
+                val.to_string()
+            };
+            (key.to_string(), value)
+        })
+        .collect()
 }
 
 /// Parse a port number from ss -tlnp output.
@@ -479,6 +507,50 @@ mod tests {
     fn test_parse_ss_port() {
         assert_eq!(parse_ss_port("LISTEN 0 128 *:8080 *:*"), Some(8080));
         assert_eq!(parse_ss_port("LISTEN 0 128 0.0.0.0:3000 *:*"), Some(3000));
+    }
+
+    #[test]
+    fn test_parse_env_output_redacts_secrets() {
+        // A value whose whole line contains '=' (e.g. a base64 token) must split
+        // only on the first '='; non-secret keys are preserved verbatim while
+        // secret-keyed values are replaced, never stored.
+        let raw = "PATH=/usr/bin\nAPI_TOKEN=abc123\nDB_PASSWORD=p=a=ss\nLANG=C.UTF-8\n";
+        let vars = parse_env_output(raw, &PolicyConfig::default());
+
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("PATH"), Some("/usr/bin"));
+        assert_eq!(get("LANG"), Some("C.UTF-8"));
+        assert_eq!(get("API_TOKEN"), Some(REDACTED_PLACEHOLDER));
+        assert_eq!(get("DB_PASSWORD"), Some(REDACTED_PLACEHOLDER));
+        assert!(
+            !vars
+                .iter()
+                .any(|(_, v)| v.contains("abc123") || v.contains("p=a=ss")),
+            "no secret value may survive in collected env_vars"
+        );
+    }
+
+    #[test]
+    fn test_parse_env_output_honors_custom_patterns() {
+        let policy = PolicyConfig {
+            secret_patterns: vec!["INTERNAL".to_string()],
+            ..PolicyConfig::default()
+        };
+        let raw = "INTERNAL_URL=https://svc.internal\nAPI_TOKEN=abc123\n";
+        let vars = parse_env_output(raw, &policy);
+
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("INTERNAL_URL"), Some(REDACTED_PLACEHOLDER));
+        // TOKEN is a default pattern but not in the custom list, so it is kept.
+        assert_eq!(get("API_TOKEN"), Some("abc123"));
     }
 
     #[test]
