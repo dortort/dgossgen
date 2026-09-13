@@ -86,7 +86,7 @@ const CASES: &[Case] = &[
 fn generate_case(case: &Case) -> generator::GeneratorOutput {
     let df = parser::parse_dockerfile(&fixtures_dir().join(case.fixture))
         .unwrap_or_else(|e| panic!("parsing fixture {}: {e}", case.fixture));
-    let contract = extractor::extract_contract(&df, None, &[]);
+    let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     generator::generate(&contract, case.profile, &PolicyConfig::default(), None)
 }
 
