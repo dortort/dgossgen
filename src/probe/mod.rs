@@ -422,12 +422,68 @@ fn collect_evidence(
     // both structurally (Env arrays) and by value (derived fields such as
     // WorkingDir) before it is stored, so `image_config` carries no cleartext.
     if let Some(mut val) = inspect_val.take() {
+        // Also harvest secret values baked into the image's own `Env` arrays,
+        // so derived fields (WorkingDir, ExposedPorts, ...) are scrubbed even
+        // when the runtime value was overridden via `--env`, or when the exec
+        // `env` failed entirely (e.g. a scratch/distroless image).
+        collect_secret_values_from_inspect(&val, policy, &mut secret_values);
+        let secret_values = dedup_longest_first(secret_values);
+
         redact_inspect_env(&mut val, policy);
         scrub_secret_values(&mut val, &secret_values);
         evidence.image_config = Some(val);
     }
 
     Ok(evidence)
+}
+
+/// Collect the concrete cleartext values of secret-keyed entries found in any
+/// `Env` array within `image inspect` JSON, appending them to `out`. These are
+/// the secrets baked into the image itself, which may differ from (or be absent
+/// in) the container's runtime env.
+fn collect_secret_values_from_inspect(
+    value: &serde_json::Value,
+    policy: &PolicyConfig,
+    out: &mut Vec<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "Env" {
+                    if let serde_json::Value::Array(items) = child {
+                        for item in items {
+                            if let serde_json::Value::String(pair) = item {
+                                if let Some((k, v)) = pair.split_once('=') {
+                                    if !v.is_empty() && policy.is_secret_key(k) {
+                                        out.push(v.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    collect_secret_values_from_inspect(child, policy, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_secret_values_from_inspect(item, policy, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Deduplicate secret needles and order them longest-first. Longest-first makes
+/// substring replacement overlap-safe: when one secret is a prefix of another
+/// (`abc` and `abcdef`), replacing the longer one first prevents a partial
+/// redaction (`***REDACTED***def`) that could leak the tail of the longer secret.
+fn dedup_longest_first(mut secrets: Vec<String>) -> Vec<String> {
+    secrets.sort();
+    secrets.dedup();
+    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets
 }
 
 /// Extract the concrete cleartext values of secret-keyed environment variables
@@ -443,20 +499,27 @@ fn secret_values_from_env(text: &str, policy: &PolicyConfig) -> Vec<String> {
 }
 
 /// Replace every occurrence of a known secret value with [`REDACTED_PLACEHOLDER`]
-/// across all string values of a JSON tree. This catches secret-*derived* fields
-/// that key-based redaction cannot see — e.g. a `Config.WorkingDir` of
-/// `/hunter2` produced by `WORKDIR /$DB_PASSWORD`. It may over-redact when a
-/// secret value coincides with an unrelated substring, which is the safe
-/// direction for an evidence blob that is retained but never emitted.
+/// across all string values *and object keys* of a JSON tree. This catches
+/// secret-*derived* fields that key-based redaction cannot see — a
+/// `Config.WorkingDir` of `/hunter2` from `WORKDIR /$DB_PASSWORD`, or an
+/// `ExposedPorts` map keyed `8123/tcp` from `EXPOSE $SECRET_PORT`. `secrets`
+/// must be ordered longest-first (see [`dedup_longest_first`]) so overlapping
+/// needles redact fully. It may over-redact when a secret value coincides with
+/// an unrelated substring, which is the safe direction for an evidence blob that
+/// is retained but never emitted.
 fn scrub_secret_values(value: &mut serde_json::Value, secrets: &[String]) {
     if secrets.is_empty() {
         return;
     }
     match value {
         serde_json::Value::Object(map) => {
-            for (_, child) in map.iter_mut() {
-                scrub_secret_values(child, secrets);
+            // Rebuild the map so secret substrings in keys are redacted too.
+            let mut rebuilt = serde_json::Map::with_capacity(map.len());
+            for (key, mut child) in std::mem::take(map) {
+                scrub_secret_values(&mut child, secrets);
+                rebuilt.insert(redact_secrets_in_str(&key, secrets), child);
             }
+            *map = rebuilt;
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
@@ -464,14 +527,22 @@ fn scrub_secret_values(value: &mut serde_json::Value, secrets: &[String]) {
             }
         }
         serde_json::Value::String(s) => {
-            for secret in secrets {
-                if s.contains(secret.as_str()) {
-                    *s = s.replace(secret.as_str(), REDACTED_PLACEHOLDER);
-                }
-            }
+            *s = redact_secrets_in_str(s, secrets);
         }
         _ => {}
     }
+}
+
+/// Replace every occurrence of each secret needle in `s` with the placeholder.
+/// `secrets` is expected longest-first so overlapping needles redact fully.
+fn redact_secrets_in_str(s: &str, secrets: &[String]) -> String {
+    let mut out = s.to_string();
+    for secret in secrets {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), REDACTED_PLACEHOLDER);
+        }
+    }
+    out
 }
 
 /// Recursively redact secret values inside `image inspect` JSON. Any object key
@@ -694,6 +765,56 @@ mod tests {
         let mut val = serde_json::json!({"WorkingDir": "/app"});
         scrub_secret_values(&mut val, &[]);
         assert_eq!(val, serde_json::json!({"WorkingDir": "/app"}));
+    }
+
+    #[test]
+    fn test_collect_secret_values_from_inspect_harvests_baked_env() {
+        // Baked image secrets must be harvested from Config.Env and
+        // ContainerConfig.Env (used to scrub derived fields even when the
+        // runtime env differs or the exec `env` failed). Empty values skipped.
+        let val = serde_json::json!([{
+            "Config": { "Env": ["PATH=/usr/bin", "DB_PASSWORD=baked1", "EMPTY_TOKEN="] },
+            "ContainerConfig": { "Env": ["API_TOKEN=baked2"] }
+        }]);
+        let mut out = Vec::new();
+        collect_secret_values_from_inspect(&val, &PolicyConfig::default(), &mut out);
+        out.sort();
+        assert_eq!(out, vec!["baked1".to_string(), "baked2".to_string()]);
+    }
+
+    #[test]
+    fn test_dedup_longest_first_orders_and_dedups() {
+        let ordered = dedup_longest_first(vec![
+            "abc".to_string(),
+            "abcdef".to_string(),
+            "abc".to_string(),
+        ]);
+        assert_eq!(ordered, vec!["abcdef".to_string(), "abc".to_string()]);
+    }
+
+    #[test]
+    fn test_scrub_secret_values_handles_overlapping_secrets() {
+        // With `abc` a prefix of `abcdef`, naive in-order replacement would
+        // leave `***REDACTED***def`, leaking the tail. Longest-first ordering
+        // (dedup_longest_first) must fully redact the longer secret.
+        let secrets = dedup_longest_first(vec!["abc".to_string(), "abcdef".to_string()]);
+        let mut val = serde_json::json!({ "WorkingDir": "/abcdef" });
+        scrub_secret_values(&mut val, &secrets);
+        assert_eq!(val, serde_json::json!({ "WorkingDir": "/***REDACTED***" }));
+    }
+
+    #[test]
+    fn test_scrub_secret_values_redacts_object_keys() {
+        // `EXPOSE $SECRET_PORT` lands the secret value in an ExposedPorts map
+        // *key* (e.g. "8123/tcp"), which value-only traversal would miss.
+        let secrets = dedup_longest_first(vec!["8123".to_string()]);
+        let mut val = serde_json::json!({
+            "Config": { "ExposedPorts": { "8123/tcp": {} } }
+        });
+        scrub_secret_values(&mut val, &secrets);
+        let dumped = serde_json::to_string(&val).unwrap();
+        assert!(!dumped.contains("8123"), "secret leaked in an object key");
+        assert!(dumped.contains("***REDACTED***/tcp"));
     }
 
     #[test]
