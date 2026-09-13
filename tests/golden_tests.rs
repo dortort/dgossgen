@@ -588,11 +588,16 @@ fn test_secret_keys_not_in_output() {
     // extract -> generate pipeline, must never emit those values into goss.yml,
     // goss_wait.yml, or any diagnostic, and the contract itself must hold a
     // redacted placeholder for secret keys while non-secret keys are untouched.
+    // WORKDIR references the secret so it is rendered into goss.yml as a
+    // FileExists path — a real output path that would carry the cleartext on
+    // pre-fix code, making the output scan below a genuine regression guard
+    // rather than a vacuous one (contract.env itself is never rendered).
     let content = r#"
 FROM alpine
 ENV DB_PASSWORD=hunter2
 ENV API_TOKEN=abc123
 ENV APP_PORT=3000
+WORKDIR /srv/$DB_PASSWORD
 EXPOSE 3000
 "#;
     let df = parser::parse_dockerfile_content(content).unwrap();

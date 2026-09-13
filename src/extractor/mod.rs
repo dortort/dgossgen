@@ -16,10 +16,13 @@ const MAX_EXPOSE_RANGE: u32 = 128;
 /// Extract a RuntimeContract from a parsed Dockerfile.
 ///
 /// `policy` governs secret redaction: any `ENV` value whose key
-/// [`PolicyConfig::is_secret_key`] matches is stored as [`REDACTED_PLACEHOLDER`]
-/// rather than its real value, so secrets never enter the contract (and thus
-/// never reach generated output). The variable resolver still sees the real
-/// value, so later instructions that reference the variable resolve correctly.
+/// [`PolicyConfig::is_secret_key`] matches is replaced with
+/// [`REDACTED_PLACEHOLDER`] before it is stored anywhere — both in the contract
+/// and in the variable resolver's map. Redacting in the resolver too means a
+/// later instruction that substitutes the secret variable (e.g. `WORKDIR
+/// /$DB_PASSWORD`, `EXPOSE $DB_PASSWORD`, or another `ENV` referencing it) sees
+/// the placeholder, so the cleartext value never enters the contract or any
+/// derived assertion or diagnostic.
 pub fn extract_contract(
     dockerfile: &Dockerfile,
     target: Option<&str>,
@@ -154,15 +157,22 @@ pub fn extract_contract(
             Instruction::Env(pairs) => {
                 for (key, value) in pairs {
                     let resolved_val = resolver.resolve(value);
-                    // The resolver keeps the real value so later `$KEY` references
-                    // still expand during static analysis; only the value stored in
-                    // the contract is redacted when the key looks like a secret.
-                    resolver.set_var(key, &resolved_val);
+                    // Redact a secret value *before* it is stored anywhere,
+                    // including in the resolver's variable map. Feeding the
+                    // placeholder (not the real value) back to the resolver is
+                    // what keeps a later `$SECRET` substitution — e.g.
+                    // `WORKDIR /$DB_PASSWORD` or an unparseable `EXPOSE
+                    // $DB_PASSWORD` warning — from leaking the secret into a
+                    // derived assertion or diagnostic. The trade-off is that a
+                    // non-secret field derived from a secret-keyed variable sees
+                    // the placeholder rather than the real value, which is the
+                    // safe direction.
                     let stored_val = if policy.is_secret_key(key) {
                         REDACTED_PLACEHOLDER.to_string()
                     } else {
                         resolved_val
                     };
+                    resolver.set_var(key, &stored_val);
                     contract.env.push((key.clone(), stored_val));
                 }
             }
@@ -1024,17 +1034,55 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
     }
 
     #[test]
-    fn test_secret_value_still_resolves_for_dependent_variables() {
-        // Redaction only affects the stored value; the resolver keeps the real
-        // value so a later non-secret variable that references it resolves.
-        let content = "FROM alpine\nENV SECRET_BASE=/opt/app\nENV WORKROOT=$SECRET_BASE/data\n";
+    fn test_secret_value_does_not_leak_through_dependent_variables() {
+        // A non-secret key whose value references a secret-keyed variable must
+        // not resurrect the real secret: the resolver holds the placeholder, so
+        // the dependent value carries the placeholder, never the cleartext.
+        let content =
+            "FROM alpine\nENV DB_PASSWORD=hunter2\nENV DATABASE_URL=postgres://u:$DB_PASSWORD@h\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(
-            env_value(&contract, "SECRET_BASE"),
+            env_value(&contract, "DB_PASSWORD"),
             Some(REDACTED_PLACEHOLDER)
         );
-        assert_eq!(env_value(&contract, "WORKROOT"), Some("/opt/app/data"));
+        assert_eq!(
+            env_value(&contract, "DATABASE_URL"),
+            Some("postgres://u:***REDACTED***@h")
+        );
+        assert!(
+            !contract.env.iter().any(|(_, v)| v.contains("hunter2")),
+            "the real secret value must not survive anywhere in contract.env"
+        );
+    }
+
+    #[test]
+    fn test_secret_value_does_not_leak_into_derived_assertions_or_warnings() {
+        // A secret referenced by WORKDIR (rendered into goss.yml as a FileExists
+        // path) or by an unparseable EXPOSE (rendered into a warning) must not
+        // carry the cleartext into either derived output.
+        let content =
+            "FROM alpine\nENV DB_PASSWORD=hunter2\nWORKDIR /data/$DB_PASSWORD\nEXPOSE $DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let workdir = contract.workdir.as_deref().unwrap_or("");
+        assert!(
+            !workdir.contains("hunter2"),
+            "secret leaked into WORKDIR path"
+        );
+        assert!(workdir.contains(REDACTED_PLACEHOLDER));
+        assert!(
+            contract.warnings.iter().all(|w| !w.contains("hunter2")),
+            "secret leaked into an extraction warning"
+        );
+        assert!(
+            contract
+                .assertions
+                .iter()
+                .all(|a| !a.provenance.contains("hunter2")),
+            "secret leaked into an assertion's provenance"
+        );
     }
 }
