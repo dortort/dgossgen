@@ -418,23 +418,53 @@ fn collect_evidence(
         }
     }
 
-    // Now that the secret values are known, sanitize the deferred inspect JSON
-    // both structurally (Env arrays) and by value (derived fields such as
-    // WorkingDir) before it is stored, so `image_config` carries no cleartext.
-    if let Some(mut val) = inspect_val.take() {
-        // Also harvest secret values baked into the image's own `Env` arrays,
-        // so derived fields (WorkingDir, ExposedPorts, ...) are scrubbed even
-        // when the runtime value was overridden via `--env`, or when the exec
-        // `env` failed entirely (e.g. a scratch/distroless image).
-        collect_secret_values_from_inspect(&val, policy, &mut secret_values);
-        let secret_values = dedup_longest_first(secret_values);
+    // Finalize the set of secret values before scrubbing any evidence. Also
+    // harvest secrets baked into the image's own `Env` arrays, so derived fields
+    // are scrubbed even when the runtime value was overridden via `--env`, or
+    // when the exec `env` failed entirely (e.g. a scratch/distroless image).
+    if let Some(val) = &inspect_val {
+        collect_secret_values_from_inspect(val, policy, &mut secret_values);
+    }
+    let secret_values = dedup_longest_first(secret_values);
 
+    // Sanitize the deferred inspect JSON both structurally (Env arrays) and by
+    // value (derived fields such as WorkingDir) before storing it.
+    if let Some(mut val) = inspect_val.take() {
         redact_inspect_env(&mut val, policy);
         scrub_secret_values(&mut val, &secret_values);
         evidence.image_config = Some(val);
     }
 
+    // Scrub secret values from the remaining string evidence fields: a secret
+    // substituted into `USER`/`ENTRYPOINT` surfaces in `user`/`running_processes`
+    // (e.g. `USER $DB_PASSWORD` -> `id` output), and a non-secret-keyed runtime
+    // var can hold a secret value.
+    scrub_evidence_fields(&mut evidence, &secret_values);
+
     Ok(evidence)
+}
+
+/// Scrub every known secret value out of the string-bearing evidence fields
+/// (`user`, `running_processes`, `existing_files`, and `env_vars` values). The
+/// `env_vars` values are already key-redacted; this additionally catches a
+/// secret value stored under a non-secret key. `image_config` is scrubbed
+/// separately at the point it is stored.
+fn scrub_evidence_fields(evidence: &mut ProbeEvidence, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    if let Some(user) = evidence.user.as_mut() {
+        *user = redact_secrets_in_str(user, secrets);
+    }
+    for proc in evidence.running_processes.iter_mut() {
+        *proc = redact_secrets_in_str(proc, secrets);
+    }
+    for file in evidence.existing_files.iter_mut() {
+        *file = redact_secrets_in_str(file, secrets);
+    }
+    for (_, value) in evidence.env_vars.iter_mut() {
+        *value = redact_secrets_in_str(value, secrets);
+    }
 }
 
 /// Collect the concrete cleartext values of secret-keyed entries found in any
@@ -801,6 +831,27 @@ mod tests {
         let mut val = serde_json::json!({ "WorkingDir": "/abcdef" });
         scrub_secret_values(&mut val, &secrets);
         assert_eq!(val, serde_json::json!({ "WorkingDir": "/***REDACTED***" }));
+    }
+
+    #[test]
+    fn test_scrub_evidence_fields_redacts_user_and_processes() {
+        // `USER $DB_PASSWORD` -> `id` output in `user`; a secret-derived
+        // executable in `running_processes`; a secret value under a non-secret
+        // runtime env key. All must be scrubbed.
+        let mut evidence = ProbeEvidence {
+            user: Some("uid=0(alice) gid=0".to_string()),
+            running_processes: vec!["/alice".to_string(), "nginx".to_string()],
+            env_vars: vec![("PUBLIC_ALIAS".to_string(), "alice".to_string())],
+            ..ProbeEvidence::default()
+        };
+        scrub_evidence_fields(&mut evidence, &["alice".to_string()]);
+
+        assert_eq!(
+            evidence.user.as_deref(),
+            Some("uid=0(***REDACTED***) gid=0")
+        );
+        assert_eq!(evidence.running_processes, vec!["/***REDACTED***", "nginx"]);
+        assert_eq!(evidence.env_vars[0].1, "***REDACTED***");
     }
 
     #[test]
