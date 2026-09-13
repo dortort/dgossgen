@@ -375,7 +375,7 @@ warnings if you want any confidence-filtered skip to fail the build.
 
 ## Security
 
-- **Secret redaction**: Environment variable values for keys matching `SECRET`, `TOKEN`, `PASSWORD`, `KEY`, etc. are never embedded in generated assertions
+- **Secret redaction**: Environment variable values are redacted at the point they are collected — both statically (`ENV` values read from the Dockerfile) and dynamically (the running container's environment during a probe) — for any key matching the configured `secret_patterns` (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, etc. by default). Redacted values are replaced with `***REDACTED***` so they never enter the contract or generated output. Matching is a case-insensitive substring test on the key, so broad patterns like `KEY` will also redact non-secret keys such as `SSH_KEY_PATH`; tune `secret_patterns` in `.dgossgen.yml` to fit your keys.
 - **Probe isolation**: Probe containers run with `--network none` by default (override with `--allow-network`)
 - **Probe run args**: `--run-arg` is allowlisted in safe mode; use `--unsafe-run-arg` only for trusted inputs
 - **Command sanitization**: Dockerfile strings are treated as data; values are sanitized when embedded into YAML commands to prevent injection
