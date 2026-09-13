@@ -344,7 +344,12 @@ fn collect_evidence(
 
     if inspect_output.status.success() {
         let json_str = String::from_utf8_lossy(&inspect_output.stdout);
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            // `image inspect` echoes the image's `Config.Env` (and
+            // `ContainerConfig.Env`), which hold secret values verbatim. Redact
+            // them before storing so the stored evidence carries no cleartext
+            // secret, matching the treatment of the exec-collected env.
+            redact_inspect_env(&mut val, policy);
             evidence.image_config = Some(val);
         }
     }
@@ -408,6 +413,41 @@ fn collect_evidence(
     }
 
     Ok(evidence)
+}
+
+/// Recursively redact secret values inside `image inspect` JSON. Any object key
+/// named `Env` holding an array of `KEY=VALUE` strings (Docker exposes the image
+/// env at `Config.Env` and `ContainerConfig.Env`) has each secret-keyed entry's
+/// value replaced with [`REDACTED_PLACEHOLDER`], leaving keys and structure
+/// intact. This keeps [`ProbeEvidence::image_config`] free of cleartext secrets.
+fn redact_inspect_env(value: &mut serde_json::Value, policy: &PolicyConfig) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "Env" {
+                    if let serde_json::Value::Array(items) = child {
+                        for item in items.iter_mut() {
+                            if let serde_json::Value::String(pair) = item {
+                                if let Some((k, _)) = pair.split_once('=') {
+                                    if policy.is_secret_key(k) {
+                                        *pair = format!("{k}={REDACTED_PLACEHOLDER}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    redact_inspect_env(child, policy);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_inspect_env(item, policy);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse `env` command output into key/value pairs, redacting the value of any
@@ -532,6 +572,29 @@ mod tests {
                 .any(|(_, v)| v.contains("abc123") || v.contains("p=a=ss")),
             "no secret value may survive in collected env_vars"
         );
+    }
+
+    #[test]
+    fn test_redact_inspect_env_sanitizes_config_env() {
+        // Mirrors `docker image inspect` shape: a top-level array of objects,
+        // each with Config.Env and ContainerConfig.Env holding KEY=VALUE strings.
+        let mut val = serde_json::json!([{
+            "Config": { "Env": ["PATH=/usr/bin", "DB_PASSWORD=hunter2"] },
+            "ContainerConfig": { "Env": ["API_TOKEN=abc123", "LANG=C.UTF-8"] }
+        }]);
+        redact_inspect_env(&mut val, &PolicyConfig::default());
+
+        let dumped = serde_json::to_string(&val).unwrap();
+        assert!(!dumped.contains("hunter2"), "secret leaked in Config.Env");
+        assert!(
+            !dumped.contains("abc123"),
+            "secret leaked in ContainerConfig.Env"
+        );
+        // Non-secret entries and the keys of secret entries are preserved.
+        assert!(dumped.contains("PATH=/usr/bin"));
+        assert!(dumped.contains("LANG=C.UTF-8"));
+        assert!(dumped.contains("DB_PASSWORD=***REDACTED***"));
+        assert!(dumped.contains("API_TOKEN=***REDACTED***"));
     }
 
     #[test]
