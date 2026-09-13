@@ -85,7 +85,10 @@ pub struct ProbeEvidence {
     /// runtime env can include secrets injected via `--env`/`--env-file`, so
     /// this collection is sanitized at the point of capture.
     pub env_vars: Vec<(String, String)>,
-    /// Image inspect data
+    /// Image inspect data, sanitized before storage: `Env` arrays are redacted
+    /// by key and any secret value collected from the container's env is
+    /// scrubbed from all string fields (see `collect_evidence`), so no cleartext
+    /// secret is retained even in secret-derived fields such as `WorkingDir`.
     pub image_config: Option<serde_json::Value>,
 }
 
@@ -336,7 +339,13 @@ fn collect_evidence(
 ) -> Result<ProbeEvidence> {
     let mut evidence = ProbeEvidence::default();
 
-    // Inspect the image
+    // Inspect the image. Redaction of the parsed JSON is deferred to the end of
+    // this function: `image inspect` can echo secret values both structurally
+    // (`Config.Env`) and as substrings of *derived* fields (e.g. a
+    // `Config.WorkingDir` of `/hunter2` produced by `WORKDIR /$DB_PASSWORD`),
+    // and scrubbing the latter needs the concrete secret values, which are only
+    // known once the container's env has been collected below.
+    let mut inspect_val: Option<serde_json::Value> = None;
     let mut inspect_cmd = Command::new(runtime);
     inspect_cmd.args(["image", "inspect", image]);
     let inspect_output =
@@ -344,14 +353,7 @@ fn collect_evidence(
 
     if inspect_output.status.success() {
         let json_str = String::from_utf8_lossy(&inspect_output.stdout);
-        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            // `image inspect` echoes the image's `Config.Env` (and
-            // `ContainerConfig.Env`), which hold secret values verbatim. Redact
-            // them before storing so the stored evidence carries no cleartext
-            // secret, matching the treatment of the exec-collected env.
-            redact_inspect_env(&mut val, policy);
-            evidence.image_config = Some(val);
-        }
+        inspect_val = serde_json::from_str::<serde_json::Value>(&json_str).ok();
     }
 
     // Check running processes
@@ -400,7 +402,10 @@ fn collect_evidence(
         }
     }
 
-    // Check env, redacting secret values at the point of capture.
+    // Check env, redacting secret values at the point of capture. The concrete
+    // secret values are also retained (locally, never stored) so they can be
+    // scrubbed out of the image-inspect JSON below.
+    let mut secret_values: Vec<String> = Vec::new();
     let mut env_cmd = Command::new(runtime);
     env_cmd.args(["exec", container, "env"]);
     let env_output = run_command_with_timeout(env_cmd, timeout);
@@ -409,10 +414,64 @@ fn collect_evidence(
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             evidence.env_vars = parse_env_output(&text, policy);
+            secret_values = secret_values_from_env(&text, policy);
         }
     }
 
+    // Now that the secret values are known, sanitize the deferred inspect JSON
+    // both structurally (Env arrays) and by value (derived fields such as
+    // WorkingDir) before it is stored, so `image_config` carries no cleartext.
+    if let Some(mut val) = inspect_val.take() {
+        redact_inspect_env(&mut val, policy);
+        scrub_secret_values(&mut val, &secret_values);
+        evidence.image_config = Some(val);
+    }
+
     Ok(evidence)
+}
+
+/// Extract the concrete cleartext values of secret-keyed environment variables
+/// from raw `env` output. Empty values are skipped (nothing to scrub, and an
+/// empty needle would match everywhere). Used only to scrub secrets out of the
+/// image-inspect JSON; the returned values are never stored in evidence.
+fn secret_values_from_env(text: &str, policy: &PolicyConfig) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, value)| !value.is_empty() && policy.is_secret_key(key))
+        .map(|(_, value)| value.to_string())
+        .collect()
+}
+
+/// Replace every occurrence of a known secret value with [`REDACTED_PLACEHOLDER`]
+/// across all string values of a JSON tree. This catches secret-*derived* fields
+/// that key-based redaction cannot see — e.g. a `Config.WorkingDir` of
+/// `/hunter2` produced by `WORKDIR /$DB_PASSWORD`. It may over-redact when a
+/// secret value coincides with an unrelated substring, which is the safe
+/// direction for an evidence blob that is retained but never emitted.
+fn scrub_secret_values(value: &mut serde_json::Value, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (_, child) in map.iter_mut() {
+                scrub_secret_values(child, secrets);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                scrub_secret_values(item, secrets);
+            }
+        }
+        serde_json::Value::String(s) => {
+            for secret in secrets {
+                if s.contains(secret.as_str()) {
+                    *s = s.replace(secret.as_str(), REDACTED_PLACEHOLDER);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively redact secret values inside `image inspect` JSON. Any object key
@@ -595,6 +654,46 @@ mod tests {
         assert!(dumped.contains("LANG=C.UTF-8"));
         assert!(dumped.contains("DB_PASSWORD=***REDACTED***"));
         assert!(dumped.contains("API_TOKEN=***REDACTED***"));
+    }
+
+    #[test]
+    fn test_secret_values_from_env_extracts_nonempty_secret_values() {
+        let raw = "PATH=/usr/bin\nDB_PASSWORD=hunter2\nAPI_TOKEN=abc123\nEMPTY_SECRET_KEY=\n";
+        let mut values = secret_values_from_env(raw, &PolicyConfig::default());
+        values.sort();
+        // Only non-empty, secret-keyed values; PATH excluded, empty value skipped.
+        assert_eq!(values, vec!["abc123".to_string(), "hunter2".to_string()]);
+    }
+
+    #[test]
+    fn test_scrub_secret_values_redacts_derived_inspect_fields() {
+        // A secret substituted into a non-Env field (WorkingDir from
+        // `WORKDIR /$DB_PASSWORD`) must be scrubbed even though its key is not "Env".
+        let mut val = serde_json::json!([{
+            "Config": {
+                "WorkingDir": "/hunter2",
+                "Env": ["PATH=/usr/bin"],
+                "Labels": { "build": "commit-hunter2-1" }
+            }
+        }]);
+        scrub_secret_values(&mut val, &["hunter2".to_string()]);
+
+        let dumped = serde_json::to_string(&val).unwrap();
+        assert!(
+            !dumped.contains("hunter2"),
+            "secret leaked in a derived field"
+        );
+        assert!(dumped.contains("/***REDACTED***"));
+        assert!(dumped.contains("commit-***REDACTED***-1"));
+        // Unrelated data is preserved.
+        assert!(dumped.contains("PATH=/usr/bin"));
+    }
+
+    #[test]
+    fn test_scrub_secret_values_noop_when_no_secrets() {
+        let mut val = serde_json::json!({"WorkingDir": "/app"});
+        scrub_secret_values(&mut val, &[]);
+        assert_eq!(val, serde_json::json!({"WorkingDir": "/app"}));
     }
 
     #[test]
