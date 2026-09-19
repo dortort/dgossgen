@@ -503,9 +503,11 @@ fn shell_runs_stdin_script(args: &[&str]) -> bool {
             if short.contains('s') {
                 return true;
             }
-            // A short-flag bundle ending in `o` consumes the next token as its
-            // setting name (`-o pipefail`, `-euo pipefail`).
-            if short.ends_with('o') {
+            // A short-flag bundle ending in `o`/`O` consumes the next token as
+            // its setting name (`-o pipefail`, `-euo pipefail`, `-O extglob`).
+            // These are the only argument-taking bash invocation options besides
+            // `-c` (handled above).
+            if short.ends_with('o') || short.ends_with('O') {
                 it.next();
             }
             continue;
@@ -2511,8 +2513,9 @@ SCRIPT
     fn test_run_shell_interpreter_with_options_is_folded() {
         // A shell with only option flags still runs the heredoc body as its
         // script (`bash -euo pipefail <<EOF` is a common idiom), so installs must
-        // be detected.
-        for opener in ["bash -euo pipefail", "bash -x", "sh -e"] {
+        // be detected. `-O extglob` and `-o pipefail` take an argument that must
+        // not be mistaken for a script-file operand.
+        for opener in ["bash -euo pipefail", "bash -x", "sh -e", "bash -O extglob"] {
             let content =
                 format!("FROM alpine\nRUN {opener} <<EOF\napk add --no-cache nginx\nEOF\n");
             let runs = run_commands(&content);
