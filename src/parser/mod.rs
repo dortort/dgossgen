@@ -312,7 +312,11 @@ fn parse_heredoc_marker(chars: &[char], start: usize) -> Option<(Heredoc, usize)
         j += 1;
     }
 
-    if j < n && (chars[j] == '"' || chars[j] == '\'') {
+    // A leading backslash quotes the delimiter (`<<\EOF`), disabling expansion —
+    // equivalent to `<<'EOF'`. Skip it; the terminator is the bare word `EOF`.
+    if j < n && chars[j] == '\\' {
+        j += 1;
+    } else if j < n && (chars[j] == '"' || chars[j] == '\'') {
         // Quoted delimiter: the terminator word is everything up to the matching
         // quote, which may contain punctuation or spaces.
         let q = chars[j];
@@ -751,14 +755,16 @@ fn push_script_command(
     // recursively so its installs are detected. A data nested heredoc (`cat
     // <<INNER > /f`) and a nested bare heredoc (a no-op, hence `bare_is_script =
     // false`) have their payloads dropped.
+    // Only an explicit-shell nested heredoc is folded here (a nested bare heredoc
+    // is a no-op — `bare_is_script = false` — and its body is dropped). With the
+    // shell explicit, a leading `#!` line is just a comment, so no shebang
+    // suppression applies.
     let inner_tokens: Vec<&str> = stripped.split_whitespace().collect();
     if heredoc_body_is_script(&inner_tokens, false) {
         if let Some(stdin_body) = stdin_heredoc_body(&inner, &inner_bodies) {
-            if !body_has_non_shell_shebang(stdin_body) {
-                let folded = fold_script_body(stdin_body);
-                if !folded.is_empty() {
-                    commands.push(folded);
-                }
+            let folded = fold_script_body(stdin_body);
+            if !folded.is_empty() {
+                commands.push(folded);
             }
         }
     }
@@ -2128,6 +2134,53 @@ EOF
         assert!(
             !runs[0].contains("apk add"),
             "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_backslash_quoted_heredoc_delimiter_is_recognized() {
+        // `<<\EOF` quotes the delimiter (like `<<'EOF'`); the terminator is `EOF`.
+        // The heredoc must be consumed so its body does not leak as instructions.
+        let content = "\
+FROM alpine
+RUN cat <<\\EOF > /tmp/x
+USER phantom
+EOF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "backslash-quoted heredoc body leaked a phantom USER instruction"
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_nested_shell_heredoc_with_shebang_is_folded() {
+        // A nested `bash <<INNER` runs its body as bash; a first `#!` line is a
+        // comment, so a following install is still detected.
+        let content = "\
+FROM alpine
+RUN <<OUTER
+bash <<INNER
+#!/usr/bin/env python3
+apk add --no-cache nginx
+INNER
+OUTER
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "nested explicit-shell heredoc body was dropped over a shebang: {}",
             runs[0]
         );
     }
