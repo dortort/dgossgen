@@ -705,6 +705,39 @@ fn test_heredoc_end_to_end_output_has_no_phantom_user() {
     assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");
 }
 
+#[test]
+fn test_data_heredoc_produces_no_phantom_package() {
+    // A redirected RUN heredoc writes file content, not shell. Even though the
+    // body mentions `apt-get install` and `nginx`, no package/service assertion
+    // may be fabricated from it end-to-end.
+    let content = "\
+FROM alpine
+RUN cat <<EOF > /etc/motd
+welcome, run: apt-get install -y ghost-package
+you can reach nginx at :80
+EOF
+EXPOSE 80
+";
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    assert!(
+        !contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::PackageInstalled { package, .. } if package == "ghost-package"
+        )),
+        "a package assertion was fabricated from heredoc file content"
+    );
+    // The real EXPOSE after the heredoc still survives.
+    assert!(
+        contract
+            .assertions
+            .iter()
+            .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: 80, .. })),
+        "EXPOSE after the heredoc was lost"
+    );
+}
+
 // --- YAML validity tests ---
 
 #[test]
