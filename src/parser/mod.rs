@@ -207,6 +207,16 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
             i += 1;
             continue;
         }
+        // Outside quotes, a backslash escapes the next character, so an escaped
+        // quote (`\"`) is literal and must not open a quoted span, and `\#` /
+        // `\<` are not a comment / redirection.
+        if c == '\\' && i + 1 < n {
+            stripped.push(c);
+            stripped.push(chars[i + 1]);
+            prev_boundary = false;
+            i += 2;
+            continue;
+        }
         if c == '\'' {
             in_single = true;
             stripped.push(c);
@@ -271,9 +281,13 @@ fn strip_inline_shell_comment(line: &str) -> &str {
     let mut in_double = false;
     let mut prev_boundary = true;
     let mut escaped_in_double = false;
+    let mut escaped = false; // an unquoted backslash escapes the next character
 
     for (idx, c) in line.char_indices() {
-        if in_single {
+        if escaped {
+            escaped = false;
+            prev_boundary = false;
+        } else if in_single {
             in_single = c != '\'';
             prev_boundary = false;
         } else if in_double {
@@ -284,6 +298,9 @@ fn strip_inline_shell_comment(line: &str) -> &str {
             } else if c == '"' {
                 in_double = false;
             }
+            prev_boundary = false;
+        } else if c == '\\' {
+            escaped = true;
             prev_boundary = false;
         } else if c == '\'' {
             in_single = true;
@@ -2136,6 +2153,27 @@ EOF
             "`sh -c` heredoc body must be treated as data: {}",
             runs[0]
         );
+    }
+
+    #[test]
+    fn test_escaped_quote_in_opener_does_not_hide_heredoc() {
+        // An escaped quote (`\"`) outside quotes is literal and must not open a
+        // quoted span that hides a following `<<EOF`. The heredoc must still be
+        // detected so its body does not leak as instructions.
+        let content =
+            "FROM alpine\nRUN printf \\\"x\\\" <<EOF > /tmp/x\nUSER phantom\nEOF\nEXPOSE 80\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "escaped quote hid the heredoc, leaking a phantom USER instruction"
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
     }
 
     #[test]
