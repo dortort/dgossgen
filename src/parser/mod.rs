@@ -135,11 +135,11 @@ fn heredoc_openers(line: &str) -> Option<(Vec<Heredoc>, String, bool)> {
     let opener = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // The body is an executable shell script only for the bare `RUN <<DELIM`
-    // form (optionally preceded by `--flags`). When a command word precedes the
-    // heredoc (`RUN cat <<EOF > /f`, `RUN python3 <<EOF`) the body is data fed to
-    // that command — file content or program source — not shell, so it must not
-    // be scanned for installs.
-    let fold_body = keyword == "RUN" && run_heredoc_is_script(line);
+    // form (optionally preceded by `--flags`/redirections). When a command word
+    // is present — before or after the marker (`RUN cat <<EOF > /f`, `RUN python3
+    // <<EOF`, `RUN <<EOF cat > /f`) — the body is data fed to that command (file
+    // content or program source), not shell, so it must not be scanned.
+    let fold_body = keyword == "RUN" && run_heredoc_is_script(&opener);
 
     Some((heredocs, opener, fold_body))
 }
@@ -236,44 +236,89 @@ fn parse_heredoc_marker(chars: &[char], start: usize) -> Option<(Heredoc, usize)
         j += 1;
     }
 
-    let quote = if j < n && (chars[j] == '"' || chars[j] == '\'') {
+    if j < n && (chars[j] == '"' || chars[j] == '\'') {
+        // Quoted delimiter: the terminator word is everything up to the matching
+        // quote, which may contain punctuation or spaces.
         let q = chars[j];
         j += 1;
-        Some(q)
-    } else {
-        None
-    };
+        let word_start = j;
+        while j < n && chars[j] != q {
+            j += 1;
+        }
+        if j >= n {
+            return None; // unbalanced quote around the delimiter
+        }
+        let delim: String = chars[word_start..j].iter().collect();
+        j += 1; // consume the closing quote
+        if delim.is_empty() {
+            return None;
+        }
+        return Some((Heredoc { delim, strip_tabs }, j));
+    }
 
-    // Delimiter word: `[A-Za-z_][A-Za-z0-9_]*`.
+    // Unquoted delimiter: BuildKit delimiters are ordinary shell words and may
+    // carry punctuation (e.g. `<<robots.txt`). The first character must be a
+    // letter or underscore so that shell arithmetic (`1 <<2`) is not mistaken
+    // for a heredoc; the rest runs until whitespace or a shell operator.
     let word_start = j;
     if !(j < n && (chars[j].is_ascii_alphabetic() || chars[j] == '_')) {
         return None;
     }
     j += 1;
-    while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+    while j < n && is_delim_char(chars[j]) {
         j += 1;
     }
     let delim: String = chars[word_start..j].iter().collect();
 
-    if let Some(q) = quote {
-        if j < n && chars[j] == q {
-            j += 1;
-        } else {
-            return None; // unbalanced quote around the delimiter
-        }
-    }
-
     Some((Heredoc { delim, strip_tabs }, j))
 }
 
-/// Whether a `RUN` heredoc opener is the bare shell-script form — the first
-/// non-flag token after `RUN` is a `<<` marker — as opposed to feeding a command
-/// (`RUN cat <<EOF`, `RUN python3 <<EOF`).
-fn run_heredoc_is_script(line: &str) -> bool {
-    line.split_whitespace()
-        .skip(1) // the RUN keyword
-        .find(|tok| !tok.starts_with("--"))
-        .is_some_and(|tok| tok.starts_with("<<"))
+/// Characters allowed after the first in an unquoted heredoc delimiter: anything
+/// that is not whitespace, a shell redirection/control operator, or a quote.
+fn is_delim_char(c: char) -> bool {
+    !c.is_whitespace() && !matches!(c, '<' | '>' | '|' | '&' | ';' | '(' | ')' | '"' | '\'')
+}
+
+/// Whether a `RUN` heredoc opener (with the `<<DELIM` markers already removed) is
+/// the bare shell-script form, in which the heredoc body is the script to run.
+/// This holds only when no command word remains after the `RUN` keyword — just
+/// flags and redirections. When any command word is present, whether before or
+/// after the marker (`RUN cat <<EOF`, `RUN python3 <<EOF`, `RUN <<EOF cat > /f`),
+/// the body is data fed to that command, not shell.
+fn run_heredoc_is_script(opener: &str) -> bool {
+    let toks: Vec<&str> = opener.split_whitespace().collect();
+    let mut i = 1; // skip the RUN keyword
+    while i < toks.len() {
+        let tok = toks[i];
+        if tok.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        match classify_redirection(tok) {
+            // A bare operator (`>`, `2>`, `<`) takes the following token as its
+            // target, so skip both.
+            Some(true) => i += 2,
+            // A redirection with an attached target (`>/f`, `2>&1`) is one token.
+            Some(false) => i += 1,
+            // Any other token is a command word, so the body is data.
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Classify a token as a shell redirection. Returns `Some(true)` for a bare
+/// operator whose target is the next token (`>`, `>>`, `2>`, `<`), `Some(false)`
+/// for a redirection with the target attached (`>/f`, `>>log`, `2>&1`), or `None`
+/// when the token is not a redirection.
+fn classify_redirection(tok: &str) -> Option<bool> {
+    let rest = tok.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    if !(rest.starts_with('>') || rest.starts_with('<')) {
+        return None;
+    }
+    let after = rest.trim_start_matches(['>', '<']);
+    Some(after.is_empty())
 }
 
 /// Consume the physical body lines of a heredoc block starting at `start_idx`,
@@ -1670,6 +1715,66 @@ EXPOSE 80
         assert!(
             !runs[0].contains("apt-get"),
             "interpreter heredoc body was folded into the shell command: {}",
+            runs[0]
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_copy_heredoc_delimiter_with_punctuation() {
+        // Heredoc delimiters may carry punctuation (`<<robots.txt`). The full
+        // token must be captured so the terminator matches and the body does not
+        // swallow the rest of the file.
+        let content = "\
+FROM alpine
+COPY <<robots.txt /usr/share/nginx/html/
+User-agent: *
+Disallow:
+robots.txt
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let copy = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Copy { dest, .. } => Some(dest.clone()),
+                _ => None,
+            })
+            .expect("COPY instruction");
+        assert_eq!(copy, "/usr/share/nginx/html/");
+        // The body between the opener and the `robots.txt` terminator must not
+        // leak as instructions, and the EXPOSE afterward must survive.
+        assert!(
+            df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::Expose(_))),
+            "EXPOSE after a punctuation-delimited heredoc was swallowed"
+        );
+    }
+
+    #[test]
+    fn test_run_redirection_before_command_is_data() {
+        // A redirection may precede its command (`RUN <<EOF cat > /f`), so `cat`
+        // is the command and the body is data. It must not be folded/scanned.
+        let content = "\
+FROM alpine
+RUN <<EOF cat > /etc/motd
+apt-get install -y ghost-package
+welcome to nginx
+EOF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apt-get") && !runs[0].contains("welcome"),
+            "redirection-before-command heredoc body was folded into the command: {}",
             runs[0]
         );
         assert!(df.stages[0]
