@@ -601,6 +601,80 @@ EXPOSE 3000
     assert!(!policy.is_secret_key("APP_PORT"));
 }
 
+// --- Heredoc fixture tests (issue #19) ---
+
+#[test]
+fn test_heredoc_run_body_yields_package_assertions() {
+    // The apk installs live inside a `RUN <<EOF` heredoc body. Before heredoc
+    // support the body was invisible to the RUN heuristics and no package
+    // assertion was produced.
+    let df = parser::parse_dockerfile(&fixture_path("heredoc.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    for pkg in ["nginx", "curl"] {
+        assert!(
+            contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::PackageInstalled { package, .. } if package == pkg
+            )),
+            "expected a PackageInstalled assertion for `{pkg}` from the RUN heredoc body"
+        );
+    }
+}
+
+#[test]
+fn test_heredoc_copy_body_does_not_fabricate_assertions() {
+    // The COPY heredoc body contains `user nginx;`, which starts with a
+    // Dockerfile keyword. It must be treated as file content, not re-parsed into
+    // a USER instruction / UserExists assertion.
+    let df = parser::parse_dockerfile(&fixture_path("heredoc.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+
+    assert!(
+        contract.user.is_none(),
+        "COPY heredoc body was fabricated into a USER instruction: {:?}",
+        contract.user
+    );
+    assert!(
+        !contract
+            .assertions
+            .iter()
+            .any(|a| matches!(&a.kind, AssertionKind::UserExists { .. })),
+        "COPY heredoc body fabricated a UserExists assertion"
+    );
+
+    // The COPY destination itself is still recognized as a written file.
+    assert!(
+        contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path == "/etc/nginx/nginx.conf"
+        )),
+        "COPY heredoc destination should still yield a FileExists assertion"
+    );
+}
+
+#[test]
+fn test_heredoc_end_to_end_output_has_no_phantom_user() {
+    let df = parser::parse_dockerfile(&fixture_path("heredoc.Dockerfile")).unwrap();
+    let contract = extractor::extract_contract(&df, None, &[]);
+    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+
+    // Real evidence survives to the generated file...
+    assert!(
+        output.goss_yml.contains("nginx"),
+        "generated goss.yml should mention nginx from the heredoc install"
+    );
+    // ...and the fabricated user never reaches it.
+    assert!(
+        !output.goss_yml.contains("user:"),
+        "generated goss.yml must not contain a phantom user resource: {}",
+        output.goss_yml
+    );
+
+    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output.goss_yml);
+    assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");
+}
+
 // --- YAML validity tests ---
 
 #[test]

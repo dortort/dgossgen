@@ -96,8 +96,7 @@ fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
                 // body lines that follow so they are not re-parsed as top-level
                 // instructions, and (for RUN) fold the body into the command.
                 if let Some((delimiters, opener)) = heredoc_openers(&merged) {
-                    let (assembled, next_idx) =
-                        consume_heredoc(&opener, delimiters, &lines, idx);
+                    let (assembled, next_idx) = consume_heredoc(&opener, delimiters, &lines, idx);
                     result.push((start_line_num, assembled));
                     idx = next_idx;
                 } else {
@@ -1201,5 +1200,226 @@ COPY --from=builder /app /app
             }
             _ => panic!("expected Copy"),
         }
+    }
+
+    /// Collect the shell text of every RUN instruction in the first stage.
+    fn run_commands(content: &str) -> Vec<String> {
+        let df = parse_dockerfile_content(content).unwrap();
+        df.stages[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match &i.instruction {
+                Instruction::Run(cmd) => Some(cmd.to_string_lossy()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_run_heredoc_body_folded_into_command() {
+        // A `RUN <<EOF` heredoc: the body carries the real install and must be
+        // folded into the single RUN command; no body line may be re-parsed as a
+        // top-level instruction.
+        let content = "\
+FROM alpine
+RUN <<EOF
+apk add --no-cache nginx
+EOF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(
+            runs.len(),
+            1,
+            "heredoc RUN must remain a single instruction"
+        );
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "heredoc body was not folded into the RUN command: {}",
+            runs[0]
+        );
+        assert!(
+            !runs[0].contains("<<"),
+            "the heredoc marker must be stripped from the command: {}",
+            runs[0]
+        );
+        // The EXPOSE that follows the terminator must still parse cleanly.
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_run_heredoc_multiple_body_lines_stay_bounded() {
+        // Multiple installs on separate body lines are joined with a shell
+        // separator so each command stays bounded for the install heuristics.
+        let content = "\
+FROM alpine
+RUN <<EOF
+apk add --no-cache nginx
+apk add --no-cache curl
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].contains("apk add --no-cache nginx"));
+        assert!(runs[0].contains("apk add --no-cache curl"));
+        assert!(
+            runs[0].contains("&&"),
+            "body lines should be joined with a shell separator: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_copy_heredoc_body_is_not_reparsed() {
+        // A `COPY <<CONF /dest` heredoc: the body is file content. A body line
+        // that starts with a Dockerfile keyword (`user nginx;`) must not be
+        // fabricated into a USER instruction.
+        let content = "\
+FROM alpine
+COPY <<CONF /etc/nginx/nginx.conf
+user nginx;
+worker_processes auto;
+CONF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "COPY heredoc body line was fabricated into a USER instruction"
+        );
+
+        // The COPY itself is preserved with the correct destination and no
+        // heredoc marker recorded as a source.
+        let copy = df.stages[0]
+            .instructions
+            .iter()
+            .find_map(|i| match &i.instruction {
+                Instruction::Copy { sources, dest, .. } => Some((sources.clone(), dest.clone())),
+                _ => None,
+            })
+            .expect("COPY instruction");
+        assert_eq!(copy.1, "/etc/nginx/nginx.conf");
+        assert!(
+            !copy.0.iter().any(|s| s.contains("<<")),
+            "heredoc marker leaked into COPY sources: {:?}",
+            copy.0
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_heredoc_dash_and_quoted_delimiters() {
+        // `<<-EOF` (tab-stripped) and quoted delimiters (`<<"EOF"`, `<<'EOF'`)
+        // are all recognized, and the tab-indented terminator of a `<<-` heredoc
+        // still terminates the body.
+        for opener in ["<<-EOF", "<<\"EOF\"", "<<'EOF'"] {
+            let content =
+                format!("FROM alpine\nRUN {opener}\napk add --no-cache nginx\n\tEOF\nEXPOSE 80\n");
+            let df = parse_dockerfile_content(&content).unwrap();
+            let runs = run_commands(&content);
+            assert_eq!(runs.len(), 1, "opener {opener}: one RUN expected");
+            assert!(
+                runs[0].contains("apk add --no-cache nginx"),
+                "opener {opener}: body not folded: {}",
+                runs[0]
+            );
+            assert!(
+                df.stages[0]
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i.instruction, Instruction::Expose(_))),
+                "opener {opener}: EXPOSE after terminator was swallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiple_heredocs_on_one_run() {
+        // `cmd <<A <<B` concatenates both bodies in declaration order; both
+        // terminators must be consumed before the instruction stream resumes.
+        let content = "\
+FROM alpine
+RUN cat <<A && cat <<B
+apk add --no-cache nginx
+A
+apk add --no-cache curl
+B
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].contains("apk add --no-cache nginx"));
+        assert!(runs[0].contains("apk add --no-cache curl"));
+        assert!(
+            df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::Expose(_))),
+            "EXPOSE after both terminators was swallowed"
+        );
+    }
+
+    #[test]
+    fn test_shell_left_shift_is_not_a_heredoc() {
+        // `$(( 1 << 2 ))` and `a<<b` are not heredocs: `<<` must sit at a token
+        // boundary with the delimiter immediately following. Nothing after the
+        // RUN may be consumed as a body.
+        let content = "\
+FROM alpine
+RUN echo $(( 1 << 2 ))
+EXPOSE 80
+CMD [\"true\"]
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("1 << 2"),
+            "left-shift text was altered: {}",
+            runs[0]
+        );
+        // The instructions after the RUN must survive.
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Cmd(_))));
+    }
+
+    #[test]
+    fn test_heredoc_without_terminator_consumes_to_eof() {
+        // A heredoc whose terminator never appears consumes the rest of the file
+        // rather than leaking body lines as instructions.
+        let content = "\
+FROM alpine
+RUN <<EOF
+apk add --no-cache nginx
+USER root
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "unterminated heredoc body leaked a USER instruction"
+        );
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].contains("apk add --no-cache nginx"));
     }
 }
