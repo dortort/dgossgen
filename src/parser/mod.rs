@@ -208,6 +208,14 @@ fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
             continue;
         }
 
+        if c == '#' && prev_boundary {
+            // An unquoted `#` at a token boundary begins a shell comment; the
+            // rest of the line (including any `<<WORD`) is not executed, so no
+            // heredoc can be opened there. Keep the text but stop scanning.
+            stripped.extend(chars[i..].iter());
+            break;
+        }
+
         if prev_boundary {
             // A heredoc redirection may carry an optional leading file-descriptor
             // (`0<<EOF`, `1<<EOF`); skip those digits before matching `<<`.
@@ -302,32 +310,92 @@ fn is_delim_char(c: char) -> bool {
 /// body is data fed to that command, not shell, and must not be scanned.
 fn run_heredoc_is_script(opener: &str) -> bool {
     let toks: Vec<&str> = opener.split_whitespace().collect();
-    let mut commands: Vec<&str> = Vec::new();
-    let mut i = 1; // skip the RUN keyword
-    while i < toks.len() {
-        let tok = toks[i];
+    // Skip the RUN keyword; a bare heredoc (no command word) runs the body as a
+    // script.
+    heredoc_body_is_script(&toks[1..], true)
+}
+
+/// Decide whether a heredoc body is executed as a shell script, given the opener
+/// tokens (RUN keyword already removed for the top level). `bare_is_script` says
+/// what a heredoc with no command word means: for a top-level `RUN <<EOF` the
+/// body is the script, but a nested `<<EOF` with no command is a no-op reading
+/// stdin, so its body is data.
+fn heredoc_body_is_script(tokens: &[&str], bare_is_script: bool) -> bool {
+    match command_and_args(tokens) {
+        // No command word: `RUN <<EOF` runs the body; a bare nested heredoc does
+        // not.
+        None => bare_is_script,
+        // A lone shell interpreter reads the heredoc as its script — unless a
+        // `-c` flag supplies the script instead (then the heredoc is stdin data)
+        // or a non-option operand names a script file to run.
+        Some((cmd, args)) => is_shell_command(cmd) && shell_runs_stdin_script(&args),
+    }
+}
+
+/// Given a shell command's argument tokens (redirections already removed),
+/// whether the shell would run its script from stdin — i.e. from the heredoc.
+/// A `-c` flag redirects the script to that option's value, and a non-option
+/// operand names a script file; either means the heredoc is stdin data instead.
+/// Recognized options like `-e`/`-x`/`-euo` (and the word consumed by `-o`, e.g.
+/// `set -o pipefail`) do not count as operands.
+fn shell_runs_stdin_script(args: &[&str]) -> bool {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if is_command_source_flag(arg) {
+            return false; // `-c` → script comes from the option value
+        }
+        if arg.starts_with("--") {
+            continue; // long option, ignored
+        }
+        if let Some(short) = arg.strip_prefix('-') {
+            // A short-flag bundle ending in `o` consumes the next token as its
+            // setting name (`-o pipefail`, `-euo pipefail`).
+            if short.ends_with('o') {
+                it.next();
+            }
+            continue;
+        }
+        return false; // a non-option operand names a script file → stdin is data
+    }
+    true
+}
+
+/// Split opener tokens into the command word and its following argument tokens,
+/// skipping leading `--flags` and redirections (before the command) and
+/// redirections interspersed with the arguments. Returns `None` when there is no
+/// command word (only flags/redirections).
+fn command_and_args<'a>(tokens: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
         if tok.starts_with("--") {
             i += 1;
             continue;
         }
         match classify_redirection(tok) {
-            // A bare operator (`>`, `2>`, `<`) takes the following token as its
-            // target, so skip both.
             Some(true) => i += 2,
-            // A redirection with an attached target (`>/f`, `2>&1`) is one token.
             Some(false) => i += 1,
-            // Any other token is a command word.
+            None => break,
+        }
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+    let cmd = tokens[i];
+    i += 1;
+    let mut args = Vec::new();
+    while i < tokens.len() {
+        let tok = tokens[i];
+        match classify_redirection(tok) {
+            Some(true) => i += 2,
+            Some(false) => i += 1,
             None => {
-                commands.push(tok);
+                args.push(tok);
                 i += 1;
             }
         }
     }
-    match commands.as_slice() {
-        [] => true,
-        [cmd] => is_shell_command(cmd),
-        _ => false,
-    }
+    Some((cmd, args))
 }
 
 /// Whether a command word is a shell that executes a heredoc fed on stdin as a
@@ -335,6 +403,13 @@ fn run_heredoc_is_script(opener: &str) -> bool {
 fn is_shell_command(word: &str) -> bool {
     let base = word.rsplit('/').next().unwrap_or(word);
     matches!(base, "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh")
+}
+
+/// Whether a shell argument is a `-c` option (possibly bundled, e.g. `-xc`),
+/// which makes the shell take its script from that option's value rather than
+/// from the heredoc on stdin.
+fn is_command_source_flag(arg: &str) -> bool {
+    arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')
 }
 
 /// Classify a token as a shell redirection. Returns `Some(true)` for a bare
@@ -386,7 +461,7 @@ fn consume_heredoc(
         body.push(raw);
     }
 
-    if fold_body {
+    if fold_body && !body_has_non_shell_shebang(&body) {
         // Fold the heredoc body into the shell command so the RUN heuristics
         // (package/service detection) can see installs inside the heredoc. The
         // body is itself a shell script, so process its own continuations,
@@ -427,9 +502,18 @@ fn fold_script_body(body: &[&str]) -> String {
         let line = body[i];
         i += 1;
 
-        // A whole-line comment is a shell no-op; skip it without ending an
-        // in-progress backslash continuation (mirrors `merge_continuation_lines`).
+        // A whole-line `#` comment is a shell no-op.
         if line.trim_start().starts_with('#') {
+            if in_continuation {
+                // In shell, the preceding `\`-newline already joined this line
+                // onto the command, so the `#` comments out the remainder: the
+                // command ends with what was accumulated so far. Finalize it and
+                // drop the dangling continuation rather than joining the next
+                // line across the comment.
+                in_continuation = false;
+                let logical = std::mem::take(&mut current);
+                i = push_script_command(&mut commands, logical, body, i);
+            }
             continue;
         }
         let trimmed = line.trim_end();
@@ -470,9 +554,11 @@ fn fold_script_body(body: &[&str]) -> String {
 }
 
 /// Record one logical command line from a folded heredoc body. If the line opens
-/// its own (nested) heredocs, consume their payloads from `body` (they are data,
-/// not executed) and record only the opener with the markers removed. Returns the
-/// body index to continue scanning from.
+/// its own (nested) heredocs, consume their bodies from `body`: an executable
+/// nested heredoc (bare or a shell interpreter, e.g. `sh <<INNER`) is folded
+/// recursively so its installs are kept, while a data nested heredoc (`cat
+/// <<INNER > /f`) has its payload dropped. Returns the body index to continue
+/// scanning from.
 fn push_script_command(
     commands: &mut Vec<String>,
     logical: String,
@@ -489,8 +575,9 @@ fn push_script_command(
         return i;
     }
 
-    // Skip the nested heredoc payloads (file content / data) up to each
-    // terminator, in declaration order.
+    // Collect the nested heredoc bodies up to each terminator, in declaration
+    // order.
+    let mut inner_body: Vec<&str> = Vec::new();
     let mut pos = 0;
     while i < body.len() && pos < inner.len() {
         let raw = body[i];
@@ -502,11 +589,55 @@ fn push_script_command(
         };
         if candidate == inner[pos].delim {
             pos += 1;
+        } else {
+            inner_body.push(raw);
         }
     }
 
     commands.push(stripped.trim().to_string());
+
+    // A nested heredoc that feeds a shell (or is bare) executes its body; fold it
+    // recursively so its installs are detected. A data nested heredoc's payload
+    // is file content and is dropped. A nested bare heredoc has no command, so it
+    // is a no-op and its body is data (hence `bare_is_script = false`).
+    let inner_tokens: Vec<&str> = stripped.split_whitespace().collect();
+    if heredoc_body_is_script(&inner_tokens, false) {
+        let folded = fold_script_body(&inner_body);
+        if !folded.is_empty() {
+            commands.push(folded);
+        }
+    }
+
     i
+}
+
+/// Whether the first non-blank line of a bare `RUN <<EOF` body is a shebang for a
+/// non-shell interpreter (e.g. `#!/usr/bin/env python3`). BuildKit runs such a
+/// body with that interpreter, so it is program source, not shell, and must not
+/// be scanned for installs.
+fn body_has_non_shell_shebang(body: &[&str]) -> bool {
+    for line in body {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("#!") else {
+            return false; // first content line is not a shebang
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(first) = parts.next() else {
+            return false;
+        };
+        // `#!/usr/bin/env python3` → the interpreter is the argument to `env`.
+        let interp = if first.rsplit('/').next() == Some("env") {
+            parts.next().unwrap_or("")
+        } else {
+            first
+        };
+        let base = interp.rsplit('/').next().unwrap_or(interp);
+        return !base.is_empty() && !is_shell_command(base);
+    }
+    false
 }
 
 /// Parse raw instructions from merged lines.
@@ -1845,6 +1976,142 @@ EOF
         assert!(
             !runs[0].contains("apk add"),
             "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_run_shell_interpreter_with_options_is_folded() {
+        // A shell with only option flags still runs the heredoc body as its
+        // script (`bash -euo pipefail <<EOF` is a common idiom), so installs must
+        // be detected.
+        for opener in ["bash -euo pipefail", "bash -x", "sh -e"] {
+            let content =
+                format!("FROM alpine\nRUN {opener} <<EOF\napk add --no-cache nginx\nEOF\n");
+            let runs = run_commands(&content);
+            assert_eq!(runs.len(), 1, "opener `{opener}`: one RUN expected");
+            assert!(
+                runs[0].contains("apk add --no-cache nginx"),
+                "opener `{opener}`: shell-with-options heredoc body was not folded: {}",
+                runs[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_opener_shell_comment_disables_heredoc_detection() {
+        // An unquoted `#` on the opener begins a shell comment, so a following
+        // `<<EOF` is not a heredoc and must not swallow the rest of the file.
+        let content = "\
+FROM alpine
+RUN echo ok # mention <<EOF here
+RUN apk add --no-cache nginx
+EXPOSE 80
+CMD [\"true\"]
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(
+            runs.len(),
+            2,
+            "commented `<<EOF` wrongly swallowed later lines"
+        );
+        assert!(runs[1].contains("apk add --no-cache nginx"));
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Cmd(_))));
+    }
+
+    #[test]
+    fn test_non_shell_shebang_body_is_not_scanned() {
+        // A bare `RUN <<EOF` whose first body line is a non-shell shebang is run
+        // by that interpreter; the body is program source, not shell, and must
+        // not be scanned for installs.
+        let content = "\
+FROM alpine
+RUN <<EOF
+#!/usr/bin/env python3
+subprocess.run('apt-get install -y ghost-package')
+print('nginx')
+EOF
+EXPOSE 80
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apt-get") && !runs[0].contains("ghost"),
+            "python heredoc body (non-shell shebang) was folded into the command: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_shell_shebang_body_is_folded() {
+        // A shell shebang keeps the body as a script, so installs are detected.
+        let content = "\
+FROM alpine
+RUN <<EOF
+#!/bin/bash
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "shell-shebang heredoc body was not folded: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_nested_shell_heredoc_payload_is_scanned() {
+        // A nested heredoc feeding a shell (`bash <<INNER`) is executable, so its
+        // installs must be detected (unlike a data heredoc, whose payload is
+        // dropped).
+        let content = "\
+FROM alpine
+RUN <<OUTER
+echo start
+bash <<INNER
+apk add --no-cache nginx
+INNER
+echo done
+OUTER
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "nested shell heredoc install was dropped: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_body_comment_after_continuation_terminates_command() {
+        // In shell, a `\`-continued line joins onto the next physical line, but a
+        // whole-line `#` there comments out the remainder. The command must end
+        // at the accumulated text, so `nginx` is a separate command and no
+        // `apk add nginx` package is fabricated.
+        let content = "\
+FROM alpine
+RUN <<EOF
+apk add \\
+# commented out
+nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apk add nginx") && !runs[0].contains("apk add --no-cache nginx"),
+            "continuation joined across a comment, fabricating a package: {}",
             runs[0]
         );
     }
