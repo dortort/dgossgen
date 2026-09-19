@@ -15,6 +15,18 @@ struct Heredoc {
     /// terminator line (and, in Docker, from the body — irrelevant to our
     /// textual scan).
     strip_tabs: bool,
+    /// The file descriptor the heredoc targets (`3<<EOF` → `Some(3)`), or `None`
+    /// when unprefixed. Only an unprefixed or fd-0 heredoc supplies the command's
+    /// stdin, and thus a shell's script.
+    fd: Option<u32>,
+}
+
+impl Heredoc {
+    /// Whether this heredoc feeds the command's standard input (and so a shell's
+    /// script): unprefixed or explicitly fd 0.
+    fn is_stdin(&self) -> bool {
+        self.fd.is_none_or(|fd| fd == 0)
+    }
 }
 
 /// Parse a Dockerfile from a file path into a list of stages.
@@ -218,13 +230,17 @@ fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
 
         if prev_boundary {
             // A heredoc redirection may carry an optional leading file-descriptor
-            // (`0<<EOF`, `1<<EOF`); skip those digits before matching `<<`.
+            // (`0<<EOF`, `3<<EOF`); capture those digits before matching `<<`.
             let mut m = i;
             while m < n && chars[m].is_ascii_digit() {
                 m += 1;
             }
             if m + 1 < n && chars[m] == '<' && chars[m + 1] == '<' {
-                if let Some((heredoc, next)) = parse_heredoc_marker(&chars, m) {
+                if let Some((mut heredoc, next)) = parse_heredoc_marker(&chars, m) {
+                    if m > i {
+                        let fd: String = chars[i..m].iter().collect();
+                        heredoc.fd = fd.parse::<u32>().ok();
+                    }
                     heredocs.push(heredoc);
                     // Drop the fd prefix and the marker from the stripped opener.
                     prev_boundary = false;
@@ -271,7 +287,14 @@ fn parse_heredoc_marker(chars: &[char], start: usize) -> Option<(Heredoc, usize)
         if delim.is_empty() {
             return None;
         }
-        return Some((Heredoc { delim, strip_tabs }, j));
+        return Some((
+            Heredoc {
+                delim,
+                strip_tabs,
+                fd: None,
+            },
+            j,
+        ));
     }
 
     // Unquoted delimiter: BuildKit delimiters are ordinary shell words and may
@@ -288,7 +311,14 @@ fn parse_heredoc_marker(chars: &[char], start: usize) -> Option<(Heredoc, usize)
     }
     let delim: String = chars[word_start..j].iter().collect();
 
-    Some((Heredoc { delim, strip_tabs }, j))
+    Some((
+        Heredoc {
+            delim,
+            strip_tabs,
+            fd: None,
+        },
+        j,
+    ))
 }
 
 /// Characters allowed after the first in an unquoted heredoc delimiter: anything
@@ -322,13 +352,49 @@ fn run_heredoc_is_script(opener: &str) -> bool {
 /// stdin, so its body is data.
 fn heredoc_body_is_script(tokens: &[&str], bare_is_script: bool) -> bool {
     match command_and_args(tokens) {
-        // No command word: `RUN <<EOF` runs the body; a bare nested heredoc does
-        // not.
-        None => bare_is_script,
-        // A lone shell interpreter reads the heredoc as its script — unless a
-        // `-c` flag supplies the script instead (then the heredoc is stdin data)
-        // or a non-option operand names a script file to run.
+        // No command word. `RUN <<EOF` runs the body, but an assignment-only null
+        // command (`RUN FOO=bar <<EOF`) does not execute its stdin, so its body is
+        // data.
+        None => bare_is_script && !leading_assignment(tokens),
+        // A lone shell interpreter (optionally with an env-assignment prefix)
+        // reads the heredoc as its script — unless a `-c` flag supplies the script
+        // instead (then the heredoc is stdin data) or a non-option operand names a
+        // script file to run.
         Some((cmd, args)) => is_shell_command(cmd) && shell_runs_stdin_script(&args),
+    }
+}
+
+/// Whether the first command-position token (after any leading flags and
+/// redirections) is a `VAR=value` environment assignment.
+fn leading_assignment(tokens: &[&str]) -> bool {
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if tok.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        match classify_redirection(tok) {
+            Some(true) => i += 2,
+            Some(false) => i += 1,
+            None => return is_env_assignment(tok),
+        }
+    }
+    false
+}
+
+/// Whether a token is a `NAME=value` shell environment assignment.
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
     }
 }
 
@@ -366,9 +432,11 @@ fn shell_runs_stdin_script(args: &[&str]) -> bool {
 /// command word (only flags/redirections).
 fn command_and_args<'a>(tokens: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
     let mut i = 0;
+    // Skip leading `--flags`, redirections, and `VAR=value` env-assignment
+    // prefixes to reach the actual command word.
     while i < tokens.len() {
         let tok = tokens[i];
-        if tok.starts_with("--") {
+        if tok.starts_with("--") || is_env_assignment(tok) {
             i += 1;
             continue;
         }
@@ -437,14 +505,45 @@ fn consume_heredoc(
     lines: &[&str],
     start_idx: usize,
 ) -> (String, usize) {
+    let (bodies, idx) = collect_heredoc_bodies(&heredocs, lines, start_idx);
+
+    if fold_body {
+        // Fold only the heredoc that supplies the command's stdin (the last
+        // unprefixed/fd-0 one — later redirections win) so the RUN heuristics see
+        // installs inside the executed script. Other heredocs (fd 3, shadowed
+        // duplicates) are data and are dropped.
+        if let Some(body) = stdin_heredoc_body(&heredocs, &bodies) {
+            if !body_has_non_shell_shebang(body) {
+                let body_joined = fold_script_body(body);
+                if !body_joined.is_empty() {
+                    return (format!("{} {}", opener, body_joined), idx);
+                }
+            }
+        }
+        (opener.to_string(), idx)
+    } else {
+        // COPY/ADD bodies (file content) and command-fed RUN bodies (file
+        // content or program source) are not shell. Drop every body (it must not
+        // leak into the instruction stream) and keep only the opener so a COPY
+        // destination still yields a FileExists assertion.
+        (opener.to_string(), idx)
+    }
+}
+
+/// Collect one physical body per heredoc, in declaration order, from `lines`
+/// starting at `start_idx`. Returns the per-heredoc bodies and the index of the
+/// first line after the last consumed body. A plain `<<EOF` terminator must match
+/// the line exactly; only the `<<-EOF` form permits leading tabs to be stripped,
+/// so an indented `EOF` inside a plain heredoc body does not close it early.
+fn collect_heredoc_bodies<'a>(
+    heredocs: &[Heredoc],
+    lines: &[&'a str],
+    start_idx: usize,
+) -> (Vec<Vec<&'a str>>, usize) {
     let mut idx = start_idx;
-    let mut body: Vec<&str> = Vec::new();
+    let mut bodies: Vec<Vec<&str>> = heredocs.iter().map(|_| Vec::new()).collect();
     let mut delim_pos = 0;
 
-    // Delimiters terminate in declaration order. A plain `<<EOF` terminator must
-    // match the line exactly; only the `<<-EOF` form permits leading tabs to be
-    // stripped, so an indented `EOF` inside a plain heredoc body does not close
-    // it early.
     while idx < lines.len() && delim_pos < heredocs.len() {
         let raw = lines[idx];
         idx += 1;
@@ -458,28 +557,23 @@ fn consume_heredoc(
             delim_pos += 1;
             continue;
         }
-        body.push(raw);
+        bodies[delim_pos].push(raw);
     }
 
-    if fold_body && !body_has_non_shell_shebang(&body) {
-        // Fold the heredoc body into the shell command so the RUN heuristics
-        // (package/service detection) can see installs inside the heredoc. The
-        // body is itself a shell script, so process its own continuations,
-        // comments, and nested heredocs, then join the resulting commands with
-        // ` && ` — a shell separator the install regexes recognize.
-        let body_joined = fold_script_body(&body);
-        if body_joined.is_empty() {
-            (opener.to_string(), idx)
-        } else {
-            (format!("{} {}", opener, body_joined), idx)
-        }
-    } else {
-        // COPY/ADD bodies (file content) and command-fed RUN bodies (file
-        // content or program source) are not shell. Drop the body (it must not
-        // leak into the instruction stream) and keep only the opener so a COPY
-        // destination still yields a FileExists assertion.
-        (opener.to_string(), idx)
-    }
+    (bodies, idx)
+}
+
+/// The body of the heredoc that supplies the command's stdin — the last
+/// unprefixed or fd-0 heredoc, since later redirections to a descriptor win.
+/// Returns `None` when no heredoc targets stdin (e.g. only `3<<EOF`).
+fn stdin_heredoc_body<'a>(
+    heredocs: &[Heredoc],
+    bodies: &'a [Vec<&'a str>],
+) -> Option<&'a [&'a str]> {
+    heredocs
+        .iter()
+        .rposition(Heredoc::is_stdin)
+        .map(|k| bodies[k].as_slice())
 }
 
 /// Fold a shell-script heredoc body into a single ` && `-joined command string
@@ -575,36 +669,25 @@ fn push_script_command(
         return i;
     }
 
-    // Collect the nested heredoc bodies up to each terminator, in declaration
-    // order.
-    let mut inner_body: Vec<&str> = Vec::new();
-    let mut pos = 0;
-    while i < body.len() && pos < inner.len() {
-        let raw = body[i];
-        i += 1;
-        let candidate = if inner[pos].strip_tabs {
-            raw.trim_start_matches('\t')
-        } else {
-            raw
-        };
-        if candidate == inner[pos].delim {
-            pos += 1;
-        } else {
-            inner_body.push(raw);
-        }
-    }
+    // Collect one body per nested heredoc, in declaration order.
+    let (inner_bodies, next) = collect_heredoc_bodies(&inner, body, i);
+    i = next;
 
     commands.push(stripped.trim().to_string());
 
-    // A nested heredoc that feeds a shell (or is bare) executes its body; fold it
-    // recursively so its installs are detected. A data nested heredoc's payload
-    // is file content and is dropped. A nested bare heredoc has no command, so it
-    // is a no-op and its body is data (hence `bare_is_script = false`).
+    // A nested heredoc feeding a shell executes its stdin body; fold that one
+    // recursively so its installs are detected. A data nested heredoc (`cat
+    // <<INNER > /f`) and a nested bare heredoc (a no-op, hence `bare_is_script =
+    // false`) have their payloads dropped.
     let inner_tokens: Vec<&str> = stripped.split_whitespace().collect();
     if heredoc_body_is_script(&inner_tokens, false) {
-        let folded = fold_script_body(&inner_body);
-        if !folded.is_empty() {
-            commands.push(folded);
+        if let Some(stdin_body) = stdin_heredoc_body(&inner, &inner_bodies) {
+            if !body_has_non_shell_shebang(stdin_body) {
+                let folded = fold_script_body(stdin_body);
+                if !folded.is_empty() {
+                    commands.push(folded);
+                }
+            }
         }
     }
 
@@ -1976,6 +2059,89 @@ EOF
         assert!(
             !runs[0].contains("apk add"),
             "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_run_env_assignment_prefix_before_shell_is_folded() {
+        // `RUN DEBIAN_FRONTEND=noninteractive bash <<EOF` runs the body as bash's
+        // script; the assignment prefix must not be mistaken for the command.
+        let content = "\
+FROM alpine
+RUN DEBIAN_FRONTEND=noninteractive bash <<EOF
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "assignment-prefixed shell heredoc body was not folded: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_run_env_assignment_only_heredoc_is_data() {
+        // `RUN FOO=bar <<EOF` is an assignment-only null command; it does not
+        // execute the heredoc, so the body is data and must not be scanned.
+        let content = "\
+FROM alpine
+RUN FOO=bar <<EOF
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apk add"),
+            "assignment-only heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_heredoc_on_nonzero_fd_is_not_shell_script() {
+        // `RUN bash 3<<EOF` puts the heredoc on fd 3, not stdin, so bash does not
+        // run it as its script; the body is data.
+        let content = "\
+FROM alpine
+RUN bash 3<<EOF
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apk add"),
+            "fd-3 heredoc body must not be folded as the shell script: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_multiple_stdin_heredocs_last_one_wins() {
+        // With `bash <<IGNORED <<SCRIPT`, later redirections win, so only SCRIPT
+        // becomes bash's stdin; the shadowed IGNORED payload is not executed.
+        let content = "\
+FROM alpine
+RUN bash <<IGNORED <<SCRIPT
+apt-get install -y ghost-package
+IGNORED
+apk add --no-cache nginx
+SCRIPT
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "the stdin heredoc (SCRIPT) install was lost: {}",
+            runs[0]
+        );
+        assert!(
+            !runs[0].contains("ghost-package"),
+            "the shadowed heredoc (IGNORED) payload was scanned: {}",
             runs[0]
         );
     }
