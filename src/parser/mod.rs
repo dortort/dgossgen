@@ -175,6 +175,7 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
     let mut in_single = false;
     let mut in_double = false;
     let mut prev_boundary = true; // start of line is a boundary
+    let mut arith_depth: usize = 0; // depth of `$((`/`((` arithmetic expansion
     let mut i = 0;
 
     while i < n {
@@ -232,7 +233,27 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
             continue;
         }
 
-        if shell_comments && c == '#' && prev_boundary {
+        // `$((`/`((` open an arithmetic-expansion context, where `<<` is a left
+        // shift, not a heredoc; `))` closes it. Detection is suppressed while
+        // inside, so `$(( 1 <<BITS ))` is not mistaken for a heredoc.
+        if c == '(' && i + 1 < n && chars[i + 1] == '(' {
+            arith_depth += 1;
+            stripped.push(c);
+            stripped.push(chars[i + 1]);
+            prev_boundary = true;
+            i += 2;
+            continue;
+        }
+        if arith_depth > 0 && c == ')' && i + 1 < n && chars[i + 1] == ')' {
+            arith_depth -= 1;
+            stripped.push(c);
+            stripped.push(chars[i + 1]);
+            prev_boundary = true;
+            i += 2;
+            continue;
+        }
+
+        if arith_depth == 0 && shell_comments && c == '#' && prev_boundary {
             // In a shell command (`RUN`), an unquoted `#` at a token boundary
             // begins a comment; the rest of the line (including any `<<WORD`) is
             // not executed, so no heredoc can be opened there. Keep the text but
@@ -242,7 +263,7 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
             break;
         }
 
-        if prev_boundary {
+        if arith_depth == 0 && prev_boundary {
             // A heredoc redirection may carry an optional leading file-descriptor
             // (`0<<EOF`, `3<<EOF`); capture those digits before matching `<<`.
             let mut m = i;
@@ -2812,6 +2833,35 @@ EXPOSE 80
             .instructions
             .iter()
             .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_arithmetic_shift_with_variable_operand_is_not_heredoc() {
+        // `$((1 <<BITS))` is an arithmetic left shift by a variable, not a
+        // heredoc, even though `BITS` immediately follows `<<`. Arithmetic
+        // context suppresses heredoc detection, so nothing after is consumed.
+        let content = "\
+FROM alpine
+RUN echo $((1 <<BITS))
+EXPOSE 80
+CMD [\"true\"]
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("1 <<BITS"),
+            "arithmetic shift text was altered: {}",
+            runs[0]
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Cmd(_))));
     }
 
     #[test]
