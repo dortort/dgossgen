@@ -136,7 +136,9 @@ fn heredoc_openers(line: &str) -> Option<(Vec<Heredoc>, String, bool)> {
         return None;
     }
 
-    let (heredocs, stripped) = scan_heredocs(line);
+    // Only `RUN` runs a shell, so an unquoted `#` is a comment only there; for
+    // `COPY`/`ADD` a `#`-prefixed token is a literal source path.
+    let (heredocs, stripped) = scan_heredocs(line, keyword == "RUN");
     if heredocs.is_empty() {
         return None;
     }
@@ -165,7 +167,7 @@ fn heredoc_openers(line: &str) -> Option<(Vec<Heredoc>, String, bool)> {
 /// only treated as a redirection when it sits at a token boundary (start of line
 /// or after whitespace) and the delimiter word immediately follows, so shell
 /// arithmetic like `$(( 1 << 2 ))` is not matched.
-fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
+fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut heredocs = Vec::new();
@@ -220,10 +222,12 @@ fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
             continue;
         }
 
-        if c == '#' && prev_boundary {
-            // An unquoted `#` at a token boundary begins a shell comment; the
-            // rest of the line (including any `<<WORD`) is not executed, so no
-            // heredoc can be opened there. Keep the text but stop scanning.
+        if shell_comments && c == '#' && prev_boundary {
+            // In a shell command (`RUN`), an unquoted `#` at a token boundary
+            // begins a comment; the rest of the line (including any `<<WORD`) is
+            // not executed, so no heredoc can be opened there. Keep the text but
+            // stop scanning. `COPY`/`ADD` do not run a shell, so a `#`-prefixed
+            // token there is a literal source path, not a comment.
             stripped.extend(chars[i..].iter());
             break;
         }
@@ -256,6 +260,44 @@ fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
     }
 
     (heredocs, stripped)
+}
+
+/// Return `line` truncated before an unquoted `#` shell comment. The `#` starts a
+/// comment only at a token boundary (start of line or after whitespace) and
+/// outside single/double quotes, so `echo "a#b"` and `url#frag` are preserved
+/// while `echo ok # note` loses its comment.
+fn strip_inline_shell_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_boundary = true;
+    let mut escaped_in_double = false;
+
+    for (idx, c) in line.char_indices() {
+        if in_single {
+            in_single = c != '\'';
+            prev_boundary = false;
+        } else if in_double {
+            if escaped_in_double {
+                escaped_in_double = false;
+            } else if c == '\\' {
+                escaped_in_double = true;
+            } else if c == '"' {
+                in_double = false;
+            }
+            prev_boundary = false;
+        } else if c == '\'' {
+            in_single = true;
+            prev_boundary = false;
+        } else if c == '"' {
+            in_double = true;
+            prev_boundary = false;
+        } else if c == '#' && prev_boundary {
+            return &line[..idx];
+        } else {
+            prev_boundary = c.is_whitespace();
+        }
+    }
+    line
 }
 
 /// Parse a heredoc marker starting at `start` (which points at the first `<`).
@@ -414,6 +456,11 @@ fn shell_runs_stdin_script(args: &[&str]) -> bool {
             continue; // long option, ignored
         }
         if let Some(short) = arg.strip_prefix('-') {
+            // `-s` forces the script to be read from stdin (the heredoc); any
+            // following non-option tokens are positional parameters, not a file.
+            if short.contains('s') {
+                return true;
+            }
             // A short-flag bundle ending in `o` consumes the next token as its
             // setting name (`-o pipefail`, `-euo pipefail`).
             if short.ends_with('o') {
@@ -581,8 +628,8 @@ fn stdin_heredoc_body<'a>(
 ///
 /// - joins its own backslash line-continuations (otherwise `apk add \` / `nginx`
 ///   folds to `apk add \ && nginx`, capturing a bogus package named `\`);
-/// - skips whole-line `#` comments (shell no-ops), matching top-level handling,
-///   so commented-out installs do not fabricate evidence;
+/// - strips `#` shell comments — whole-line and inline (`echo ok # note`),
+///   quote-aware — so commented-out text does not fabricate evidence;
 /// - recognizes nested heredocs (`cat <<INNER > /f`) and drops their payloads —
 ///   that content is data written to a file, not executed — while keeping the
 ///   surrounding executable lines.
@@ -596,21 +643,21 @@ fn fold_script_body(body: &[&str]) -> String {
         let line = body[i];
         i += 1;
 
-        // A whole-line `#` comment is a shell no-op.
-        if line.trim_start().starts_with('#') {
+        // Remove any `#` shell comment (whole-line or inline) before processing.
+        let uncommented = strip_inline_shell_comment(line);
+        let trimmed = uncommented.trim_end();
+
+        if trimmed.trim_start().is_empty() {
+            // A blank or comment-only line. If a continuation was open, the `\`
+            // already joined onto this line and the `#`/blank ends the command,
+            // so finalize what was accumulated rather than joining across it.
             if in_continuation {
-                // In shell, the preceding `\`-newline already joined this line
-                // onto the command, so the `#` comments out the remainder: the
-                // command ends with what was accumulated so far. Finalize it and
-                // drop the dangling continuation rather than joining the next
-                // line across the comment.
                 in_continuation = false;
                 let logical = std::mem::take(&mut current);
                 i = push_script_command(&mut commands, logical, body, i);
             }
             continue;
         }
-        let trimmed = line.trim_end();
 
         if let Some(without_backslash) = trimmed.strip_suffix('\\') {
             if in_continuation {
@@ -663,7 +710,7 @@ fn push_script_command(
         return i;
     }
 
-    let (inner, stripped) = scan_heredocs(&logical);
+    let (inner, stripped) = scan_heredocs(&logical, true);
     if inner.is_empty() {
         commands.push(logical);
         return i;
@@ -694,33 +741,30 @@ fn push_script_command(
     i
 }
 
-/// Whether the first non-blank line of a bare `RUN <<EOF` body is a shebang for a
+/// Whether the very first line of a bare `RUN <<EOF` body is a shebang for a
 /// non-shell interpreter (e.g. `#!/usr/bin/env python3`). BuildKit runs such a
 /// body with that interpreter, so it is program source, not shell, and must not
-/// be scanned for installs.
+/// be scanned for installs. A shebang is only honored on the first line: a blank
+/// or any other content before it makes it an ordinary comment.
 fn body_has_non_shell_shebang(body: &[&str]) -> bool {
-    for line in body {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix("#!") else {
-            return false; // first content line is not a shebang
-        };
-        let mut parts = rest.split_whitespace();
-        let Some(first) = parts.next() else {
-            return false;
-        };
-        // `#!/usr/bin/env python3` → the interpreter is the argument to `env`.
-        let interp = if first.rsplit('/').next() == Some("env") {
-            parts.next().unwrap_or("")
-        } else {
-            first
-        };
-        let base = interp.rsplit('/').next().unwrap_or(interp);
-        return !base.is_empty() && !is_shell_command(base);
-    }
-    false
+    let Some(first_line) = body.first() else {
+        return false;
+    };
+    let Some(rest) = first_line.strip_prefix("#!") else {
+        return false; // the body does not start with a shebang
+    };
+    let mut parts = rest.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    // `#!/usr/bin/env python3` → the interpreter is the argument to `env`.
+    let interp = if first.rsplit('/').next() == Some("env") {
+        parts.next().unwrap_or("")
+    } else {
+        first
+    };
+    let base = interp.rsplit('/').next().unwrap_or(interp);
+    !base.is_empty() && !is_shell_command(base)
 }
 
 /// Parse raw instructions from merged lines.
@@ -2059,6 +2103,98 @@ EOF
         assert!(
             !runs[0].contains("apk add"),
             "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_copy_heredoc_hash_source_is_not_a_comment() {
+        // `COPY` does not run a shell, so a `#`-prefixed token is a literal source
+        // path, not a comment; the following heredoc must still be detected and
+        // its body must not leak as instructions.
+        let content = "\
+FROM alpine
+COPY #defaults <<CONF /etc/app/
+user nginx;
+CONF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "COPY heredoc after a `#`-prefixed source leaked a phantom USER"
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_run_heredoc_body_inline_comment_is_stripped() {
+        // An inline `#` in a folded body is a shell comment; text after it must
+        // not be scanned for installs.
+        let content = "\
+FROM alpine
+RUN <<EOF
+echo ok # apt-get install -y ghost-package
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "real install lost: {}",
+            runs[0]
+        );
+        assert!(
+            !runs[0].contains("ghost-package") && !runs[0].contains("apt-get"),
+            "inline-commented text was folded into the command: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_run_shell_dash_s_heredoc_is_folded() {
+        // `bash -s release <<EOF` reads the script from stdin (the heredoc) and
+        // treats `release` as a positional argument, so installs must be detected.
+        let content = "\
+FROM alpine
+RUN bash -s release <<EOF
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "`bash -s` stdin-script heredoc body was not folded: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_blank_line_before_shebang_is_treated_as_shell() {
+        // A shebang is only honored on the very first line; a leading blank line
+        // makes it an ordinary comment, so the body runs as shell and installs are
+        // detected.
+        let content = "\
+FROM alpine
+RUN <<EOF
+
+#!/usr/bin/env python3
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "body with a non-first-line shebang should fold as shell: {}",
             runs[0]
         );
     }
