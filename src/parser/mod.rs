@@ -256,10 +256,11 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
         if arith_depth == 0 && shell_comments && c == '#' && prev_boundary {
             // In a shell command (`RUN`), an unquoted `#` at a token boundary
             // begins a comment; the rest of the line (including any `<<WORD`) is
-            // not executed, so no heredoc can be opened there. Keep the text but
-            // stop scanning. `COPY`/`ADD` do not run a shell, so a `#`-prefixed
-            // token there is a literal source path, not a comment.
-            stripped.extend(chars[i..].iter());
+            // not executed, so no heredoc can be opened there. Drop the comment
+            // so it is neither scanned nor mistaken for a command operand when
+            // classifying the opener (`RUN bash <<EOF # note` stays a shell
+            // script). `COPY`/`ADD` do not run a shell, so a `#`-prefixed token
+            // there is a literal source path, not a comment.
             break;
         }
 
@@ -2267,6 +2268,25 @@ OUTER
         assert!(
             runs[0].contains("apk add --no-cache nginx"),
             "nested explicit-shell heredoc body was dropped over a shebang: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_trailing_comment_on_shell_heredoc_opener_is_folded() {
+        // A trailing `#` comment on the opener (`RUN bash <<EOF # note`) must not
+        // be mistaken for a command operand; the heredoc still folds as a script.
+        let content = "\
+FROM alpine
+RUN bash <<EOF # install deps
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "trailing comment on the opener caused the body to be dropped: {}",
             runs[0]
         );
     }
