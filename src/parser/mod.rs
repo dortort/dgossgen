@@ -255,7 +255,7 @@ fn scan_heredocs(line: &str, shell_comments: bool) -> (Vec<Heredoc>, String) {
         }
 
         stripped.push(c);
-        prev_boundary = c.is_whitespace();
+        prev_boundary = is_shell_boundary(c);
         i += 1;
     }
 
@@ -294,7 +294,7 @@ fn strip_inline_shell_comment(line: &str) -> &str {
         } else if c == '#' && prev_boundary {
             return &line[..idx];
         } else {
-            prev_boundary = c.is_whitespace();
+            prev_boundary = is_shell_boundary(c);
         }
     }
     line
@@ -501,6 +501,12 @@ fn command_and_args<'a>(tokens: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
     let mut args = Vec::new();
     while i < tokens.len() {
         let tok = tokens[i];
+        // A control operator ends this simple command; the heredoc feeds the
+        // command before it, so stop collecting its arguments here (`bash <<EOF
+        // && echo done` → command is `bash` with no operands).
+        if is_control_operator(tok) {
+            break;
+        }
         match classify_redirection(tok) {
             Some(true) => i += 2,
             Some(false) => i += 1,
@@ -511,6 +517,18 @@ fn command_and_args<'a>(tokens: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
         }
     }
     Some((cmd, args))
+}
+
+/// Whether a token is a shell control operator that separates simple commands.
+fn is_control_operator(tok: &str) -> bool {
+    matches!(tok, "&&" | "||" | "|" | "|&" | "&" | ";" | ";;")
+}
+
+/// Whether a character ends a shell token — whitespace or a control/list
+/// metacharacter — so the next `#` starts a comment and the next `<<` is a
+/// redirection at a command boundary.
+fn is_shell_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')')
 }
 
 /// Whether a command word is a shell that executes a heredoc fed on stdin as a
@@ -559,8 +577,15 @@ fn consume_heredoc(
         // unprefixed/fd-0 one — later redirections win) so the RUN heuristics see
         // installs inside the executed script. Other heredocs (fd 3, shadowed
         // duplicates) are data and are dropped.
+        // A non-shell shebang only selects the interpreter for the *bare* `RUN
+        // <<EOF` form, where BuildKit reads it. When a shell is invoked
+        // explicitly (`RUN bash <<EOF`), a leading `#!` line is just a shell
+        // comment and the body still runs as shell.
+        let opener_toks: Vec<&str> = opener.split_whitespace().collect();
+        let is_bare = command_and_args(&opener_toks[1..]).is_none();
+
         if let Some(body) = stdin_heredoc_body(&heredocs, &bodies) {
-            if !body_has_non_shell_shebang(body) {
+            if !(is_bare && body_has_non_shell_shebang(body)) {
                 let body_joined = fold_script_body(body);
                 if !body_joined.is_empty() {
                     return (format!("{} {}", opener, body_joined), idx);
@@ -2103,6 +2128,69 @@ EOF
         assert!(
             !runs[0].contains("apk add"),
             "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_opener_comment_after_control_operator_disables_heredoc() {
+        // `#` begins a shell comment after a `;` control operator (not only after
+        // whitespace), so a following `<<EOF` is not a heredoc.
+        let content = "\
+FROM alpine
+RUN echo ok;# mention <<EOF here
+RUN apk add --no-cache nginx
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        let runs = run_commands(content);
+        assert_eq!(
+            runs.len(),
+            2,
+            "commented `<<EOF` after `;` wrongly swallowed later lines"
+        );
+        assert!(runs[1].contains("apk add --no-cache nginx"));
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_explicit_shell_heredoc_ignores_shebang_line() {
+        // With an explicit shell (`RUN bash <<EOF`), a `#!` first line is just a
+        // bash comment; the body still runs as shell, so installs are detected.
+        let content = "\
+FROM alpine
+RUN bash <<EOF
+#!/usr/bin/env python3
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "explicit-shell heredoc body was dropped over a shebang comment: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_shell_heredoc_with_trailing_control_list_is_folded() {
+        // `RUN bash <<EOF && echo done`: the heredoc feeds bash's stdin and
+        // `&& echo done` is a separate command, so the body still folds.
+        let content = "\
+FROM alpine
+RUN bash <<EOF && echo done
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "heredoc body was dropped because of a trailing `&&` list: {}",
             runs[0]
         );
     }
