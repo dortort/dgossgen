@@ -382,16 +382,16 @@ fn parse_heredoc_marker(chars: &[char], start: usize) -> Option<(Heredoc, usize)
     }
 
     // Unquoted delimiter: BuildKit delimiters are ordinary shell words and may
-    // carry punctuation (e.g. `<<robots.txt`). The first character must be a
-    // letter or underscore so that shell arithmetic (`1 <<2`) is not mistaken
-    // for a heredoc; the rest runs until whitespace or a shell operator.
+    // carry punctuation or digits (e.g. `<<robots.txt`, `<<123`). Any nonempty
+    // run up to whitespace or a shell operator is accepted; arithmetic shifts
+    // (`1 << n`) are excluded earlier by the arithmetic-context tracking, so the
+    // first character no longer needs to be a letter.
     let word_start = j;
-    if !(j < n && (chars[j].is_ascii_alphabetic() || chars[j] == '_')) {
-        return None;
-    }
-    j += 1;
     while j < n && is_delim_char(chars[j]) {
         j += 1;
+    }
+    if j == word_start {
+        return None; // no delimiter word (e.g. `<<` followed by whitespace)
     }
     let delim: String = chars[word_start..j].iter().collect();
 
@@ -2190,6 +2190,31 @@ EOF
                 .iter()
                 .any(|i| matches!(i.instruction, Instruction::User(_))),
             "escaped quote hid the heredoc, leaking a phantom USER instruction"
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_heredoc_delimiter_starting_with_digit_is_recognized() {
+        // A delimiter may start with a digit (`<<123`); it must be recognized so
+        // the body is consumed rather than leaking as instructions.
+        let content = "\
+FROM alpine
+RUN cat <<123 > /tmp/x
+USER phantom
+123
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "digit-delimited heredoc body leaked a phantom USER instruction"
         );
         assert!(df.stages[0]
             .instructions
