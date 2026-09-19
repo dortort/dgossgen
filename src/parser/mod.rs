@@ -5,7 +5,22 @@ pub use ast::*;
 pub use resolver::*;
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// Matches a BuildKit heredoc redirection (`<<WORD`, `<<-WORD`, `<<"WORD"`,
+/// `<<'WORD'`). The `<<` must sit at a token boundary (start of the logical line
+/// or preceded by whitespace) and the delimiter word must immediately follow, so
+/// shell arithmetic like `$(( 1 << 2 ))` and left-shifts like `a<<b` are not
+/// mistaken for heredocs. The delimiter word is captured in group 1, 2, or 3
+/// depending on the quoting.
+static HEREDOC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:^|\s)<<-?(?:"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)'|([A-Za-z_][A-Za-z0-9_]*))"#,
+    )
+    .unwrap()
+});
 
 /// Parse a Dockerfile from a file path into a list of stages.
 pub fn parse_dockerfile(path: &Path) -> Result<Dockerfile> {
@@ -27,13 +42,19 @@ pub fn parse_dockerfile_content(content: &str) -> Result<Dockerfile> {
 /// Merge continuation lines (trailing backslash) into single logical lines,
 /// tracking the original source line number for each instruction.
 fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
+    // Indexed over physical lines so that once a logical line is finalized we can
+    // look ahead and consume any BuildKit heredoc body it opens.
+    let lines: Vec<&str> = content.lines().collect();
     let mut result = Vec::new();
     let mut current_line = String::new();
     let mut start_line_num = 0;
     let mut in_continuation = false;
+    let mut idx = 0;
 
-    for (idx, line) in content.lines().enumerate() {
+    while idx < lines.len() {
+        let line = lines[idx];
         let line_num = idx + 1; // 1-based
+        idx += 1;
         let trimmed = line.trim_end();
 
         // Strip whole-line comments before joining continuations, matching
@@ -71,18 +92,116 @@ fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
             in_continuation = false;
             let merged = current_line.trim().to_string();
             if !merged.is_empty() {
-                result.push((start_line_num, merged));
+                // If this instruction opens one or more heredocs, consume the
+                // body lines that follow so they are not re-parsed as top-level
+                // instructions, and (for RUN) fold the body into the command.
+                if let Some((delimiters, opener)) = heredoc_openers(&merged) {
+                    let (assembled, next_idx) =
+                        consume_heredoc(&opener, delimiters, &lines, idx);
+                    result.push((start_line_num, assembled));
+                    idx = next_idx;
+                } else {
+                    result.push((start_line_num, merged));
+                }
             }
             current_line.clear();
         }
     }
 
-    // Handle case where file ends with continuation
+    // Handle case where file ends with continuation. A dangling continuation has
+    // no following lines, so it cannot open a heredoc body.
     if in_continuation && !current_line.trim().is_empty() {
         result.push((start_line_num, current_line.trim().to_string()));
     }
 
     result
+}
+
+/// If the merged instruction line opens one or more BuildKit heredocs, return the
+/// ordered list of terminator delimiters and the opener with the `<<DELIM`
+/// markers removed. Only `RUN`, `COPY`, and `ADD` support heredocs, so other
+/// instructions never match. Returns `None` when the line opens no heredoc.
+fn heredoc_openers(line: &str) -> Option<(Vec<String>, String)> {
+    let keyword = line.split_whitespace().next()?.to_uppercase();
+    if !matches!(keyword.as_str(), "RUN" | "COPY" | "ADD") {
+        return None;
+    }
+
+    let mut delimiters = Vec::new();
+    for caps in HEREDOC_RE.captures_iter(line) {
+        let word = caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .expect("one delimiter alternative always matches");
+        delimiters.push(word.as_str().to_string());
+    }
+    if delimiters.is_empty() {
+        return None;
+    }
+
+    // Drop the `<<DELIM` markers and collapse the whitespace they leave behind so
+    // the remaining opener parses as an ordinary instruction (e.g. `COPY <<EOF
+    // /dest` becomes `COPY /dest`).
+    let stripped = HEREDOC_RE.replace_all(line, "");
+    let opener = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    Some((delimiters, opener))
+}
+
+/// Consume the physical body lines of a heredoc block starting at `start_idx`,
+/// stopping after the last delimiter is matched (or at end of file). Returns the
+/// assembled logical instruction line and the index of the first line after the
+/// consumed body.
+fn consume_heredoc(
+    opener: &str,
+    delimiters: Vec<String>,
+    lines: &[&str],
+    start_idx: usize,
+) -> (String, usize) {
+    let is_run = opener
+        .split_whitespace()
+        .next()
+        .is_some_and(|kw| kw.eq_ignore_ascii_case("RUN"));
+
+    let mut idx = start_idx;
+    let mut body: Vec<&str> = Vec::new();
+    let mut delim_pos = 0;
+
+    // Delimiters terminate in declaration order. A body line matches the current
+    // delimiter after trimming, which also handles the tab-stripped `<<-` form.
+    while idx < lines.len() && delim_pos < delimiters.len() {
+        let raw = lines[idx];
+        idx += 1;
+        if raw.trim() == delimiters[delim_pos] {
+            delim_pos += 1;
+            continue;
+        }
+        body.push(raw);
+    }
+
+    if is_run {
+        // Fold the heredoc body into the shell command so the RUN heuristics
+        // (package/service detection) can see installs inside the heredoc. Body
+        // lines are joined with ` && ` — a shell separator the install regexes
+        // recognize — so each command stays bounded.
+        let body_joined = body
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" && ");
+        if body_joined.is_empty() {
+            (opener.to_string(), idx)
+        } else {
+            (format!("{} {}", opener, body_joined), idx)
+        }
+    } else {
+        // COPY/ADD heredoc bodies are file content, not shell. Drop the body (it
+        // must not leak into the instruction stream) and keep only the opener so
+        // the destination still yields a FileExists assertion.
+        (opener.to_string(), idx)
+    }
 }
 
 /// Parse raw instructions from merged lines.
