@@ -181,7 +181,7 @@ flowchart TD
     G --> H[goss.yml + goss_wait.yml]
 ```
 
-1. **Dockerfile Parser**: Parses the Dockerfile into an AST, handling multi-stage builds, continuation lines, variable substitution (`$VAR`, `${VAR:-default}`), and all instruction types.
+1. **Dockerfile Parser**: Parses the Dockerfile into an AST, handling multi-stage builds, continuation lines, BuildKit heredocs (`RUN <<EOF ... EOF`, `COPY <<EOF /dest`), variable substitution (`$VAR`, `${VAR:-default}`), and all instruction types.
 
 2. **Contract Extractor**: Walks the target stage's instructions and produces a Runtime Contract Model containing:
    - Base image, workdir, user, env vars
