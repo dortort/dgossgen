@@ -389,14 +389,10 @@ fn consume_heredoc(
     if fold_body {
         // Fold the heredoc body into the shell command so the RUN heuristics
         // (package/service detection) can see installs inside the heredoc. The
-        // body is itself a shell script, so join its own backslash continuations
-        // first, then join the resulting commands with ` && ` — a shell
-        // separator the install regexes recognize — so each stays bounded.
-        let body_joined = merge_body_continuations(&body)
-            .into_iter()
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" && ");
+        // body is itself a shell script, so process its own continuations,
+        // comments, and nested heredocs, then join the resulting commands with
+        // ` && ` — a shell separator the install regexes recognize.
+        let body_joined = fold_script_body(&body);
         if body_joined.is_empty() {
             (opener.to_string(), idx)
         } else {
@@ -411,24 +407,33 @@ fn consume_heredoc(
     }
 }
 
-/// Join a heredoc body's own backslash line-continuations into logical commands,
-/// mirroring shell continuation semantics. Without this, folding with ` && `
-/// would turn `apk add \` / `nginx` into `apk add \ && nginx`, capturing a bogus
-/// package named `\` and dropping the real ones. Whole-line `#` comments are
-/// skipped (they are shell no-ops), matching how top-level comment lines are
-/// handled, so commented-out installs do not fabricate evidence.
-fn merge_body_continuations(body: &[&str]) -> Vec<String> {
-    let mut result = Vec::new();
+/// Fold a shell-script heredoc body into a single ` && `-joined command string
+/// for the RUN install heuristics. The body is a shell script, so this:
+///
+/// - joins its own backslash line-continuations (otherwise `apk add \` / `nginx`
+///   folds to `apk add \ && nginx`, capturing a bogus package named `\`);
+/// - skips whole-line `#` comments (shell no-ops), matching top-level handling,
+///   so commented-out installs do not fabricate evidence;
+/// - recognizes nested heredocs (`cat <<INNER > /f`) and drops their payloads —
+///   that content is data written to a file, not executed — while keeping the
+///   surrounding executable lines.
+fn fold_script_body(body: &[&str]) -> String {
+    let mut commands: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_continuation = false;
+    let mut i = 0;
 
-    for line in body {
+    while i < body.len() {
+        let line = body[i];
+        i += 1;
+
         // A whole-line comment is a shell no-op; skip it without ending an
         // in-progress backslash continuation (mirrors `merge_continuation_lines`).
         if line.trim_start().starts_with('#') {
             continue;
         }
         let trimmed = line.trim_end();
+
         if let Some(without_backslash) = trimmed.strip_suffix('\\') {
             if in_continuation {
                 current.push(' ');
@@ -437,23 +442,71 @@ fn merge_body_continuations(body: &[&str]) -> Vec<String> {
                 current.push_str(without_backslash.trim());
             }
             in_continuation = true;
+            continue;
+        }
+
+        if in_continuation {
+            current.push(' ');
+            current.push_str(trimmed.trim());
         } else {
-            if in_continuation {
-                current.push(' ');
-                current.push_str(trimmed.trim());
-            } else {
-                current.push_str(trimmed.trim());
-            }
-            in_continuation = false;
-            result.push(std::mem::take(&mut current));
+            current.push_str(trimmed.trim());
+        }
+        in_continuation = false;
+
+        let logical = std::mem::take(&mut current);
+        i = push_script_command(&mut commands, logical, body, i);
+    }
+
+    if in_continuation && !current.trim().is_empty() {
+        let logical = current.trim().to_string();
+        push_script_command(&mut commands, logical, body, i);
+    }
+
+    commands
+        .into_iter()
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+/// Record one logical command line from a folded heredoc body. If the line opens
+/// its own (nested) heredocs, consume their payloads from `body` (they are data,
+/// not executed) and record only the opener with the markers removed. Returns the
+/// body index to continue scanning from.
+fn push_script_command(
+    commands: &mut Vec<String>,
+    logical: String,
+    body: &[&str],
+    mut i: usize,
+) -> usize {
+    if logical.is_empty() {
+        return i;
+    }
+
+    let (inner, stripped) = scan_heredocs(&logical);
+    if inner.is_empty() {
+        commands.push(logical);
+        return i;
+    }
+
+    // Skip the nested heredoc payloads (file content / data) up to each
+    // terminator, in declaration order.
+    let mut pos = 0;
+    while i < body.len() && pos < inner.len() {
+        let raw = body[i];
+        i += 1;
+        let candidate = if inner[pos].strip_tabs {
+            raw.trim_start_matches('\t')
+        } else {
+            raw
+        };
+        if candidate == inner[pos].delim {
+            pos += 1;
         }
     }
 
-    if !current.trim().is_empty() {
-        result.push(current.trim().to_string());
-    }
-
-    result
+    commands.push(stripped.trim().to_string());
+    i
 }
 
 /// Parse raw instructions from merged lines.
@@ -1839,6 +1892,66 @@ EOF
             "double space inside a quoted redirect target was collapsed: {}",
             runs[0]
         );
+    }
+
+    #[test]
+    fn test_nested_heredoc_payload_is_not_scanned() {
+        // An executable outer `RUN <<OUTER` may contain an inner heredoc that
+        // writes a config file. The inner payload is data, not executed shell, so
+        // it must be dropped — only the surrounding executable lines are scanned.
+        let content = "\
+FROM alpine
+RUN <<OUTER
+apk add --no-cache nginx
+cat <<INNER > /etc/nginx/nginx.conf
+apt-get install -y ghost-package
+server { listen 80; }
+INNER
+nginx -t
+OUTER
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "outer executable install lost: {}",
+            runs[0]
+        );
+        assert!(
+            runs[0].contains("nginx -t"),
+            "executable line after the nested heredoc lost: {}",
+            runs[0]
+        );
+        assert!(
+            !runs[0].contains("ghost-package") && !runs[0].contains("listen 80"),
+            "nested heredoc payload leaked into the folded command: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_fd_dup_and_prefixed_heredoc_is_detected() {
+        // `RUN cat <&3 3<<EOF` combines an fd duplication and an fd-prefixed
+        // heredoc; the heredoc must still be recognized so its body is consumed.
+        let content = "\
+FROM alpine
+RUN cat <&3 3<<EOF > /f
+USER phantom
+EOF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "fd-dup + fd-prefixed heredoc body leaked a phantom USER instruction"
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
     }
 
     #[test]
