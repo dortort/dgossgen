@@ -129,10 +129,12 @@ fn heredoc_openers(line: &str) -> Option<(Vec<Heredoc>, String, bool)> {
         return None;
     }
 
-    // Collapse the whitespace left where the `<<DELIM` markers were removed so
-    // the remaining opener parses as an ordinary instruction (e.g. `COPY <<EOF
-    // /dest` becomes `COPY /dest`).
-    let opener = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Trim the opener left after the `<<DELIM` markers were removed so it parses
+    // as an ordinary instruction (e.g. `COPY <<EOF /dest` becomes `COPY /dest`).
+    // Only ends are trimmed — internal whitespace, including runs inside quoted
+    // arguments, is preserved; the downstream instruction parsers already treat
+    // runs of whitespace between tokens as a single separator.
+    let opener = stripped.trim().to_string();
 
     // The body is an executable shell script only for the bare `RUN <<DELIM`
     // form (optionally preceded by `--flags`/redirections). When a command word
@@ -206,13 +208,21 @@ fn scan_heredocs(line: &str) -> (Vec<Heredoc>, String) {
             continue;
         }
 
-        if c == '<' && prev_boundary && i + 1 < n && chars[i + 1] == '<' {
-            if let Some((heredoc, next)) = parse_heredoc_marker(&chars, i) {
-                heredocs.push(heredoc);
-                // Drop the marker from the stripped opener.
-                prev_boundary = false;
-                i = next;
-                continue;
+        if prev_boundary {
+            // A heredoc redirection may carry an optional leading file-descriptor
+            // (`0<<EOF`, `1<<EOF`); skip those digits before matching `<<`.
+            let mut m = i;
+            while m < n && chars[m].is_ascii_digit() {
+                m += 1;
+            }
+            if m + 1 < n && chars[m] == '<' && chars[m + 1] == '<' {
+                if let Some((heredoc, next)) = parse_heredoc_marker(&chars, m) {
+                    heredocs.push(heredoc);
+                    // Drop the fd prefix and the marker from the stripped opener.
+                    prev_boundary = false;
+                    i = next;
+                    continue;
+                }
             }
         }
 
@@ -279,14 +289,20 @@ fn is_delim_char(c: char) -> bool {
     !c.is_whitespace() && !matches!(c, '<' | '>' | '|' | '&' | ';' | '(' | ')' | '"' | '\'')
 }
 
-/// Whether a `RUN` heredoc opener (with the `<<DELIM` markers already removed) is
-/// the bare shell-script form, in which the heredoc body is the script to run.
-/// This holds only when no command word remains after the `RUN` keyword — just
-/// flags and redirections. When any command word is present, whether before or
-/// after the marker (`RUN cat <<EOF`, `RUN python3 <<EOF`, `RUN <<EOF cat > /f`),
-/// the body is data fed to that command, not shell.
+/// Whether a `RUN` heredoc opener (with the `<<DELIM` markers already removed)
+/// runs the heredoc body as a shell script. This holds in two cases:
+///
+/// - the bare form, where no command word remains after `RUN` (just flags and
+///   redirections), e.g. `RUN <<EOF` or `RUN --mount=... <<EOF`; and
+/// - a lone shell interpreter reading the heredoc as its script, e.g.
+///   `RUN bash <<EOF` or `RUN /bin/sh <<EOF`.
+///
+/// Any other command word — including a shell with extra arguments (`sh -c ...`)
+/// or a non-shell interpreter (`python3 <<EOF`, `cat <<EOF > /f`) — means the
+/// body is data fed to that command, not shell, and must not be scanned.
 fn run_heredoc_is_script(opener: &str) -> bool {
     let toks: Vec<&str> = opener.split_whitespace().collect();
+    let mut commands: Vec<&str> = Vec::new();
     let mut i = 1; // skip the RUN keyword
     while i < toks.len() {
         let tok = toks[i];
@@ -300,11 +316,25 @@ fn run_heredoc_is_script(opener: &str) -> bool {
             Some(true) => i += 2,
             // A redirection with an attached target (`>/f`, `2>&1`) is one token.
             Some(false) => i += 1,
-            // Any other token is a command word, so the body is data.
-            None => return false,
+            // Any other token is a command word.
+            None => {
+                commands.push(tok);
+                i += 1;
+            }
         }
     }
-    true
+    match commands.as_slice() {
+        [] => true,
+        [cmd] => is_shell_command(cmd),
+        _ => false,
+    }
+}
+
+/// Whether a command word is a shell that executes a heredoc fed on stdin as a
+/// script (matched on the basename so `/bin/sh` counts).
+fn is_shell_command(word: &str) -> bool {
+    let base = word.rsplit('/').next().unwrap_or(word);
+    matches!(base, "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh")
 }
 
 /// Classify a token as a shell redirection. Returns `Some(true)` for a bare
@@ -384,13 +414,20 @@ fn consume_heredoc(
 /// Join a heredoc body's own backslash line-continuations into logical commands,
 /// mirroring shell continuation semantics. Without this, folding with ` && `
 /// would turn `apk add \` / `nginx` into `apk add \ && nginx`, capturing a bogus
-/// package named `\` and dropping the real ones.
+/// package named `\` and dropping the real ones. Whole-line `#` comments are
+/// skipped (they are shell no-ops), matching how top-level comment lines are
+/// handled, so commented-out installs do not fabricate evidence.
 fn merge_body_continuations(body: &[&str]) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut in_continuation = false;
 
     for line in body {
+        // A whole-line comment is a shell no-op; skip it without ending an
+        // in-progress backslash continuation (mirrors `merge_continuation_lines`).
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
         let trimmed = line.trim_end();
         if let Some(without_backslash) = trimmed.strip_suffix('\\') {
             if in_continuation {
@@ -1716,6 +1753,113 @@ EXPOSE 80
             !runs[0].contains("apt-get"),
             "interpreter heredoc body was folded into the shell command: {}",
             runs[0]
+        );
+        assert!(df.stages[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i.instruction, Instruction::Expose(_))));
+    }
+
+    #[test]
+    fn test_run_shell_interpreter_heredoc_body_is_folded() {
+        // A lone shell interpreter reads the heredoc as its script, so installs
+        // in the body are real and must be detected.
+        for interp in ["bash", "sh", "/bin/sh", "dash"] {
+            let content =
+                format!("FROM alpine\nRUN {interp} <<EOF\napk add --no-cache nginx\nEOF\n");
+            let runs = run_commands(&content);
+            assert_eq!(runs.len(), 1, "interp {interp}: one RUN expected");
+            assert!(
+                runs[0].contains("apk add --no-cache nginx"),
+                "interp {interp}: shell heredoc body was not folded: {}",
+                runs[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_shell_interpreter_with_args_heredoc_is_data() {
+        // `sh -c '...'` runs the -c command; the heredoc is stdin to it (data),
+        // so the body must not be folded.
+        let content = "\
+FROM alpine
+RUN sh -c 'echo hi' <<EOF
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].contains("apk add"),
+            "`sh -c` heredoc body must be treated as data: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_run_heredoc_body_comment_lines_are_stripped() {
+        // A whole-line `#` comment inside a folded heredoc body is a shell
+        // comment (a no-op) and must not be folded into the command, or it
+        // fabricates a package from commented-out text.
+        let content = "\
+FROM alpine
+RUN <<EOF
+# apt-get install -y evilpkg
+apk add --no-cache nginx
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("apk add --no-cache nginx"),
+            "real install lost: {}",
+            runs[0]
+        );
+        assert!(
+            !runs[0].contains("evilpkg"),
+            "commented-out install leaked into the folded command: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_data_heredoc_opener_preserves_quoted_spaces() {
+        // Removing the marker must not collapse whitespace inside quoted opener
+        // arguments (only ends are trimmed).
+        let content = "\
+FROM alpine
+RUN cat <<EOF > \"/x  y\"
+some content
+EOF
+";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].contains("/x  y"),
+            "double space inside a quoted redirect target was collapsed: {}",
+            runs[0]
+        );
+    }
+
+    #[test]
+    fn test_fd_prefixed_heredoc_is_detected() {
+        // A heredoc may carry a leading file descriptor (`0<<EOF`). It must still
+        // be recognized so the body is consumed rather than leaking as
+        // instructions.
+        let content = "\
+FROM alpine
+RUN cat 0<<EOF > /f
+USER phantom
+EOF
+EXPOSE 80
+";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            !df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i.instruction, Instruction::User(_))),
+            "fd-prefixed heredoc body leaked a phantom USER instruction"
         );
         assert!(df.stages[0]
             .instructions
