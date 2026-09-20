@@ -1,0 +1,12 @@
+file:
+  # derived from WORKDIR /app; confidence: high
+  /app:
+    exists: true
+    filetype: directory
+  # derived from COPY  .; confidence: medium
+  /app/.:
+    exists: true
+process:
+  # derived from CMD python -m flask run --host=0.0.0.0; confidence: medium
+  python:
+    running: true

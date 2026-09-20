@@ -1,0 +1,4 @@
+port:
+  # derived from EXPOSE 5000/tcp; confidence: medium
+  tcp:5000:
+    listening: true

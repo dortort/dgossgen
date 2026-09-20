@@ -1,0 +1,12 @@
+file:
+  # derived from COPY  /etc/nginx/nginx.conf; confidence: medium
+  /etc/nginx/nginx.conf:
+    exists: true
+  # derived from COPY  /usr/share/nginx/html/; confidence: medium
+  /usr/share/nginx/html/:
+    exists: true
+    filetype: directory
+process:
+  # derived from CMD nginx -g daemon off;; confidence: medium
+  nginx:
+    running: true

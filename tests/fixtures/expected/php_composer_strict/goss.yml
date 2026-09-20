@@ -1,0 +1,41 @@
+file:
+  # derived from COPY --from=composer:latest /usr/bin/composer; confidence: medium
+  /usr/bin/composer:
+    exists: true
+  # derived from WORKDIR /var/www/html; confidence: high
+  /var/www/html:
+    exists: true
+    filetype: directory
+  # derived from COPY  /var/www/html/; confidence: medium
+  /var/www/html/:
+    exists: true
+    filetype: directory
+  # derived from COPY  ./; confidence: medium
+  /var/www/html/./:
+    exists: true
+    filetype: directory
+process:
+  # derived from CMD php-fpm; confidence: medium
+  php-fpm:
+    running: true
+command:
+  # derived from RUN apt-get install git; confidence: low
+  git---version:
+    exec: git --version
+    exit-status: 0
+    timeout: 10000
+  # derived from RUN apt-get install git; confidence: low
+  package-git:
+    exec: dpkg -s git
+    exit-status: 0
+    timeout: 10000
+  # derived from RUN composer require monolog/monolog; confidence: low
+  package-monolog-monolog:
+    exec: composer show 'monolog/monolog'
+    exit-status: 0
+    timeout: 10000
+  # derived from RUN apt-get install unzip; confidence: low
+  package-unzip:
+    exec: dpkg -s unzip
+    exit-status: 0
+    timeout: 10000

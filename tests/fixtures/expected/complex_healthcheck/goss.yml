@@ -1,0 +1,31 @@
+file:
+  # derived from COPY /docker-entrypoint.sh (entrypoint script pattern); confidence: medium
+  /docker-entrypoint.sh:
+    exists: true
+    filetype: file
+  # derived from COPY  /etc/nginx/conf.d/default.conf; confidence: medium
+  /etc/nginx/conf.d/default.conf:
+    exists: true
+  # derived from nginx service pattern; confidence: medium
+  /etc/nginx/nginx.conf:
+    exists: true
+    filetype: file
+  # derived from WORKDIR /var/www/html; confidence: high
+  /var/www/html:
+    exists: true
+    filetype: directory
+process:
+  # derived from ENTRYPOINT /docker-entrypoint.sh; confidence: medium
+  docker-entrypoint.sh:
+    running: true
+command:
+  # derived from nginx service pattern; confidence: medium
+  nginx--v:
+    exec: nginx -v
+    exit-status: 0
+    timeout: 10000
+  # derived from USER www-data; confidence: high
+  user-www-data-exists:
+    exec: getent passwd www-data
+    exit-status: 0
+    timeout: 5000

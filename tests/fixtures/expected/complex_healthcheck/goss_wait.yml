@@ -1,0 +1,10 @@
+port:
+  # derived from EXPOSE 8080/tcp; confidence: medium
+  tcp:8080:
+    listening: true
+command:
+  # derived from HEALTHCHECK CMD curl -f http://localhost:8080/healthz || exit 1; confidence: high
+  healthcheck:
+    exec: curl -f http://localhost:8080/healthz || exit 1
+    exit-status: 0
+    timeout: 5000
