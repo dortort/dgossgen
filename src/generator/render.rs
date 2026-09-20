@@ -69,16 +69,22 @@ impl Sections {
     }
 }
 
-/// True if `c` is allowed in a single-line YAML comment: YAML 1.2's
-/// `c-printable` set minus the line breaks (`\n`/`\r`, which would end the
-/// comment). Rust `char`s can never be surrogates, so those need no exclusion;
-/// U+FFFE/U+FFFF and the C0/C1 control ranges fall outside the ranges below and
-/// are therefore rejected.
+/// True if `c` is allowed in a single-line YAML comment: YAML's `c-printable`
+/// set minus every line break. The libyaml-family scanners used by `serde_yml`
+/// and common goss YAML parsers treat LF, CR, NEL (U+0085), LS (U+2028) and PS
+/// (U+2029) as line breaks, so all five must be excluded or the remainder of
+/// the provenance would escape the `#` comment. Rust `char`s can never be
+/// surrogates, so those need no exclusion; U+FFFE/U+FFFF and the C0/C1 control
+/// ranges fall outside the printable ranges below and are therefore rejected.
 fn is_comment_safe(c: char) -> bool {
+    // Reject every YAML line-break character first (U+0085/U+2028/U+2029 would
+    // otherwise slip through the printable ranges below).
+    if matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}') {
+        return false;
+    }
     matches!(c,
         '\t'
         | '\u{20}'..='\u{7E}'
-        | '\u{85}'
         | '\u{A0}'..='\u{D7FF}'
         | '\u{E000}'..='\u{FFFD}'
         | '\u{10000}'..='\u{10FFFF}'
@@ -604,6 +610,40 @@ mod tests {
         assert!(
             output.contains("# derived from x y z; confidence: medium"),
             "noncharacters should collapse to spaces, got:\n{output:?}"
+        );
+        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        assert!(
+            parsed.is_ok(),
+            "sanitized output should parse, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_provenance_unicode_line_breaks_are_sanitized() {
+        // NEL (U+0085), LS (U+2028) and PS (U+2029) are line breaks to
+        // libyaml-family scanners, so they must not survive in a single-line
+        // comment even though they are printable Unicode.
+        let resources = vec![GossResource::Process {
+            name: "srv".to_string(),
+            running: true,
+            provenance: "a\u{85}b\u{2028}injected: true\u{2029}c".to_string(),
+            confidence: Confidence::Medium,
+        }];
+        let output = render_goss(&resources);
+        assert!(
+            !output.contains('\u{85}')
+                && !output.contains('\u{2028}')
+                && !output.contains('\u{2029}'),
+            "Unicode line breaks must be stripped from the comment"
+        );
+        assert!(
+            output.contains("# derived from a b injected: true c; confidence: medium"),
+            "Unicode line breaks should collapse to spaces, got:\n{output:?}"
+        );
+        // The injected mapping must not have escaped the comment.
+        assert!(
+            !output.contains("\ninjected: true"),
+            "a Unicode line break must not inject active YAML, got:\n{output:?}"
         );
         let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
         assert!(
