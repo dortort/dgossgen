@@ -431,12 +431,14 @@ fn merge_resource(existing: &mut GossResource, incoming: GossResource) {
             filetype: existing_filetype,
             mode: existing_mode,
             confidence: existing_confidence,
+            provenance: existing_provenance,
             ..
         },
         GossResource::File {
             filetype: incoming_filetype,
             mode: incoming_mode,
             confidence: incoming_confidence,
+            provenance: incoming_provenance,
             ..
         },
     ) = (existing, incoming)
@@ -449,6 +451,17 @@ fn merge_resource(existing: &mut GossResource, incoming: GossResource) {
         }
         if incoming_confidence > *existing_confidence {
             *existing_confidence = incoming_confidence;
+        }
+        // Credit every distinct source that produced this same-path assertion,
+        // so the rendered provenance comment does not attribute merged
+        // `filetype`/`mode` fields to only the first-seen instruction.
+        if incoming_provenance != *existing_provenance
+            && !existing_provenance
+                .split("; ")
+                .any(|p| p == incoming_provenance)
+        {
+            existing_provenance.push_str("; ");
+            existing_provenance.push_str(&incoming_provenance);
         }
     }
 }
@@ -865,5 +878,15 @@ CMD ["nginx", "-g", "daemon off;"]
                 ..
             } if ft == "file" && mode == "0755"
         ));
+        // The merged assertion must credit both contributing sources, not only
+        // the first-seen COPY, since the filetype/mode came from the second.
+        let GossResource::File { provenance, .. } = &resources[0] else {
+            panic!("expected a File resource");
+        };
+        assert!(
+            provenance.contains("COPY /docker-entrypoint.sh")
+                && provenance.contains("entrypoint script pattern"),
+            "merged provenance should credit both sources, got: {provenance}"
+        );
     }
 }
