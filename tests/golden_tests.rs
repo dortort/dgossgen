@@ -255,13 +255,22 @@ fn test_healthcheck_unknown_flag_not_in_wait_file() {
         wait.contains("curl -f http://localhost:8080/"),
         "wait file should carry the real healthcheck command, got:\n{wait}"
     );
+
+    // The assertions below target the executable command line specifically,
+    // not the whole file: provenance comments legitimately echo the source
+    // `HEALTHCHECK CMD ...` instruction, but neither the unknown flag nor the
+    // literal `CMD` keyword may leak into the `exec:` value goss actually runs.
+    let exec_line = wait
+        .lines()
+        .find(|l| l.trim_start().starts_with("exec:"))
+        .expect("wait file should have an exec line for the healthcheck");
     assert!(
-        !wait.contains("--start-interval"),
-        "unknown flag must not leak into the wait command, got:\n{wait}"
+        !exec_line.contains("--start-interval"),
+        "unknown flag must not leak into the wait command, got:\n{exec_line}"
     );
     assert!(
-        !wait.contains("CMD"),
-        "literal CMD keyword must not leak into the wait command, got:\n{wait}"
+        !exec_line.contains("CMD"),
+        "literal CMD keyword must not leak into the wait command, got:\n{exec_line}"
     );
 }
 
@@ -320,17 +329,38 @@ fn test_output_has_stable_ordering() {
     let output = generator::generate(&contract, Profile::Standard, &policy, None);
     let yml = &output.goss_yml;
 
-    // Sections should appear in stable order: file, port, process, command
-    let file_pos = yml.find("file:");
-    let port_pos = yml.find("port:");
-    let command_pos = yml.find("command:");
+    // Port assertions are partitioned into the wait file, so the main goss.yml
+    // never carries a `port:` section — the previous version of this test
+    // guarded its assertions on `port:` appearing here and so never actually
+    // ran. Assert the section order that genuinely exists in the main file:
+    // `file` precedes `command`.
+    let file_pos = yml
+        .find("file:")
+        .expect("complex_healthcheck main file should have a file section");
+    let command_pos = yml
+        .find("command:")
+        .expect("complex_healthcheck main file should have a command section");
+    assert!(
+        file_pos < command_pos,
+        "file section should come before command section in:\n{yml}"
+    );
+    assert!(
+        !yml.contains("\nport:"),
+        "port assertions belong in the wait file, not goss.yml:\n{yml}"
+    );
 
-    if let (Some(f), Some(p)) = (file_pos, port_pos) {
-        assert!(f < p, "file section should come before port section");
-    }
-    if let (Some(p), Some(c)) = (port_pos, command_pos) {
-        assert!(p < c, "port section should come before command section");
-    }
+    // Port readiness lives in the wait file; assert it is present there.
+    let wait = output
+        .goss_wait_yml
+        .expect("a healthcheck + single port should produce a wait file");
+    assert!(
+        wait.contains("port:"),
+        "wait file should carry the port readiness gate:\n{wait}"
+    );
+    assert!(
+        wait.contains("tcp:8080"),
+        "wait file should gate on the exposed port:\n{wait}"
+    );
 }
 
 // --- No-wait / force-wait tests ---
