@@ -1,0 +1,4 @@
+process:
+  # derived from ENTRYPOINT /usr/local/bin/server; confidence: medium
+  server:
+    running: true
