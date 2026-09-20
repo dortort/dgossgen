@@ -1,0 +1,13 @@
+port:
+  # derived from EXPOSE 443/tcp; confidence: medium
+  tcp:443:
+    listening: true
+  # derived from EXPOSE 80/tcp; confidence: medium
+  tcp:80:
+    listening: true
+command:
+  # derived from HEALTHCHECK CMD curl -f http://localhost/ || exit 1; confidence: high
+  healthcheck:
+    exec: curl -f http://localhost/ || exit 1
+    exit-status: 0
+    timeout: 5000

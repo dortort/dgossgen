@@ -1,0 +1,16 @@
+file:
+  # derived from COPY --from=build /server; confidence: medium
+  /server:
+    exists: true
+process:
+  # derived from ENTRYPOINT /server; confidence: medium
+  server:
+    running: true
+command:
+  # derived from USER 65534; confidence: high
+  id--u:
+    exec: id -u
+    exit-status: 0
+    stdout:
+    - '65534'
+    timeout: 10000

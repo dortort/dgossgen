@@ -1,0 +1,25 @@
+file:
+  # derived from WORKDIR /app; confidence: high
+  /app:
+    exists: true
+    filetype: directory
+  # derived from COPY --from=builder /app/; confidence: medium
+  /app/:
+    exists: true
+    filetype: directory
+  # derived from COPY --from=builder /app/dist; confidence: medium
+  /app/dist:
+    exists: true
+  # derived from COPY --from=builder /app/node_modules; confidence: medium
+  /app/node_modules:
+    exists: true
+process:
+  # derived from ENTRYPOINT node dist/server.js; confidence: medium
+  node:
+    running: true
+command:
+  # derived from RUN useradd/adduser appuser; confidence: medium
+  user-appuser-exists:
+    exec: getent passwd appuser
+    exit-status: 0
+    timeout: 5000
