@@ -334,16 +334,13 @@ fn build_main_resources(
                 });
             }
 
-            AssertionKind::PortListening { protocol, port } => {
-                // Port assertions in main goss.yml (hard check)
-                if policy.assert_ports_enabled() {
-                    resources.push(GossResource::Port {
-                        address: format!("{}:{}", protocol, port),
-                        listening: true,
-                        provenance: assertion.provenance.clone(),
-                        confidence: assertion.confidence,
-                    });
-                }
+            AssertionKind::PortListening { .. } => {
+                // Unreachable in practice: `generate` partitions every
+                // `PortListening` assertion into the wait file via
+                // `is_wait_assertion` before this function runs, so port
+                // readiness is asserted in goss_wait.yml, not the main file.
+                // Kept as an explicit no-op to preserve match exhaustiveness
+                // and document the routing.
             }
 
             AssertionKind::HttpStatus { url, status } => {
