@@ -70,12 +70,19 @@ impl Sections {
 
 /// Build the `# derived from ...; confidence: ...` line promised in the README.
 ///
-/// `GossResource` is a public type, so a provenance string could carry a line
-/// break. `write_section` prefixes only the first line with `#`, so an embedded
-/// `\n`/`\r` would let the remainder escape the comment and become active YAML.
-/// Collapse line breaks to spaces to keep the comment a single line.
+/// `GossResource` is a public type, so a provenance string could carry control
+/// characters. This comment is hand-written (not routed through `serde_yml`,
+/// which escapes such data in scalars), so a raw control character would make
+/// the whole document invalid: a line break (`\n`/`\r`) lets the remainder
+/// escape the comment into active YAML, and other C0 controls (NUL, form feed,
+/// …) are forbidden by the YAML character set even inside a comment. Replace
+/// every control character with a space so the comment stays a single,
+/// printable line.
 fn comment_line(provenance: &str, confidence: Confidence) -> String {
-    let sanitized = provenance.replace(['\n', '\r'], " ");
+    let sanitized: String = provenance
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     format!("# derived from {}; confidence: {}", sanitized, confidence)
 }
 
@@ -539,6 +546,33 @@ mod tests {
         assert!(
             output.contains("# derived from line one malicious: true  more; confidence: medium"),
             "provenance line breaks should collapse to spaces, got:\n{output}"
+        );
+        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        assert!(
+            parsed.is_ok(),
+            "sanitized output should parse, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_provenance_control_chars_are_sanitized() {
+        // Control characters forbidden by the YAML character set (NUL, form
+        // feed, vertical tab, …) must not leak into the comment, or the whole
+        // document becomes unparseable even though they sit inside a `#` line.
+        let resources = vec![GossResource::Process {
+            name: "srv".to_string(),
+            running: true,
+            provenance: "a\u{0}b\u{c}c\u{b}d".to_string(),
+            confidence: Confidence::High,
+        }];
+        let output = render_goss(&resources);
+        assert!(
+            !output.contains('\u{0}') && !output.contains('\u{c}') && !output.contains('\u{b}'),
+            "control characters must be stripped from the comment"
+        );
+        assert!(
+            output.contains("# derived from a b c d; confidence: high"),
+            "control characters should collapse to spaces, got:\n{output:?}"
         );
         let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
         assert!(
