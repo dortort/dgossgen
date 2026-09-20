@@ -284,16 +284,16 @@ CMD ["nginx", "-g", "daemon off;"]
 
 **Generated `goss_wait.yml`:**
 ```yaml
-command:
-  # derived from HEALTHCHECK CMD curl -f http://localhost/ || exit 1; confidence: high
-  healthcheck:
-    exec: "curl -f http://localhost/ || exit 1"
-    exit-status: 0
-    timeout: 5000
 port:
   # derived from EXPOSE 80/tcp; confidence: medium
   tcp:80:
     listening: true
+command:
+  # derived from HEALTHCHECK CMD curl -f http://localhost/ || exit 1; confidence: high
+  healthcheck:
+    exec: curl -f http://localhost/ || exit 1
+    exit-status: 0
+    timeout: 5000
 ```
 
 **Generated `goss.yml`:**
@@ -302,20 +302,15 @@ file:
   # derived from COPY nginx.conf /etc/nginx/nginx.conf; confidence: medium
   /etc/nginx/nginx.conf:
     exists: true
-  # derived from nginx service pattern; confidence: medium
-  /etc/nginx/nginx.conf:
-    exists: true
     filetype: file
-
 process:
   # derived from CMD nginx -g daemon off;; confidence: medium
   nginx:
     running: true
-
 command:
   # derived from nginx service pattern; confidence: medium
   nginx--v:
-    exec: "nginx -v"
+    exec: nginx -v
     exit-status: 0
     timeout: 10000
 ```
