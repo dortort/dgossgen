@@ -37,15 +37,16 @@ struct HttpAssertion {
     status: u16,
 }
 
-/// A single rendered assertion: its map key, the provenance comment to place
-/// above it, and the serialized YAML for the value body.
+/// A single rendered assertion: the provenance comment to place above it, and
+/// the complete `serde_yml`-serialized mapping entry (key and value together).
 struct Entry {
-    /// The map key exactly as `serde_yml` renders it (with any quoting).
-    rendered_key: String,
     /// `# derived from ...; confidence: ...`
     comment: String,
-    /// The value body serialized by `serde_yml`, e.g. `  exists: true`.
-    body: String,
+    /// The whole `serde_yml` mapping entry, e.g. `/app:\n  exists: true`, or
+    /// the explicit `? <key>\n: <value>` form `serde_yml` uses for keys past
+    /// the YAML simple-key length limit. Stored verbatim (never re-split) so we
+    /// never corrupt an explicit-form key.
+    block: String,
 }
 
 /// The five goss sections, emitted in this fixed order.
@@ -68,38 +69,51 @@ impl Sections {
     }
 }
 
+/// True if `c` is allowed in a single-line YAML comment: YAML 1.2's
+/// `c-printable` set minus the line breaks (`\n`/`\r`, which would end the
+/// comment). Rust `char`s can never be surrogates, so those need no exclusion;
+/// U+FFFE/U+FFFF and the C0/C1 control ranges fall outside the ranges below and
+/// are therefore rejected.
+fn is_comment_safe(c: char) -> bool {
+    matches!(c,
+        '\t'
+        | '\u{20}'..='\u{7E}'
+        | '\u{85}'
+        | '\u{A0}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}'
+    )
+}
+
 /// Build the `# derived from ...; confidence: ...` line promised in the README.
 ///
-/// `GossResource` is a public type, so a provenance string could carry control
-/// characters. This comment is hand-written (not routed through `serde_yml`,
-/// which escapes such data in scalars), so a raw control character would make
-/// the whole document invalid: a line break (`\n`/`\r`) lets the remainder
-/// escape the comment into active YAML, and other C0 controls (NUL, form feed,
-/// …) are forbidden by the YAML character set even inside a comment. Replace
-/// every control character with a space so the comment stays a single,
-/// printable line.
+/// `GossResource` is a public type, so a provenance string could carry
+/// characters the YAML character set forbids. This comment is hand-written (not
+/// routed through `serde_yml`, which escapes such data in scalars), so any such
+/// character would make the whole document unparseable — a line break lets the
+/// remainder escape the comment into active YAML, and control characters and
+/// Unicode noncharacters (U+FFFE/U+FFFF) are rejected by the parser even inside
+/// a comment. Replace every character outside YAML's single-line `c-printable`
+/// set with a space so the comment stays one valid, printable line.
 fn comment_line(provenance: &str, confidence: Confidence) -> String {
     let sanitized: String = provenance
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_comment_safe(c) { c } else { ' ' })
         .collect();
     format!("# derived from {}; confidence: {}", sanitized, confidence)
 }
 
-/// Serialize a single `{ key: value }` map through `serde_yml` and split it into
-/// the rendered key (with any quoting `serde_yml` applied) and the value body
-/// (every line after the key line). Reusing `serde_yml` here keeps key quoting
-/// and value formatting identical to a whole-document serialization.
-fn render_entry<T: Serialize>(key: &str, value: &T) -> (String, String) {
+/// Serialize a single `{ key: value }` map through `serde_yml` and return the
+/// entry verbatim (trailing newline trimmed). Reusing `serde_yml` keeps key
+/// quoting and value formatting identical to a whole-document serialization,
+/// including the explicit `? <key>\n: <value>` form it emits for keys past the
+/// YAML simple-key length limit. The caller must indent the whole block as a
+/// unit rather than decomposing it, so explicit-form keys are never corrupted.
+fn render_entry<T: Serialize>(key: &str, value: &T) -> String {
     let mut map = BTreeMap::new();
     map.insert(key, value);
     let yaml = serde_yml::to_string(&map).unwrap_or_default();
-    let yaml = yaml.trim_end_matches('\n');
-
-    let (key_line, body) = yaml.split_once('\n').unwrap_or((yaml, ""));
-    // The key line is `<rendered_key>:`; strip the trailing colon.
-    let rendered_key = key_line.strip_suffix(':').unwrap_or(key_line).to_string();
-    (rendered_key, body.to_string())
+    yaml.trim_end_matches('\n').to_string()
 }
 
 /// Convert one `GossResource` into a section-keyed `Entry`.
@@ -113,7 +127,7 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(
+            let block = render_entry(
                 path,
                 &FileAssertion {
                     exists: *exists,
@@ -125,9 +139,8 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
                 Section::File,
                 path.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -137,7 +150,7 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(
+            let block = render_entry(
                 address,
                 &PortAssertion {
                     listening: *listening,
@@ -147,9 +160,8 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
                 Section::Port,
                 address.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -159,14 +171,13 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(name, &ProcessAssertion { running: *running });
+            let block = render_entry(name, &ProcessAssertion { running: *running });
             (
                 Section::Process,
                 name.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -178,7 +189,7 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(
+            let block = render_entry(
                 name,
                 &CommandAssertion {
                     exec: command.clone(),
@@ -191,9 +202,8 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
                 Section::Command,
                 name.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -206,7 +216,7 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(
+            let block = render_entry(
                 name,
                 &CommandAssertion {
                     exec: command.clone(),
@@ -219,9 +229,8 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
                 Section::Command,
                 name.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -231,14 +240,13 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             provenance,
             confidence,
         } => {
-            let (rendered_key, body) = render_entry(url, &HttpAssertion { status: *status });
+            let block = render_entry(url, &HttpAssertion { status: *status });
             (
                 Section::Http,
                 url.clone(),
                 Entry {
-                    rendered_key,
                     comment: comment_line(provenance, *confidence),
-                    body,
+                    block,
                 },
             )
         }
@@ -270,7 +278,9 @@ fn indent(block: &str, spaces: usize) -> String {
 }
 
 /// Append one section (if non-empty) to `out`, emitting each entry's provenance
-/// comment immediately above its key, both indented two spaces.
+/// comment immediately above its serialized mapping entry, both indented two
+/// spaces. The entry block is indented as a unit so an explicit `? key`/`: value`
+/// form survives intact.
 fn write_section(out: &mut String, name: &str, entries: &BTreeMap<String, Entry>) {
     if entries.is_empty() {
         return;
@@ -281,13 +291,8 @@ fn write_section(out: &mut String, name: &str, entries: &BTreeMap<String, Entry>
         out.push_str("  ");
         out.push_str(&entry.comment);
         out.push('\n');
-        out.push_str("  ");
-        out.push_str(&entry.rendered_key);
-        out.push_str(":\n");
-        if !entry.body.is_empty() {
-            out.push_str(&indent(&entry.body, 2));
-            out.push('\n');
-        }
+        out.push_str(&indent(&entry.block, 2));
+        out.push('\n');
     }
 }
 
@@ -578,6 +583,65 @@ mod tests {
         assert!(
             parsed.is_ok(),
             "sanitized output should parse, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_provenance_unicode_noncharacters_are_sanitized() {
+        // U+FFFE/U+FFFF are not `char::is_control()` but are forbidden by YAML's
+        // character set; they must be stripped from the comment.
+        let resources = vec![GossResource::Process {
+            name: "srv".to_string(),
+            running: true,
+            provenance: "x\u{FFFE}y\u{FFFF}z".to_string(),
+            confidence: Confidence::Medium,
+        }];
+        let output = render_goss(&resources);
+        assert!(
+            !output.contains('\u{FFFE}') && !output.contains('\u{FFFF}'),
+            "Unicode noncharacters must be stripped from the comment"
+        );
+        assert!(
+            output.contains("# derived from x y z; confidence: medium"),
+            "noncharacters should collapse to spaces, got:\n{output:?}"
+        );
+        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        assert!(
+            parsed.is_ok(),
+            "sanitized output should parse, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_long_key_past_simple_key_limit_renders_valid_yaml() {
+        // A key long enough to exceed YAML's 128-byte simple-key limit forces
+        // serde_yml into explicit `? key`/`: value` form. The whole entry block
+        // must be indented as a unit so it stays valid and the key round-trips
+        // as a scalar string (not corrupted into a nested mapping).
+        let long_path = format!("/opt/{}", "a".repeat(200));
+        let resources = vec![GossResource::File {
+            path: long_path.clone(),
+            exists: true,
+            filetype: Some("directory".to_string()),
+            mode: None,
+            provenance: "WORKDIR (long path)".to_string(),
+            confidence: Confidence::High,
+        }];
+        let output = render_goss(&resources);
+
+        let parsed: serde_yml::Value =
+            serde_yml::from_str(&output).unwrap_or_else(|e| panic!("must parse: {e}\n{output}"));
+        let file = parsed
+            .get("file")
+            .and_then(|f| f.as_mapping())
+            .expect("file section should be a mapping");
+        let entry = file
+            .get(serde_yml::Value::String(long_path.clone()))
+            .expect("long path must round-trip as a scalar string key");
+        assert_eq!(
+            entry.get("exists").and_then(|v| v.as_bool()),
+            Some(true),
+            "value must survive explicit-key rendering, got:\n{output}"
         );
     }
 
