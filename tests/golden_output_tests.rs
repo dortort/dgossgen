@@ -67,6 +67,14 @@ const CASES: &[Case] = &[
         fixture: "php_composer.Dockerfile",
         profile: Profile::Strict,
     },
+    // cmd_before_entrypoint has a CMD/ENTRYPOINT but no EXPOSE or HEALTHCHECK,
+    // so it generates a goss.yml with no goss_wait.yml. This exercises
+    // check_golden's `None` (no-wait) branch, which every other case skips.
+    Case {
+        name: "cmd_before_entrypoint",
+        fixture: "cmd_before_entrypoint.Dockerfile",
+        profile: Profile::Standard,
+    },
 ];
 
 fn generate_case(case: &Case) -> generator::GeneratorOutput {
