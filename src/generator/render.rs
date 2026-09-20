@@ -69,8 +69,14 @@ impl Sections {
 }
 
 /// Build the `# derived from ...; confidence: ...` line promised in the README.
+///
+/// `GossResource` is a public type, so a provenance string could carry a line
+/// break. `write_section` prefixes only the first line with `#`, so an embedded
+/// `\n`/`\r` would let the remainder escape the comment and become active YAML.
+/// Collapse line breaks to spaces to keep the comment a single line.
 fn comment_line(provenance: &str, confidence: Confidence) -> String {
-    format!("# derived from {}; confidence: {}", provenance, confidence)
+    let sanitized = provenance.replace(['\n', '\r'], " ");
+    format!("# derived from {}; confidence: {}", sanitized, confidence)
 }
 
 /// Serialize a single `{ key: value }` map through `serde_yml` and split it into
@@ -513,6 +519,32 @@ mod tests {
         let process_pos = output.find("process:").unwrap();
         assert!(file_pos < port_pos);
         assert!(port_pos < process_pos);
+    }
+
+    #[test]
+    fn test_provenance_line_breaks_are_sanitized() {
+        // A provenance carrying a newline must not escape the comment into
+        // active YAML; the whole file must stay valid and single-comment.
+        let resources = vec![GossResource::Process {
+            name: "srv".to_string(),
+            running: true,
+            provenance: "line one\nmalicious: true\r\nmore".to_string(),
+            confidence: Confidence::Medium,
+        }];
+        let output = render_goss(&resources);
+        assert!(
+            !output.contains("\nmalicious: true"),
+            "line break must not inject active YAML, got:\n{output}"
+        );
+        assert!(
+            output.contains("# derived from line one malicious: true  more; confidence: medium"),
+            "provenance line breaks should collapse to spaces, got:\n{output}"
+        );
+        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        assert!(
+            parsed.is_ok(),
+            "sanitized output should parse, got:\n{output}"
+        );
     }
 
     #[test]
