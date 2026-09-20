@@ -1,5 +1,5 @@
 file:
-  # derived from WORKDIR /app; confidence: high
+  # derived from WORKDIR /app; COPY  /app; confidence: high
   /app:
     exists: true
     filetype: directory
