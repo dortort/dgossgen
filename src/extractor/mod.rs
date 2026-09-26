@@ -27,19 +27,10 @@ pub fn extract_contract(
     resolver.load_build_args(build_args);
     resolver.load_global_args(&dockerfile.global_args);
 
-    // A final stage whose `FROM` names an earlier stage in the same file inherits
-    // that ancestor's accumulated filesystem and metadata (ENV, WORKDIR, USER,
-    // ENTRYPOINT, ...). Walk the internal `FROM <alias>` chain so those ancestors
-    // are processed before the target stage; without this, a `WORKDIR $APP_HOME`
-    // in the final stage never sees the `ENV APP_HOME` set in its base stage and
-    // gets emitted as the literal path `/$APP_HOME`. Image references are resolved
-    // against the pre-FROM scope (build args + globals) before alias matching, so
-    // `FROM ${BASE}` still finds the `base` stage.
+    // Walk the internal `FROM <alias>` chain so the final stage inherits the base stage's ENV/etc.
     let chain = resolve_stage_chain(dockerfile, stage, &resolver);
 
-    // Report the chain's root image (the first non-alias FROM), not the internal
-    // alias. A stage-body ARG/ENV appears after FROM and cannot influence how the
-    // image reference resolved, so the pre-FROM resolver is the right scope.
+    // Report the chain's root image, not the internal alias; a stage-body ARG/ENV can't affect it.
     let root_image = chain
         .first()
         .map(|s| s.image.as_str())
@@ -49,45 +40,22 @@ pub fn extract_contract(
         ..Default::default()
     };
 
-    // `None` marks the working directory as unknown: an earlier WORKDIR referenced
-    // a variable we could not resolve, so we cannot compute where a later relative
-    // COPY/ADD would land. An absolute, resolvable WORKDIR re-establishes it.
+    // `None` means the working directory is unknown (an earlier WORKDIR failed to resolve).
     let mut current_workdir: Option<String> = Some(String::from("/"));
 
-    // A stage started with `FROM <alias>` inherits its ancestor's image config,
-    // and Docker inherits both ENV *and* ARG into a stage based on the one that
-    // declared them. A single resolver shared across the whole chain therefore
-    // models the inheritance directly — a child stage's instructions resolve
-    // against the ARG/ENV its base stage established.
-
-    // Docker applies last-wins semantics to ENTRYPOINT, CMD, HEALTHCHECK, and USER:
-    // only the final effective occurrence takes effect. Rather than emit an
-    // assertion at each encounter (which accumulates stale/duplicate assertions from
-    // overridden instructions — and, across a chain, would make de-duplication keep
-    // the *parent's* value), we fold these into their effective final state during
-    // the walk and emit their assertions once, afterward. Each fold records the
-    // chain stage index so cross-stage inheritance rules can be applied.
+    // Fold ENTRYPOINT/CMD/HEALTHCHECK/USER to their last-wins value; emit once, after the walk.
     let mut fold_entrypoint: Option<(CommandForm, usize, usize)> = None;
     let mut fold_cmd: Option<(CommandForm, usize, usize)> = None;
     let mut fold_healthcheck: Option<(HealthcheckInfo, usize)> = None;
     let mut fold_user: Option<FoldedUser> = None;
 
-    // Walk instructions in source order across the whole inherited chain (root
-    // ancestor first, target stage last), updating the variable map as ARG/ENV are
-    // seen so every instruction resolves against the variables defined above it. A
-    // later ENV redefinition therefore cannot retroactively change how an earlier
-    // instruction resolved, and a child stage's instructions resolve against the
-    // ARG/ENV its base stage established.
+    // Walk the chain root-first, updating ARG/ENV so later redefinitions can't apply retroactively.
     for (stage_idx, chain_stage) in chain.iter().enumerate() {
         for inst in &chain_stage.instructions {
             match &inst.instruction {
                 Instruction::Workdir(dir) => {
                     let (resolved, unresolved) = resolver.resolve_checked(dir);
-                    // Determine the new absolute working directory, or `None` if it
-                    // cannot be known: an unresolved variable, or a relative WORKDIR
-                    // stacked on an already-unknown directory. A directory we cannot
-                    // determine must not be asserted (it could never match), and it
-                    // also invalidates later relative COPY/ADD destinations.
+                    // `None` means unknown (unresolved var, or unknown base dir); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
                             "WORKDIR '{dir}' contains an unresolved variable (no ARG/ENV \
@@ -128,10 +96,7 @@ pub fn extract_contract(
                 }
 
                 Instruction::User(user) => {
-                    // Fold USER to its effective final value across the chain; emitting
-                    // an assertion at each encounter would leave same-command
-                    // duplicates whose de-duplication keeps the overridden (e.g.
-                    // parent-stage) value, asserting the wrong uid.
+                    // Fold USER to its effective value; avoids keeping a stale parent uid.
                     let (resolved, unresolved) = resolver.resolve_checked(user);
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
@@ -180,10 +145,7 @@ pub fn extract_contract(
                 Instruction::Volume(volumes) => {
                     for vol in volumes {
                         let resolved = resolver.resolve(vol);
-                        // One effective volume entry per path: walking the chain can
-                        // meet the same VOLUME in an ancestor and a child, and the
-                        // interactive flow iterates contract.volumes directly, so a
-                        // duplicate would prompt twice for the same mount.
+                        // One entry per path: repeats across the chain are deduped.
                         if !contract.volumes.contains(&resolved) {
                             contract.volumes.push(resolved);
                         }
@@ -195,7 +157,7 @@ pub fn extract_contract(
                         Some(def) => {
                             let (resolved_def, unresolved) = resolver.resolve_checked(def);
                             if unresolved {
-                                // Leave the name undefined so any later use is dropped with a warning.
+                                // Leave the name undefined so later uses drop with a warning.
                                 if !resolver.is_locked(name) {
                                     resolver.unset(name);
                                 }
@@ -220,17 +182,13 @@ pub fn extract_contract(
                 }
 
                 Instruction::Entrypoint(cmd) => {
-                    // Docker resets a CMD inherited from the base image whenever a
-                    // derived stage sets ENTRYPOINT — in any form, including the empty
-                    // reset form `ENTRYPOINT []`. Clear a CMD that came from an earlier
-                    // stage in the chain; a CMD set within this same stage is unaffected.
+                    // Docker resets an inherited CMD when a derived stage sets any ENTRYPOINT form.
                     if let Some((_, _, cmd_stage)) = &fold_cmd {
                         if *cmd_stage < stage_idx {
                             fold_cmd = None;
                         }
                     }
-                    // An empty exec form clears the entrypoint; any other form
-                    // overrides the previous one (last wins).
+                    // An empty exec form clears the entrypoint; other forms override (last wins).
                     if is_reset_exec(cmd) {
                         fold_entrypoint = None;
                     } else {
@@ -266,8 +224,7 @@ pub fn extract_contract(
                     ));
                 }
 
-                // `HEALTHCHECK NONE` disables any healthcheck inherited from an earlier
-                // instruction, so it must clear the folded state (and thus the wait assertion).
+                // `HEALTHCHECK NONE` clears the folded state, dropping any pending wait assertion.
                 Instruction::HealthcheckNone => {
                     fold_healthcheck = None;
                 }
@@ -278,8 +235,7 @@ pub fn extract_contract(
                     dest,
                     chmod,
                 } => {
-                    // Only assert on files copied from within the build (not from other stages
-                    // where we can't know what was built), unless the dest is an absolute path
+                    // Only assert build-local copies (unknown for other stages) or absolute paths.
                     let full_dest =
                         match resolve_dest_path(dest, &resolver, current_workdir.as_deref()) {
                             DestPath::Resolved(path) => path,
@@ -398,12 +354,9 @@ pub fn extract_contract(
         }
     }
 
-    // Emit phase: generate the folded assertions once, from the effective final
-    // state.
+    // Emit phase: generate the folded assertions once, from their effective final state.
 
-    // USER: emit the effective final value. A value that is unresolved (still
-    // holds a variable) or empty (e.g. a variable that resolved to "") can never
-    // match the built image, so drop it (in every profile) and warn instead.
+    // Drop USER if unresolved or empty (can never match the built image); warn instead.
     if let Some(user) = &fold_user {
         contract.user = Some(user.resolved.clone());
         if user.unresolved {
@@ -422,9 +375,7 @@ pub fn extract_contract(
         }
     }
 
-    // Docker's interaction rule: when an ENTRYPOINT is set, CMD supplies its
-    // arguments rather than a process of its own, so a process assertion comes from
-    // the entrypoint; only in the absence of an entrypoint does CMD name the process.
+    // With an ENTRYPOINT set, CMD supplies its args, not the process; else CMD names it.
     contract.entrypoint = fold_entrypoint.as_ref().map(|(cmd, _, _)| cmd.clone());
     contract.cmd = fold_cmd.as_ref().map(|(cmd, _, _)| cmd.clone());
 
@@ -470,8 +421,7 @@ struct FoldedUser {
     unresolved: bool,
 }
 
-/// Build the assertion for a resolved USER value: a numeric uid is checked via
-/// `id -u`, a named user via a user-exists assertion (dropping any `:group`).
+/// Build the USER assertion: numeric uid via `id -u`, else user-exists (drops `:group`).
 fn make_user_assertion(user: &FoldedUser) -> ContractAssertion {
     if user.resolved.chars().all(|c| c.is_ascii_digit()) {
         ContractAssertion::new(
@@ -497,25 +447,7 @@ fn make_user_assertion(user: &FoldedUser) -> ContractAssertion {
     }
 }
 
-/// Resolve the chain of build stages the target stage inherits from, ordered
-/// root ancestor first and the target stage last.
-///
-/// A stage's `FROM` may name an earlier stage's alias (`FROM base`), in which
-/// case Docker starts it from that ancestor's final filesystem and metadata.
-/// Following the chain lets the extractor process the ancestors' `ARG`/`ENV`/
-/// `WORKDIR`/`USER`/... before the target stage so variable references resolve.
-///
-/// Each stage's `FROM` image is variable-resolved (against `resolver`, which holds
-/// the pre-FROM scope of build args + globals) before it is matched, so
-/// `FROM ${BASE}` resolves to `base` and still finds the internal stage. Alias
-/// matching is case-insensitive, mirroring [`Dockerfile::resolve_target`].
-///
-/// A stage can only reference stages declared before it, so a candidate parent
-/// must have a strictly earlier `from_line`; among matches the nearest preceding
-/// one wins (Docker's last-declared-alias-wins). The strictly-decreasing
-/// `from_line` also guarantees termination even if a malformed Dockerfile reused
-/// an alias. A `FROM` naming an external image (or an unknown alias) ends the
-/// walk, so a single-stage build yields just `[stage]`.
+/// Follow the internal `FROM <alias>` chain, nearest preceding, back to the root ancestor.
 fn resolve_stage_chain<'a>(
     dockerfile: &'a Dockerfile,
     target: &'a Stage,
@@ -659,16 +591,11 @@ enum DestPath {
     Resolved(String),
     /// The destination itself contained an unresolved variable.
     UnresolvedVar,
-    /// The destination is relative but the current working directory is unknown
-    /// (an earlier WORKDIR could not be resolved), so the absolute path is unknown.
+    /// Relative but the current WORKDIR is unknown (an earlier WORKDIR failed to resolve).
     UnknownWorkdir,
 }
 
-/// Resolve a COPY/ADD destination against variables and the current WORKDIR. An
-/// absolute destination stands on its own; a relative one is joined onto
-/// `current_workdir`, which is `None` when an earlier WORKDIR could not be
-/// resolved. Either failure means the real path is unknown and the caller must
-/// not emit an assertion for it.
+/// Resolve a COPY/ADD dest; a relative one joins `current_workdir`, `None` if unknown.
 fn resolve_dest_path(
     dest: &str,
     resolver: &crate::parser::VariableResolver,
@@ -760,9 +687,7 @@ ENTRYPOINT ["/app/app"]
 
     #[test]
     fn test_internal_from_alias_inherits_parent_env() {
-        // The final stage is `FROM base`, an internal alias; it must inherit the
-        // ENV declared in the base stage so `WORKDIR $APP_HOME` resolves to /app
-        // and base_image reports the underlying image, not the alias.
+        // `FROM base` must inherit the base stage's ENV, resolving $APP_HOME, not the alias.
         let content = r#"
 FROM node:20 AS base
 ENV APP_HOME=/app
@@ -807,8 +732,7 @@ WORKDIR $APP_HOME
 
     #[test]
     fn test_internal_from_chain_transits_multiple_hops() {
-        // ENV set in the root stage `a` must reach the final stage through the
-        // intermediate stage `b` (a -> b -> final).
+        // ENV set in root stage `a` must reach the final stage via intermediate stage `b`.
         let content = r#"
 FROM debian:12 AS a
 ENV ROOT_DIR=/srv/app
@@ -845,9 +769,7 @@ WORKDIR $DEST
 
     #[test]
     fn test_unresolved_workdir_path_is_dropped_and_warns() {
-        // Safety net, independent of chain walking: a WORKDIR referencing a
-        // variable that no ARG/ENV in scope defines cannot match the built image,
-        // so no assertion is emitted (in any profile) and a warning is surfaced.
+        // Independent of chain walking: an unresolvable WORKDIR var drops the assertion, warns.
         let content = r#"
 FROM alpine
 WORKDIR $UNDECLARED
@@ -876,9 +798,7 @@ WORKDIR $UNDECLARED
 
     #[test]
     fn test_no_variable_path_survives_in_any_kind() {
-        // Invariant: across a Dockerfile that mixes resolvable and unresolvable
-        // paths, no FileExists assertion carries a `$` in its path at all — the
-        // unresolvable ones are dropped, the resolvable one survives.
+        // Invariant: no FileExists assertion may carry a literal `$` in its path, ever.
         let content = r#"
 FROM alpine
 WORKDIR /real
@@ -906,9 +826,7 @@ COPY other $MISSING/other
 
     #[test]
     fn test_escaped_literal_dollar_path_is_not_flagged_unresolved() {
-        // `\$` produces a legitimate literal `$` in the value; resolving a WORKDIR
-        // that references it must NOT be mistaken for an unresolved variable, so
-        // the assertion is kept at High confidence with no warning.
+        // An escaped `\$` is a literal dollar, not unresolved; keeps High confidence.
         let content = "FROM alpine\nENV LITERAL=\\$HOME\nWORKDIR $LITERAL\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -932,8 +850,7 @@ COPY other $MISSING/other
 
     #[test]
     fn test_from_alias_via_build_arg_is_resolved() {
-        // `FROM ${BASE}` where BASE resolves to an internal stage alias must still
-        // follow the chain, inherit its ENV, and report the underlying image.
+        // `FROM ${BASE}` resolving to an internal alias must still follow the chain, inherit ENV.
         let content = r#"
 ARG BASE=base
 FROM node:20 AS base
@@ -951,8 +868,7 @@ WORKDIR $APP_HOME
 
     #[test]
     fn test_effective_user_across_chain_is_emitted_once() {
-        // A parent USER overridden by a child USER must yield exactly one id -u
-        // assertion carrying the child's (effective) uid, not the parent's.
+        // A child USER overriding a parent's yields exactly one id -u assertion, the child's uid.
         let content = r#"
 FROM alpine AS base
 USER 1000
@@ -1009,9 +925,7 @@ USER $UNDECLARED
 
     #[test]
     fn test_stage_arg_inherited_by_dependent_stage() {
-        // Docker inherits an ARG declared in a base stage into a stage based on it
-        // (a `FROM <that-stage>`), just like ENV. So `WORKDIR $BUILD_DIR` in the
-        // child resolves to the base stage's ARG value.
+        // Docker inherits a base stage's ARG into a dependent stage, just like ENV.
         let content = r#"
 FROM alpine AS base
 ARG BUILD_DIR=/build
@@ -1042,8 +956,7 @@ WORKDIR $BUILD_DIR
 
     #[test]
     fn test_default_with_defined_nested_variable_resolves() {
-        // A `${VAR:-default}` default that itself references a defined variable is
-        // expanded, not emitted verbatim.
+        // A `${VAR:-default}` default itself referencing a defined variable is expanded.
         let content = r#"
 FROM alpine
 ENV SUB=inner
@@ -1056,8 +969,7 @@ WORKDIR ${MISSING:-/opt/$SUB}
 
     #[test]
     fn test_default_with_undefined_nested_variable_is_dropped() {
-        // A `${VAR:-default}` default that references an UNDEFINED variable must be
-        // flagged unresolved and dropped — never shipped as a literal `$`-path.
+        // A default referencing an UNDEFINED variable is flagged unresolved, never shipped.
         let content = r#"
 FROM alpine
 WORKDIR ${MISSING:-/x$BAR}
@@ -1079,8 +991,7 @@ COPY app ${DEST:-/opt/$SUB}/a
 
     #[test]
     fn test_unterminated_brace_path_is_dropped() {
-        // A malformed, unterminated `${...}` must be treated as unresolved, not
-        // shipped as a literal `$`-path.
+        // A malformed, unterminated `${...}` is treated as unresolved, not shipped literally.
         let content = "FROM alpine\nWORKDIR /a/${UNTERM\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1094,9 +1005,7 @@ COPY app ${DEST:-/opt/$SUB}/a
 
     #[test]
     fn test_relative_copy_after_unresolved_workdir_is_suppressed() {
-        // Once a WORKDIR fails to resolve, the working directory is unknown, so a
-        // later *relative* COPY must not be asserted against the stale directory.
-        // An absolute COPY is still fine.
+        // After a WORKDIR fails to resolve, a later relative COPY must not use the stale dir.
         let content = r#"
 FROM alpine
 WORKDIR /real
@@ -1124,8 +1033,7 @@ COPY other /abs/other
 
     #[test]
     fn test_empty_user_is_dropped_and_warns() {
-        // A USER whose variable resolves to an empty string must not be emitted as
-        // an `id -u` == "" assertion.
+        // A USER resolving to empty must not be emitted as an `id -u` == "" assertion.
         let content = r#"
 FROM alpine
 ARG U=
@@ -1150,9 +1058,7 @@ USER $U
 
     #[test]
     fn test_env_referencing_undefined_var_does_not_launder() {
-        // `ENV FOO=$UNDEF` must not bind a `$`-bearing value that a later `$FOO`
-        // would then substitute back in, laundering the unresolved reference past
-        // the drop guard into a shipped `/$UNDEF` path/user.
+        // An ENV bound to an unresolved value must not launder a `$` value back via reference.
         let content = r#"
 FROM alpine
 ENV FOO=$UNDEF
@@ -1247,8 +1153,7 @@ WORKDIR $APP_DIR
 
     #[test]
     fn test_env_reassignment_to_unresolved_invalidates_prior_value() {
-        // Reassigning a variable to an unresolved value must invalidate its prior
-        // binding, not leave the stale value for a later reference to pick up.
+        // Reassigning a var to an unresolved value must invalidate its prior binding, not stale.
         let content = "FROM alpine\nENV DIR=/old\nENV DIR=$MISSING\nWORKDIR $DIR\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1270,9 +1175,7 @@ WORKDIR $APP_DIR
 
     #[test]
     fn test_env_unresolved_keeps_precedence_over_later_arg() {
-        // An unresolved ENV assignment still holds ENV precedence: a later ARG of
-        // the same name must NOT override it, so the value stays unknown (dropped),
-        // never the ARG's value.
+        // An unresolved ENV keeps precedence over a later same-name ARG; must not be overridden.
         let content = r#"
 FROM alpine
 ENV DIR=$MISSING
@@ -1295,9 +1198,7 @@ WORKDIR /app/$DIR
 
     #[test]
     fn test_tainted_env_var_with_dash_default_is_dropped() {
-        // `ENV DIR=$MISSING` leaves DIR set-but-unknown; a later `${DIR-fallback}`
-        // must not substitute the fallback (Docker keeps DIR set-empty, so `-`
-        // yields empty). We drop the assertion rather than ship `/srv/fallback`.
+        // A tainted var's `-`/`:-` default isn't substituted (Docker treats it as set-empty).
         let content = "FROM alpine\nENV DIR=$MISSING\nWORKDIR /srv/${DIR-fallback}\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1358,8 +1259,7 @@ EXPOSE 8080
 
     #[test]
     fn test_arg_default_referencing_defined_var_resolves() {
-        // An ARG default that references an already-defined variable is expanded,
-        // not stored verbatim.
+        // An ARG default referencing an already-defined variable is expanded, not verbatim.
         let content = r#"
 FROM alpine
 ENV BASE=/opt
@@ -1373,8 +1273,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_child_arg_redeclaration_overrides_inherited_default() {
-        // A child stage that re-declares an inherited ARG with a new default takes
-        // that new default (Docker's last-declared default wins, absent a build-arg).
+        // A child's ARG re-declaration with a new default overrides it (last-declared wins).
         let content = r#"
 FROM alpine AS base
 ARG DIR=/base
@@ -1390,8 +1289,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_build_arg_wins_over_redeclared_arg_default() {
-        // A command-line build-arg outranks every ARG default, inherited or
-        // re-declared, in every stage.
+        // A command-line build-arg outranks every ARG default, inherited or re-declared.
         let content = r#"
 FROM alpine AS base
 ARG DIR=/base
@@ -1407,8 +1305,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_arg_redeclared_unresolved_clears_prior_default() {
-        // Re-declaring an ARG with an unresolved default invalidates the inherited
-        // default (Docker would set it empty) rather than keeping the stale value.
+        // Re-declaring an ARG with an unresolved default invalidates the prior one, not stale.
         let content = r#"
 FROM alpine
 ARG DIR=/good
@@ -1439,8 +1336,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_child_entrypoint_resets_inherited_cmd() {
-        // Docker resets a CMD inherited from the base image when the child stage
-        // sets its own ENTRYPOINT.
+        // Docker resets a base image's inherited CMD when the child sets its own ENTRYPOINT.
         let content = "FROM alpine AS base\nENTRYPOINT [\"/base-ep\"]\nCMD [\"/base-cmd\"]\n\nFROM base\nENTRYPOINT [\"/child-ep\"]\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1450,9 +1346,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_empty_entrypoint_resets_inherited_cmd() {
-        // Docker resets an inherited CMD when a derived stage sets ENTRYPOINT in any
-        // form, including the empty reset form `ENTRYPOINT []`. The inherited CMD
-        // must therefore not survive to become the process assertion.
+        // An empty `ENTRYPOINT []` also resets an inherited CMD; it can't survive as process.
         let content = "FROM alpine AS base\nENTRYPOINT [\"/base-ep\"]\nCMD [\"/base-cmd\"]\n\nFROM base\nENTRYPOINT []\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1472,8 +1366,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_same_stage_cmd_after_entrypoint_is_kept() {
-        // The reset targets a CMD inherited from an earlier stage, not a CMD set in
-        // the same stage as the ENTRYPOINT.
+        // The CMD reset targets only an inherited CMD, not one set in the ENTRYPOINT's own stage.
         let content = "FROM alpine\nENTRYPOINT [\"/ep\"]\nCMD [\"/cmd\"]\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
@@ -1485,8 +1378,7 @@ WORKDIR $DIR
 
     #[test]
     fn test_parent_user_and_expose_inherited_by_child() {
-        // The child declares neither USER nor EXPOSE; both come from the base
-        // stage and must appear in the child's contract.
+        // The child declares neither USER nor EXPOSE; both are inherited from the base stage.
         let content = r#"
 FROM alpine AS base
 USER 1500
@@ -1536,8 +1428,7 @@ FROM $BASE_IMAGE
 
     #[test]
     fn test_global_arg_default_references_earlier_global() {
-        // A global ARG default that references an earlier global ARG is expanded in
-        // declaration order, so the FROM image reference resolves correctly.
+        // A global ARG default referencing an earlier global expands in declaration order.
         let content = r#"
 ARG ACTUAL=alpine:3.20
 ARG IMG=${ACTUAL}
@@ -1550,8 +1441,7 @@ FROM ${IMG}
 
     #[test]
     fn test_global_arg_default_chain_resolves_internal_alias() {
-        // The chained global default also resolves an internal-stage alias so the
-        // FROM chain is followed and the base stage's ENV is inherited.
+        // The chained global default must resolve an internal alias and inherit its ENV too.
         let content = r#"
 ARG ACTUAL=base
 ARG PICK=${ACTUAL}

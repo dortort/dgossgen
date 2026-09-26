@@ -1,6 +1,4 @@
-# A shared internal base stage carries ENV/WORKDIR that the final stage inherits
-# via `FROM base`. The generated goss.yml must reference the resolved directory
-# (/app), never the literal `$APP_HOME`.
+# FROM base must inherit APP_HOME and resolve it to /app, never the literal `$APP_HOME`.
 FROM node:20-alpine AS base
 ENV APP_HOME=/app
 WORKDIR $APP_HOME
