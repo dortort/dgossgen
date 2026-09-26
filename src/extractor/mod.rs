@@ -174,10 +174,14 @@ pub fn extract_contract(
                         let (resolved_val, unresolved) = resolver.resolve_checked(value);
                         if unresolved {
                             resolver.taint(key);
+                            contract.env.retain(|(k, _)| k != key);
                             continue;
                         }
                         resolver.set_var(key, &resolved_val);
-                        contract.env.push((key.clone(), resolved_val));
+                        match contract.env.iter_mut().find(|(k, _)| k == key) {
+                            Some(entry) => entry.1 = resolved_val,
+                            None => contract.env.push((key.clone(), resolved_val)),
+                        }
                     }
                 }
 
@@ -1110,6 +1114,23 @@ WORKDIR $FOO
             .warnings
             .iter()
             .any(|w| w.starts_with("WORKDIR '$FOO'") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_child_env_overrides_inherited_env_entry() {
+        let content = r#"
+FROM alpine AS base
+ENV MODE=old
+ENV GONE=/old
+
+FROM base
+ENV MODE=new
+ENV GONE=$MISSING
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.env, vec![("MODE".to_string(), "new".to_string())]);
     }
 
     #[test]
