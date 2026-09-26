@@ -1291,6 +1291,26 @@ WORKDIR /app/$DIR
     }
 
     #[test]
+    fn test_tainted_env_var_with_dash_default_is_dropped() {
+        // `ENV DIR=$MISSING` leaves DIR set-but-unknown; a later `${DIR-fallback}`
+        // must not substitute the fallback (Docker keeps DIR set-empty, so `-`
+        // yields empty). We drop the assertion rather than ship `/srv/fallback`.
+        let content = "FROM alpine\nENV DIR=$MISSING\nWORKDIR /srv/${DIR-fallback}\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("fallback")
+            )),
+            "a tainted var's dash-default must not be substituted: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
     fn test_duplicate_volume_across_chain_deduped() {
         // The same volume declared in an ancestor and its child must appear once.
         let content = r#"

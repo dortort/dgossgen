@@ -19,6 +19,12 @@ pub struct VariableResolver {
     /// default binding is *not* locked, so a re-declaration in a child stage can
     /// replace it.
     locked: HashSet<String>,
+    /// Names that are *set to an unknown value* — bound by an ENV whose value
+    /// could not be resolved (e.g. `ENV DIR=$MISSING`). The name is set (so a
+    /// `${DIR-word}`/`${DIR:-word}` default must not be substituted for it), but we
+    /// have no usable value, so any reference to it resolves as unresolved and is
+    /// dropped. A later resolvable binding clears the taint.
+    tainted: HashSet<String>,
 }
 
 impl VariableResolver {
@@ -75,24 +81,28 @@ impl VariableResolver {
     pub fn set_var(&mut self, key: &str, value: &str) {
         self.vars.insert(key.to_string(), value.to_string());
         self.locked.insert(key.to_string());
+        self.tainted.remove(key);
     }
 
-    /// Remove a binding and any lock, if present. Used for an ARG re-declared with
-    /// an unresolved default: the ARG carries no precedence, so a later ARG/ENV of
-    /// the same name may legitimately rebind it.
+    /// Remove a binding and any lock/taint, if present. Used for an ARG re-declared
+    /// with an unresolved default: the ARG carries no precedence, so a later
+    /// ARG/ENV of the same name may legitimately rebind it.
     pub fn unset(&mut self, key: &str) {
         self.locked.remove(key);
+        self.tainted.remove(key);
         self.vars.remove(key);
     }
 
-    /// Drop a variable's value but keep it locked. Used when an ENV assignment is
-    /// unresolvable: Docker still binds the name (empty) and keeps ENV precedence
-    /// over any later ARG of the same name, so the lock must remain even though we
-    /// have no usable value — a reference to it resolves as unresolved (and is
-    /// dropped), while a later ARG cannot override it.
+    /// Mark a variable set-but-unknown. Used when an ENV assignment is
+    /// unresolvable: Docker still binds the name and keeps ENV precedence over any
+    /// later ARG of the same name (so it is locked), but we have no usable value —
+    /// any reference to it resolves as unresolved (and is dropped), a `-`/`:-`
+    /// default is not substituted for it (the name is set), and a later ARG cannot
+    /// override it. A later resolvable ENV clears the taint via `set_var`.
     pub fn taint(&mut self, key: &str) {
         self.vars.remove(key);
         self.locked.insert(key.to_string());
+        self.tainted.insert(key.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string.
@@ -154,6 +164,12 @@ impl VariableResolver {
 
                     if let Some(val) = self.vars.get(var_name) {
                         result.push_str(val);
+                    } else if self.tainted.contains(var_name) {
+                        // The name is set to an unknown value, so its `-`/`:-`
+                        // default does not apply and we cannot resolve it: flag
+                        // unresolved so the assertion is dropped.
+                        result.push_str(&input[idx..end_idx + 1]);
+                        unresolved = true;
                     } else if let Some(def) = default {
                         // Resolve the default recursively so `${VAR:-$OTHER}`
                         // expands `$OTHER` (and is flagged unresolved when `$OTHER`
@@ -304,5 +320,22 @@ mod tests {
         let (value, unresolved) = resolver.resolve_checked("/a/${UNTERM");
         assert_eq!(value, "/a/${UNTERM");
         assert!(unresolved);
+    }
+
+    #[test]
+    fn test_tainted_var_reference_is_unresolved_ignoring_default() {
+        let mut resolver = VariableResolver::new();
+        resolver.taint("DIR");
+        // A set-but-unknown var is unresolved for a bare reference and for both
+        // default forms — the default must not be substituted for a set name.
+        assert!(resolver.resolve_checked("$DIR").1);
+        assert!(resolver.resolve_checked("/srv/${DIR-fallback}").1);
+        assert!(resolver.resolve_checked("/srv/${DIR:-fallback}").1);
+        // A later resolvable binding clears the taint.
+        resolver.set_var("DIR", "real");
+        assert_eq!(
+            resolver.resolve_checked("/srv/${DIR-fallback}"),
+            ("/srv/real".to_string(), false)
+        );
     }
 }
