@@ -143,7 +143,8 @@ pub fn extract_contract(
 
                 Instruction::Expose(tokens) => {
                     for raw_token in tokens {
-                        if resolver.has_unresolved(raw_token) {
+                        let (resolved, unresolved) = resolver.resolve_checked(raw_token);
+                        if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
                              in scope); no port assertion generated",
@@ -152,18 +153,11 @@ pub fn extract_contract(
                             continue;
                         }
 
-                        let resolved = resolver.resolve(raw_token);
                         let (specs, warning) = parse_expose_token(&resolved);
                         if let Some(w) = warning {
                             contract.warnings.push(w);
                         }
                         for port_spec in specs {
-                            // The image config represents an exposed port as one
-                            // effective entry, but walking the chain can encounter the
-                            // same port in an ancestor and a child. Deduplicate by
-                            // (protocol, port) so a single port is not counted twice
-                            // (which would, e.g., make the interactive flow's
-                            // `exposed_ports.len() > 1` branch prompt spuriously).
                             if contract.exposed_ports.iter().any(|p| {
                                 p.port == port_spec.port && p.protocol == port_spec.protocol
                             }) {
@@ -197,27 +191,13 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    // Resolve the default before binding so a default that references
-                    // another variable is expanded. If it references an *unresolved*
-                    // variable, do not bind a `$`-bearing value — that would launder
-                    // the unresolved reference past the resolve_checked guard when a
-                    // later instruction reads this ARG. Warn and leave it undefined so
-                    // the downstream use is itself flagged and dropped.
                     match default.as_deref() {
                         Some(def) => {
                             let (resolved_def, unresolved) = resolver.resolve_checked(def);
                             if unresolved {
-                                // A build-arg/ENV value legitimately wins and is kept
-                                // silently. Otherwise the default cannot be resolved:
-                                // clear any inherited ARG default this re-declaration
-                                // replaces and leave the name undefined, so a
-                                // downstream use is itself flagged and dropped.
+                                // Leave the name undefined so any later use is dropped with a warning.
                                 if !resolver.is_locked(name) {
                                     resolver.unset(name);
-                                    contract.warnings.push(format!(
-                                        "ARG '{name}={def}' references an unresolved variable (no \
-                                         ARG/ENV default in scope); '{name}' is left undefined"
-                                    ));
                                 }
                             } else {
                                 resolver.declare_arg(name, Some(&resolved_def));
@@ -229,22 +209,8 @@ pub fn extract_contract(
 
                 Instruction::Env(pairs) => {
                     for (key, value) in pairs {
-                        // Same guard as ARG: never bind a `$`-bearing value, which
-                        // would launder an unresolved reference (`ENV FOO=$UNDEF` then
-                        // `WORKDIR $FOO`) past the resolve_checked guard and ship a
-                        // `$`-path. Warn and leave the variable undefined instead.
                         let (resolved_val, unresolved) = resolver.resolve_checked(value);
                         if unresolved {
-                            contract.warnings.push(format!(
-                                "ENV '{key}={value}' references an unresolved variable (no \
-                                 ARG/ENV default in scope); '{key}' is left undefined"
-                            ));
-                            // Drop the value but keep the name locked: a
-                            // reassignment (`ENV DIR=/old` then `ENV DIR=$MISSING`)
-                            // replaced the old value, so a later `$DIR` must be
-                            // unresolved and dropped, not resolve to the stale value;
-                            // and ENV keeps precedence over any later ARG of the same
-                            // name, so the lock must remain.
                             resolver.taint(key);
                             continue;
                         }
@@ -507,9 +473,7 @@ struct FoldedUser {
 /// Build the assertion for a resolved USER value: a numeric uid is checked via
 /// `id -u`, a named user via a user-exists assertion (dropping any `:group`).
 fn make_user_assertion(user: &FoldedUser) -> ContractAssertion {
-    // An empty value is filtered out before this point; require at least one digit
-    // so an empty string is never mistaken for a numeric uid.
-    if !user.resolved.is_empty() && user.resolved.chars().all(|c| c.is_ascii_digit()) {
+    if user.resolved.chars().all(|c| c.is_ascii_digit()) {
         ContractAssertion::new(
             AssertionKind::CommandOutput {
                 command: "id -u".to_string(),
@@ -1218,7 +1182,7 @@ USER $FOO
         assert!(contract
             .warnings
             .iter()
-            .any(|w| w.contains("ENV") && w.contains("unresolved variable")));
+            .any(|w| w.starts_with("WORKDIR '$FOO'") && w.contains("unresolved variable")));
     }
 
     #[test]
@@ -1239,7 +1203,46 @@ WORKDIR $FOO
         assert!(contract
             .warnings
             .iter()
-            .any(|w| w.contains("ARG") && w.contains("unresolved variable")));
+            .any(|w| w.starts_with("WORKDIR '$FOO'") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_env_extending_base_image_var_does_not_warn() {
+        let content = r#"
+FROM node:20
+ENV PATH=$PATH:/app/node_modules/.bin
+ENV PYTHONPATH="${PYTHONPATH}:/app"
+ARG PIP_CACHE=$HOME/.cache/pip
+WORKDIR /app
+CMD ["node", "server.js"]
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+    }
+
+    #[test]
+    fn test_global_arg_with_unresolved_default_is_not_bound() {
+        let content = r#"
+ARG APP_DIR=${PREFIX}/app
+FROM alpine:3.19
+ARG APP_DIR
+WORKDIR $APP_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(!contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path.contains('$')
+        )));
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '$APP_DIR'")));
     }
 
     #[test]
