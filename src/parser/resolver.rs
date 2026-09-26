@@ -115,14 +115,22 @@ impl VariableResolver {
                     if let Some(val) = self.vars.get(var_name) {
                         result.push_str(val);
                     } else if let Some(def) = default {
-                        result.push_str(def);
+                        // Resolve the default recursively so `${VAR:-$OTHER}`
+                        // expands `$OTHER` (and is flagged unresolved when `$OTHER`
+                        // is itself undefined) instead of emitting the literal
+                        // default text, which would leak a `$`-bearing value.
+                        let (resolved_def, def_unresolved) = self.resolve_checked(def);
+                        result.push_str(&resolved_def);
+                        unresolved |= def_unresolved;
                     } else {
                         result.push_str(&input[idx..end_idx + 1]);
                         unresolved = true;
                     }
                 } else {
-                    // Unterminated ${...}: preserve the tail literally.
+                    // Unterminated ${...}: preserve the tail literally and flag it,
+                    // so a malformed reference is never treated as fully resolved.
                     result.push_str(&input[idx..]);
+                    unresolved = true;
                     break;
                 }
                 continue;
@@ -227,5 +235,34 @@ mod tests {
         assert!(!resolver.has_unresolved("Price is $5.00"));
         assert!(!resolver.has_unresolved("echo $$"));
         assert!(!resolver.has_unresolved("status is $?"));
+    }
+
+    #[test]
+    fn test_resolve_checked_default_with_defined_nested_var() {
+        let mut resolver = VariableResolver::new();
+        resolver.vars.insert("SUB".to_string(), "inner".to_string());
+        // The default is resolved recursively, and the reference is satisfied.
+        assert_eq!(
+            resolver.resolve_checked("${MISSING:-/opt/$SUB}"),
+            ("/opt/inner".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn test_resolve_checked_default_with_undefined_nested_var_is_unresolved() {
+        let resolver = VariableResolver::new();
+        // The default text itself carries an unresolved reference, so the whole
+        // result must be flagged unresolved rather than reported as clean.
+        let (value, unresolved) = resolver.resolve_checked("${MISSING:-/x$BAR}");
+        assert_eq!(value, "/x$BAR");
+        assert!(unresolved);
+    }
+
+    #[test]
+    fn test_resolve_checked_unterminated_brace_is_unresolved() {
+        let resolver = VariableResolver::new();
+        let (value, unresolved) = resolver.resolve_checked("/a/${UNTERM");
+        assert_eq!(value, "/a/${UNTERM");
+        assert!(unresolved);
     }
 }
