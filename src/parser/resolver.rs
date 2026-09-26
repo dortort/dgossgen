@@ -57,7 +57,21 @@ impl VariableResolver {
 
     /// Resolve ${VAR} and $VAR references in a string.
     pub fn resolve(&self, input: &str) -> String {
+        self.resolve_checked(input).0
+    }
+
+    /// Resolve like [`VariableResolver::resolve`], additionally reporting whether
+    /// any `$VAR`/`${VAR}` reference could not be substituted (the variable was
+    /// undefined and carried no `:-`/`-` default).
+    ///
+    /// The flag is set during substitution, so a literal dollar produced by an
+    /// escaped `\$` never counts as unresolved — a value that legitimately
+    /// contains a literal `$NAME` is distinguished from one whose variable was
+    /// simply undefined. A textual scan of the *resolved* string cannot make that
+    /// distinction, because by then the escape marker has become a real `$`.
+    pub fn resolve_checked(&self, input: &str) -> (String, bool) {
         let mut result = String::with_capacity(input.len());
+        let mut unresolved = false;
         let mut iter = input.char_indices().peekable();
 
         while let Some((idx, ch)) = iter.next() {
@@ -104,6 +118,7 @@ impl VariableResolver {
                         result.push_str(def);
                     } else {
                         result.push_str(&input[idx..end_idx + 1]);
+                        unresolved = true;
                     }
                 } else {
                     // Unterminated ${...}: preserve the tail literally.
@@ -132,6 +147,7 @@ impl VariableResolver {
                     result.push_str(val);
                 } else {
                     result.push_str(&input[idx..name_end]);
+                    unresolved = true;
                 }
                 continue;
             }
@@ -139,78 +155,18 @@ impl VariableResolver {
             result.push('$');
         }
 
-        result
+        (result, unresolved)
     }
 
     /// Check if a string contains unresolved variables.
     pub fn has_unresolved(&self, input: &str) -> bool {
-        let resolved = self.resolve(input);
-        contains_variable_reference(&resolved)
+        self.resolve_checked(input).1
     }
 
     /// Get current variable map.
     pub fn variables(&self) -> &HashMap<String, String> {
         &self.vars
     }
-}
-
-/// Whether `input` still contains a syntactic variable reference (`$NAME` or
-/// `${NAME}`). Unlike [`VariableResolver::has_unresolved`], this is a pure
-/// textual check that does **not** re-resolve `input` against any variable map,
-/// so it reports what is literally present in an already-resolved string. Use it
-/// to detect a stored path that was captured before its variable could be
-/// resolved, where re-resolving with a later-populated map would mask the gap.
-pub fn contains_variable_reference(input: &str) -> bool {
-    let mut iter = input.char_indices().peekable();
-    while let Some((_, ch)) = iter.next() {
-        if ch != '$' {
-            continue;
-        }
-
-        let Some((_, next_ch)) = iter.peek().copied() else {
-            continue;
-        };
-
-        if next_ch == '{' {
-            iter.next(); // consume '{'
-            let mut name = String::new();
-            while let Some((_, current)) = iter.peek().copied() {
-                iter.next();
-                if current == '}' {
-                    if is_valid_var_name(&name) {
-                        return true;
-                    }
-                    break;
-                }
-                name.push(current);
-            }
-            continue;
-        }
-
-        if next_ch.is_ascii_alphabetic() || next_ch == '_' {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_valid_var_name(expr: &str) -> bool {
-    let var_name = if let Some(sep) = expr.find(":-") {
-        &expr[..sep]
-    } else if let Some(sep) = expr.find('-') {
-        &expr[..sep]
-    } else {
-        expr
-    };
-
-    let mut chars = var_name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]

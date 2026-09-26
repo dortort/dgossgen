@@ -4,10 +4,7 @@ mod model;
 pub use heuristics::*;
 pub use model::*;
 
-use crate::parser::{
-    contains_variable_reference, CommandForm, Dockerfile, Instruction, PortSpec, Stage,
-    VariableResolver,
-};
+use crate::parser::{CommandForm, Dockerfile, Instruction, PortSpec, Stage, VariableResolver};
 use crate::Confidence;
 
 /// Maximum number of individual ports expanded from a single `EXPOSE low-high`
@@ -26,21 +23,23 @@ pub fn extract_contract(
         None => return RuntimeContract::default(),
     };
 
-    // A final stage whose `FROM` names an earlier stage in the same file inherits
-    // that ancestor's accumulated filesystem and metadata (ENV, WORKDIR, USER,
-    // EXPOSE, ENTRYPOINT, ...). Walk the internal `FROM <alias>` chain so those
-    // ancestors are processed before the target stage; without this, a
-    // `WORKDIR $APP_HOME` in the final stage never sees the `ENV APP_HOME` set in
-    // its base stage and gets emitted as the literal path `/$APP_HOME`.
-    let chain = resolve_stage_chain(dockerfile, stage);
-
     let mut resolver = VariableResolver::new();
     resolver.load_build_args(build_args);
     resolver.load_global_args(&dockerfile.global_args);
 
-    // Resolve the base image against build args and pre-FROM globals only: a stage-body
-    // ARG/ENV appears after FROM and cannot influence how the image reference resolved.
-    // Report the chain's root image (the first non-alias FROM), not the internal alias.
+    // A final stage whose `FROM` names an earlier stage in the same file inherits
+    // that ancestor's accumulated filesystem and metadata (ENV, WORKDIR, USER,
+    // ENTRYPOINT, ...). Walk the internal `FROM <alias>` chain so those ancestors
+    // are processed before the target stage; without this, a `WORKDIR $APP_HOME`
+    // in the final stage never sees the `ENV APP_HOME` set in its base stage and
+    // gets emitted as the literal path `/$APP_HOME`. Image references are resolved
+    // against the pre-FROM scope (build args + globals) before alias matching, so
+    // `FROM ${BASE}` still finds the `base` stage.
+    let chain = resolve_stage_chain(dockerfile, stage, &resolver);
+
+    // Report the chain's root image (the first non-alias FROM), not the internal
+    // alias. A stage-body ARG/ENV appears after FROM and cannot influence how the
+    // image reference resolved, so the pre-FROM resolver is the right scope.
     let root_image = chain
         .first()
         .map(|s| s.image.as_str())
@@ -52,271 +51,335 @@ pub fn extract_contract(
 
     let mut current_workdir = String::from("/");
 
-    // Docker applies last-wins semantics to ENTRYPOINT, CMD, and HEALTHCHECK: only the
-    // final occurrence in a stage takes effect. Rather than emit an assertion at each
-    // encounter (which accumulates stale assertions from overridden instructions and can
-    // emit a CMD-derived process before a later ENTRYPOINT is seen), we fold these three
-    // instructions into their effective final state during the walk and emit their
-    // assertions once, afterward, from the winning occurrence.
-    let mut fold_entrypoint: Option<(CommandForm, usize)> = None;
-    let mut fold_cmd: Option<(CommandForm, usize)> = None;
+    // ENV persists across a `FROM <alias>` boundary — it is part of the image
+    // config the child inherits — but ARG does not: a stage's ARG goes out of
+    // scope at its end. Carry the resolved ENV forward across stages and reset the
+    // ARG scope (rebuild the resolver from build args + globals + inherited ENV) at
+    // each new stage.
+    let mut inherited_env: Vec<(String, String)> = Vec::new();
+
+    // Docker applies last-wins semantics to ENTRYPOINT, CMD, HEALTHCHECK, and USER:
+    // only the final effective occurrence takes effect. Rather than emit an
+    // assertion at each encounter (which accumulates stale/duplicate assertions from
+    // overridden instructions — and, across a chain, would make de-duplication keep
+    // the *parent's* value), we fold these into their effective final state during
+    // the walk and emit their assertions once, afterward. Each fold records the
+    // chain stage index so cross-stage inheritance rules can be applied.
+    let mut fold_entrypoint: Option<(CommandForm, usize, usize)> = None;
+    let mut fold_cmd: Option<(CommandForm, usize, usize)> = None;
     let mut fold_healthcheck: Option<(HealthcheckInfo, usize)> = None;
+    let mut fold_user: Option<FoldedUser> = None;
 
     // Walk instructions in source order across the whole inherited chain (root
     // ancestor first, target stage last), updating the variable map as ARG/ENV are
     // seen so every instruction resolves against the variables defined above it. A
     // later ENV redefinition therefore cannot retroactively change how an earlier
     // instruction resolved, and a child stage's instructions resolve against the
-    // ENV/ARG its base stage established.
-    for inst in chain.iter().flat_map(|s| s.instructions.iter()) {
-        match &inst.instruction {
-            Instruction::Workdir(dir) => {
-                let resolved = resolver.resolve(dir);
-                if resolved.starts_with('/') {
-                    current_workdir = resolved.clone();
-                } else {
-                    current_workdir =
-                        format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
-                }
-                contract.workdir = Some(current_workdir.clone());
-                contract.assertions.push(ContractAssertion::new(
-                    AssertionKind::FileExists {
-                        path: current_workdir.clone(),
-                        filetype: Some("directory".to_string()),
-                        mode: None,
-                    },
-                    format!("WORKDIR {}", dir),
-                    inst.line_number,
-                    Confidence::High,
-                ));
+    // ENV its base stage established.
+    for (stage_idx, chain_stage) in chain.iter().enumerate() {
+        if stage_idx > 0 {
+            // New stage: ENV carries over, but the ARG scope resets.
+            resolver = VariableResolver::new();
+            resolver.load_build_args(build_args);
+            resolver.load_global_args(&dockerfile.global_args);
+            for (key, value) in &inherited_env {
+                resolver.set_var(key, value);
             }
+        }
 
-            Instruction::User(user) => {
-                let resolved = resolver.resolve(user);
-                contract.user = Some(resolved.clone());
-
-                if resolved.chars().all(|c| c.is_ascii_digit()) {
-                    contract.assertions.push(ContractAssertion::new(
-                        AssertionKind::CommandOutput {
-                            command: "id -u".to_string(),
-                            exit_status: 0,
-                            expected_output: vec![resolved.clone()],
-                        },
-                        format!("USER {}", user),
-                        inst.line_number,
-                        Confidence::High,
-                    ));
-                } else {
-                    // Split user:group if present
-                    let username = resolved.split(':').next().unwrap_or(&resolved);
-                    contract.assertions.push(ContractAssertion::new(
-                        AssertionKind::UserExists {
-                            username: username.to_string(),
-                        },
-                        format!("USER {}", user),
-                        inst.line_number,
-                        Confidence::High,
-                    ));
-                }
-            }
-
-            Instruction::Expose(tokens) => {
-                for raw_token in tokens {
-                    if resolver.has_unresolved(raw_token) {
+        for inst in &chain_stage.instructions {
+            match &inst.instruction {
+                Instruction::Workdir(dir) => {
+                    let (resolved, unresolved) = resolver.resolve_checked(dir);
+                    if unresolved {
+                        // We cannot determine the real directory, so an assertion on it
+                        // could never match the built image. Drop it (in every profile)
+                        // and warn rather than ship silent wrong output.
                         contract.warnings.push(format!(
-                            "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
+                            "WORKDIR '{dir}' contains an unresolved variable (no ARG/ENV \
+                         default in scope); no directory assertion generated"
+                        ));
+                        continue;
+                    }
+                    if resolved.starts_with('/') {
+                        current_workdir = resolved.clone();
+                    } else {
+                        current_workdir =
+                            format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
+                    }
+                    contract.workdir = Some(current_workdir.clone());
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::FileExists {
+                            path: current_workdir.clone(),
+                            filetype: Some("directory".to_string()),
+                            mode: None,
+                        },
+                        format!("WORKDIR {}", dir),
+                        inst.line_number,
+                        Confidence::High,
+                    ));
+                }
+
+                Instruction::User(user) => {
+                    // Fold USER to its effective final value across the chain; emitting
+                    // an assertion at each encounter would leave same-command
+                    // duplicates whose de-duplication keeps the overridden (e.g.
+                    // parent-stage) value, asserting the wrong uid.
+                    let (resolved, unresolved) = resolver.resolve_checked(user);
+                    fold_user = Some(FoldedUser {
+                        raw: user.clone(),
+                        resolved,
+                        line: inst.line_number,
+                        unresolved,
+                    });
+                }
+
+                Instruction::Expose(tokens) => {
+                    for raw_token in tokens {
+                        if resolver.has_unresolved(raw_token) {
+                            contract.warnings.push(format!(
+                                "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
                              in scope); no port assertion generated",
-                            raw_token
+                                raw_token
+                            ));
+                            continue;
+                        }
+
+                        let resolved = resolver.resolve(raw_token);
+                        let (specs, warning) = parse_expose_token(&resolved);
+                        if let Some(w) = warning {
+                            contract.warnings.push(w);
+                        }
+                        for port_spec in specs {
+                            contract.exposed_ports.push(port_spec.clone());
+                            contract.assertions.push(ContractAssertion::new(
+                                AssertionKind::PortListening {
+                                    protocol: port_spec.protocol.clone(),
+                                    port: port_spec.port,
+                                },
+                                format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
+                                inst.line_number,
+                                Confidence::Medium,
+                            ));
+                        }
+                    }
+                }
+
+                Instruction::Volume(volumes) => {
+                    for vol in volumes {
+                        let resolved = resolver.resolve(vol);
+                        contract.volumes.push(resolved);
+                    }
+                }
+
+                Instruction::Arg { name, default } => {
+                    resolver.declare_arg(name, default.as_deref());
+                }
+
+                Instruction::Env(pairs) => {
+                    for (key, value) in pairs {
+                        let resolved_val = resolver.resolve(value);
+                        resolver.set_var(key, &resolved_val);
+                        // Record for inheritance into later stages (last-wins), so a
+                        // child stage seeded from inherited_env sees this ENV.
+                        if let Some(entry) = inherited_env.iter_mut().find(|(k, _)| k == key) {
+                            entry.1 = resolved_val.clone();
+                        } else {
+                            inherited_env.push((key.clone(), resolved_val.clone()));
+                        }
+                        contract.env.push((key.clone(), resolved_val));
+                    }
+                }
+
+                Instruction::Entrypoint(cmd) => {
+                    // Docker treats an empty exec form (`ENTRYPOINT []`) as clearing the
+                    // entrypoint; any other form overrides the previous one (last wins).
+                    if is_reset_exec(cmd) {
+                        fold_entrypoint = None;
+                    } else {
+                        fold_entrypoint = Some((cmd.clone(), inst.line_number, stage_idx));
+                        // Docker resets a CMD inherited from the base image when a new
+                        // stage sets its own ENTRYPOINT. Clear a CMD that came from an
+                        // earlier stage in the chain; a CMD set within this stage stays.
+                        if let Some((_, _, cmd_stage)) = &fold_cmd {
+                            if *cmd_stage < stage_idx {
+                                fold_cmd = None;
+                            }
+                        }
+                    }
+                }
+
+                Instruction::Cmd(cmd) => {
+                    // `CMD []` clears the command; anything else overrides (last wins).
+                    if is_reset_exec(cmd) {
+                        fold_cmd = None;
+                    } else {
+                        fold_cmd = Some((cmd.clone(), inst.line_number, stage_idx));
+                    }
+                }
+
+                Instruction::Healthcheck {
+                    cmd,
+                    interval,
+                    timeout,
+                    start_period,
+                    retries,
+                } => {
+                    fold_healthcheck = Some((
+                        HealthcheckInfo {
+                            cmd: cmd.clone(),
+                            interval: interval.clone(),
+                            timeout: timeout.clone(),
+                            start_period: start_period.clone(),
+                            retries: *retries,
+                        },
+                        inst.line_number,
+                    ));
+                }
+
+                // `HEALTHCHECK NONE` disables any healthcheck inherited from an earlier
+                // instruction, so it must clear the folded state (and thus the wait assertion).
+                Instruction::HealthcheckNone => {
+                    fold_healthcheck = None;
+                }
+
+                Instruction::Copy {
+                    from_stage,
+                    sources: _,
+                    dest,
+                    chmod,
+                } => {
+                    // Only assert on files copied from within the build (not from other stages
+                    // where we can't know what was built), unless the dest is an absolute path
+                    let (full_dest, unresolved) =
+                        resolve_dest_path(dest, &resolver, &current_workdir);
+                    if unresolved {
+                        contract.warnings.push(format!(
+                            "COPY destination '{dest}' contains an unresolved variable (no \
+                         ARG/ENV default in scope); no file assertion generated"
                         ));
                         continue;
                     }
 
-                    let resolved = resolver.resolve(raw_token);
-                    let (specs, warning) = parse_expose_token(&resolved);
-                    if let Some(w) = warning {
-                        contract.warnings.push(w);
-                    }
-                    for port_spec in specs {
-                        contract.exposed_ports.push(port_spec.clone());
-                        contract.assertions.push(ContractAssertion::new(
-                            AssertionKind::PortListening {
-                                protocol: port_spec.protocol.clone(),
-                                port: port_spec.port,
+                    let confidence = Confidence::Medium;
+
+                    let is_dir = full_dest.ends_with('/');
+                    let is_entrypoint_script = is_entrypoint_path(&full_dest);
+                    let filetype = if is_entrypoint_script {
+                        Some("file".to_string())
+                    } else if is_dir {
+                        Some("directory".to_string())
+                    } else {
+                        None
+                    };
+                    let mode = if is_entrypoint_script {
+                        chmod.clone().or_else(|| Some("0755".to_string()))
+                    } else {
+                        chmod.clone()
+                    };
+                    let provenance = if is_entrypoint_script {
+                        format!("COPY {} (entrypoint script pattern)", dest)
+                    } else {
+                        format!(
+                            "COPY {} {}",
+                            if from_stage.is_some() {
+                                format!("--from={}", from_stage.as_ref().unwrap())
+                            } else {
+                                "".to_string()
                             },
-                            format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
-                            inst.line_number,
-                            Confidence::Medium,
-                        ));
-                    }
-                }
-            }
+                            dest
+                        )
+                        .trim()
+                        .to_string()
+                    };
 
-            Instruction::Volume(volumes) => {
-                for vol in volumes {
-                    let resolved = resolver.resolve(vol);
-                    contract.volumes.push(resolved);
-                }
-            }
-
-            Instruction::Arg { name, default } => {
-                resolver.declare_arg(name, default.as_deref());
-            }
-
-            Instruction::Env(pairs) => {
-                for (key, value) in pairs {
-                    let resolved_val = resolver.resolve(value);
-                    resolver.set_var(key, &resolved_val);
-                    contract.env.push((key.clone(), resolved_val));
-                }
-            }
-
-            Instruction::Entrypoint(cmd) => {
-                // Docker treats an empty exec form (`ENTRYPOINT []`) as clearing the
-                // entrypoint; any other form overrides the previous one (last wins).
-                if is_reset_exec(cmd) {
-                    fold_entrypoint = None;
-                } else {
-                    fold_entrypoint = Some((cmd.clone(), inst.line_number));
-                }
-            }
-
-            Instruction::Cmd(cmd) => {
-                // `CMD []` clears the command; anything else overrides (last wins).
-                if is_reset_exec(cmd) {
-                    fold_cmd = None;
-                } else {
-                    fold_cmd = Some((cmd.clone(), inst.line_number));
-                }
-            }
-
-            Instruction::Healthcheck {
-                cmd,
-                interval,
-                timeout,
-                start_period,
-                retries,
-            } => {
-                fold_healthcheck = Some((
-                    HealthcheckInfo {
-                        cmd: cmd.clone(),
-                        interval: interval.clone(),
-                        timeout: timeout.clone(),
-                        start_period: start_period.clone(),
-                        retries: *retries,
-                    },
-                    inst.line_number,
-                ));
-            }
-
-            // `HEALTHCHECK NONE` disables any healthcheck inherited from an earlier
-            // instruction, so it must clear the folded state (and thus the wait assertion).
-            Instruction::HealthcheckNone => {
-                fold_healthcheck = None;
-            }
-
-            Instruction::Copy {
-                from_stage,
-                sources: _,
-                dest,
-                chmod,
-            } => {
-                // Only assert on files copied from within the build (not from other stages
-                // where we can't know what was built), unless the dest is an absolute path
-                let full_dest = resolve_dest_path(dest, &resolver, &current_workdir);
-
-                let confidence = Confidence::Medium;
-
-                let is_dir = full_dest.ends_with('/');
-                let is_entrypoint_script = is_entrypoint_path(&full_dest);
-                let filetype = if is_entrypoint_script {
-                    Some("file".to_string())
-                } else if is_dir {
-                    Some("directory".to_string())
-                } else {
-                    None
-                };
-                let mode = if is_entrypoint_script {
-                    chmod.clone().or_else(|| Some("0755".to_string()))
-                } else {
-                    chmod.clone()
-                };
-                let provenance = if is_entrypoint_script {
-                    format!("COPY {} (entrypoint script pattern)", dest)
-                } else {
-                    format!(
-                        "COPY {} {}",
-                        if from_stage.is_some() {
-                            format!("--from={}", from_stage.as_ref().unwrap())
-                        } else {
-                            "".to_string()
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::FileExists {
+                            path: full_dest.clone(),
+                            filetype,
+                            mode,
                         },
-                        dest
-                    )
-                    .trim()
-                    .to_string()
-                };
+                        provenance,
+                        inst.line_number,
+                        confidence,
+                    ));
 
-                contract.assertions.push(ContractAssertion::new(
-                    AssertionKind::FileExists {
-                        path: full_dest.clone(),
-                        filetype,
-                        mode,
-                    },
-                    provenance,
-                    inst.line_number,
-                    confidence,
-                ));
+                    contract.filesystem_paths.push(full_dest);
+                }
 
-                contract.filesystem_paths.push(full_dest);
+                Instruction::Add {
+                    sources: _,
+                    dest,
+                    chmod,
+                } => {
+                    let (full_dest, unresolved) =
+                        resolve_dest_path(dest, &resolver, &current_workdir);
+                    if unresolved {
+                        contract.warnings.push(format!(
+                            "ADD destination '{dest}' contains an unresolved variable (no \
+                         ARG/ENV default in scope); no file assertion generated"
+                        ));
+                        continue;
+                    }
+
+                    contract.assertions.push(ContractAssertion::new(
+                        AssertionKind::FileExists {
+                            path: full_dest.clone(),
+                            filetype: None,
+                            mode: chmod.clone(),
+                        },
+                        format!("ADD {}", dest),
+                        inst.line_number,
+                        Confidence::Medium,
+                    ));
+
+                    contract.filesystem_paths.push(full_dest);
+                }
+
+                Instruction::Run(cmd) => {
+                    // Apply heuristics to detect installed packages/services
+                    let run_assertions = heuristics::analyze_run_command(cmd, inst.line_number);
+                    contract.assertions.extend(run_assertions);
+
+                    // Detect installed components
+                    let components = heuristics::detect_installed_components(cmd);
+                    contract.installed_components.extend(components);
+                }
+
+                _ => {}
             }
-
-            Instruction::Add {
-                sources: _,
-                dest,
-                chmod,
-            } => {
-                let full_dest = resolve_dest_path(dest, &resolver, &current_workdir);
-
-                contract.assertions.push(ContractAssertion::new(
-                    AssertionKind::FileExists {
-                        path: full_dest.clone(),
-                        filetype: None,
-                        mode: chmod.clone(),
-                    },
-                    format!("ADD {}", dest),
-                    inst.line_number,
-                    Confidence::Medium,
-                ));
-
-                contract.filesystem_paths.push(full_dest);
-            }
-
-            Instruction::Run(cmd) => {
-                // Apply heuristics to detect installed packages/services
-                let run_assertions = heuristics::analyze_run_command(cmd, inst.line_number);
-                contract.assertions.extend(run_assertions);
-
-                // Detect installed components
-                let components = heuristics::detect_installed_components(cmd);
-                contract.installed_components.extend(components);
-            }
-
-            _ => {}
         }
     }
 
-    // Emit phase: generate process and healthcheck assertions once, from the folded
-    // final state. Docker's interaction rule: when an ENTRYPOINT is set, CMD supplies its
-    // arguments rather than a process of its own, so a process assertion comes from the
-    // entrypoint; only in the absence of an entrypoint does CMD name the process.
-    contract.entrypoint = fold_entrypoint.as_ref().map(|(cmd, _)| cmd.clone());
-    contract.cmd = fold_cmd.as_ref().map(|(cmd, _)| cmd.clone());
+    // Emit phase: generate the folded assertions once, from the effective final
+    // state.
 
-    if let Some((cmd, line)) = &fold_entrypoint {
+    // USER: emit the effective final value. An unresolved value can never match
+    // the built image, so drop it (in every profile) and warn instead.
+    if let Some(user) = &fold_user {
+        contract.user = Some(user.resolved.clone());
+        if user.unresolved {
+            contract.warnings.push(format!(
+                "USER '{}' contains an unresolved variable (no ARG/ENV default in \
+                 scope); no user assertion generated",
+                user.raw
+            ));
+        } else {
+            contract.assertions.push(make_user_assertion(user));
+        }
+    }
+
+    // Docker's interaction rule: when an ENTRYPOINT is set, CMD supplies its
+    // arguments rather than a process of its own, so a process assertion comes from
+    // the entrypoint; only in the absence of an entrypoint does CMD name the process.
+    contract.entrypoint = fold_entrypoint.as_ref().map(|(cmd, _, _)| cmd.clone());
+    contract.cmd = fold_cmd.as_ref().map(|(cmd, _, _)| cmd.clone());
+
+    if let Some((cmd, line, _)) = &fold_entrypoint {
         if let Some(assertion) = make_process_assertion(cmd, "ENTRYPOINT", *line) {
             contract.assertions.push(assertion);
         }
-    } else if let Some((cmd, line)) = &fold_cmd {
+    } else if let Some((cmd, line, _)) = &fold_cmd {
         if let Some(assertion) = make_process_assertion(cmd, "CMD", *line) {
             contract.assertions.push(assertion);
         }
@@ -339,30 +402,46 @@ pub fn extract_contract(
         heuristics::generate_service_assertions(&contract.installed_components);
     contract.assertions.extend(service_assertions);
 
-    // Safety net: a filesystem-path assertion whose path still contains an
-    // unresolved variable (e.g. `/$APP_HOME` because no ARG/ENV in scope defines
-    // it) can never pass in the built image. Never let such a path ship at High
-    // confidence — where it would read as a trustworthy assertion — and warn so
-    // the gap is visible instead of surfacing later as a baffling dgoss failure.
-    // This guards every reason resolution can fail, independent of chain walking.
-    let mut unresolved_path_warnings = Vec::new();
-    for assertion in &mut contract.assertions {
-        if let AssertionKind::FileExists { path, .. } = &assertion.kind {
-            if contains_variable_reference(path) {
-                unresolved_path_warnings.push(format!(
-                    "assertion path '{}' still contains an unresolved variable (no ARG/ENV \
-                     default in scope); it cannot match the built image",
-                    path
-                ));
-                if assertion.confidence == Confidence::High {
-                    assertion.confidence = Confidence::Low;
-                }
-            }
-        }
-    }
-    contract.warnings.extend(unresolved_path_warnings);
-
     contract
+}
+
+/// A USER instruction folded to its effective final value across the stage chain.
+struct FoldedUser {
+    /// The raw instruction argument, for provenance and warnings.
+    raw: String,
+    /// The variable-resolved value.
+    resolved: String,
+    /// Source line of the winning USER instruction.
+    line: usize,
+    /// Whether resolution left an unresolved variable reference.
+    unresolved: bool,
+}
+
+/// Build the assertion for a resolved USER value: a numeric uid is checked via
+/// `id -u`, a named user via a user-exists assertion (dropping any `:group`).
+fn make_user_assertion(user: &FoldedUser) -> ContractAssertion {
+    if user.resolved.chars().all(|c| c.is_ascii_digit()) {
+        ContractAssertion::new(
+            AssertionKind::CommandOutput {
+                command: "id -u".to_string(),
+                exit_status: 0,
+                expected_output: vec![user.resolved.clone()],
+            },
+            format!("USER {}", user.raw),
+            user.line,
+            Confidence::High,
+        )
+    } else {
+        let username = user.resolved.split(':').next().unwrap_or(&user.resolved);
+        ContractAssertion::new(
+            AssertionKind::UserExists {
+                username: username.to_string(),
+            },
+            format!("USER {}", user.raw),
+            user.line,
+            Confidence::High,
+        )
+    }
 }
 
 /// Resolve the chain of build stages the target stage inherits from, ordered
@@ -373,23 +452,38 @@ pub fn extract_contract(
 /// Following the chain lets the extractor process the ancestors' `ARG`/`ENV`/
 /// `WORKDIR`/`USER`/... before the target stage so variable references resolve.
 ///
-/// Alias matching mirrors [`Dockerfile::resolve_target`] (case-insensitive). A
-/// stage can only reference stages declared before it, so each hop moves to a
-/// strictly earlier `from_line`; that guarantees termination even if a malformed
-/// Dockerfile reused an alias. A `FROM` naming an external image (or an unknown
-/// alias) ends the walk, so a single-stage build yields just `[stage]`.
-fn resolve_stage_chain<'a>(dockerfile: &'a Dockerfile, target: &'a Stage) -> Vec<&'a Stage> {
+/// Each stage's `FROM` image is variable-resolved (against `resolver`, which holds
+/// the pre-FROM scope of build args + globals) before it is matched, so
+/// `FROM ${BASE}` resolves to `base` and still finds the internal stage. Alias
+/// matching is case-insensitive, mirroring [`Dockerfile::resolve_target`].
+///
+/// A stage can only reference stages declared before it, so a candidate parent
+/// must have a strictly earlier `from_line`; among matches the nearest preceding
+/// one wins (Docker's last-declared-alias-wins). The strictly-decreasing
+/// `from_line` also guarantees termination even if a malformed Dockerfile reused
+/// an alias. A `FROM` naming an external image (or an unknown alias) ends the
+/// walk, so a single-stage build yields just `[stage]`.
+fn resolve_stage_chain<'a>(
+    dockerfile: &'a Dockerfile,
+    target: &'a Stage,
+    resolver: &VariableResolver,
+) -> Vec<&'a Stage> {
     let mut chain = vec![target];
     let mut current = target;
 
     loop {
-        let parent = dockerfile.stages.iter().find(|candidate| {
-            candidate.from_line < current.from_line
-                && candidate
-                    .alias
-                    .as_ref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&current.image))
-        });
+        let resolved_image = resolver.resolve(&current.image);
+        let parent = dockerfile
+            .stages
+            .iter()
+            .filter(|candidate| {
+                candidate.from_line < current.from_line
+                    && candidate
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(&resolved_image))
+            })
+            .max_by_key(|candidate| candidate.from_line);
 
         match parent {
             Some(parent) => {
@@ -506,13 +600,18 @@ fn make_process_assertion(
     ))
 }
 
+/// Resolve a COPY/ADD destination against variables and the current WORKDIR,
+/// returning the absolute path and whether resolution left an unresolved variable
+/// (in which case the caller must not emit an assertion — the real path is
+/// unknown). `current_workdir` is always fully resolved (an unresolved WORKDIR is
+/// dropped upstream), so any unresolved reference comes from `dest` itself.
 fn resolve_dest_path(
     dest: &str,
     resolver: &crate::parser::VariableResolver,
     current_workdir: &str,
-) -> String {
-    let resolved_dest = resolver.resolve(dest);
-    if resolved_dest.starts_with('/') {
+) -> (String, bool) {
+    let (resolved_dest, unresolved) = resolver.resolve_checked(dest);
+    let full = if resolved_dest.starts_with('/') {
         resolved_dest
     } else {
         format!(
@@ -520,7 +619,8 @@ fn resolve_dest_path(
             current_workdir.trim_end_matches('/'),
             resolved_dest
         )
-    }
+    };
+    (full, unresolved)
 }
 
 fn is_entrypoint_path(path: &str) -> bool {
@@ -676,10 +776,10 @@ WORKDIR $DEST
     }
 
     #[test]
-    fn test_unresolved_workdir_path_not_high_confidence() {
+    fn test_unresolved_workdir_path_is_dropped_and_warns() {
         // Safety net, independent of chain walking: a WORKDIR referencing a
-        // variable that no ARG/ENV in scope defines must not ship at High
-        // confidence and must surface a warning.
+        // variable that no ARG/ENV in scope defines cannot match the built image,
+        // so no assertion is emitted (in any profile) and a warning is surfaced.
         let content = r#"
 FROM alpine
 WORKDIR $UNDECLARED
@@ -687,55 +787,234 @@ WORKDIR $UNDECLARED
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
 
-        let workdir = contract
-            .assertions
-            .iter()
-            .find(|a| {
-                matches!(
-                    &a.kind,
-                    AssertionKind::FileExists { path, .. } if path.contains('$')
-                )
-            })
-            .expect("expected the unresolved workdir assertion to be present");
-        assert_ne!(
-            workdir.confidence,
-            Confidence::High,
-            "an unresolved path must not be High confidence"
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains('$')
+            )),
+            "an unresolved path must not be emitted at all: {:?}",
+            contract.assertions
         );
+        assert_eq!(contract.workdir, None);
         assert!(
             contract
                 .warnings
                 .iter()
-                .any(|w| w.contains("unresolved variable")),
-            "expected a warning about the unresolved path, got: {:?}",
+                .any(|w| w.contains("WORKDIR") && w.contains("unresolved variable")),
+            "expected a warning about the unresolved WORKDIR, got: {:?}",
             contract.warnings
         );
     }
 
     #[test]
-    fn test_no_high_confidence_assertion_retains_variable_path() {
+    fn test_no_variable_path_survives_in_any_kind() {
         // Invariant: across a Dockerfile that mixes resolvable and unresolvable
-        // paths, no FileExists assertion carrying a `$` in its path is High.
+        // paths, no FileExists assertion carries a `$` in its path at all — the
+        // unresolvable ones are dropped, the resolvable one survives.
         let content = r#"
 FROM alpine
 WORKDIR /real
 WORKDIR $MISSING
 COPY app /real/app
+COPY other $MISSING/other
 "#;
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
 
-        for assertion in &contract.assertions {
-            if let AssertionKind::FileExists { path, .. } = &assertion.kind {
-                if path.contains('$') {
-                    assert_ne!(
-                        assertion.confidence,
-                        Confidence::High,
-                        "assertion with unresolved path {path} must not be High"
-                    );
-                }
-            }
-        }
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains('$')
+            )),
+            "no unresolved path should survive: {:?}",
+            contract.assertions
+        );
+        // The resolvable COPY into /real/app is still asserted.
+        assert!(contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path == "/real/app"
+        )));
+    }
+
+    #[test]
+    fn test_escaped_literal_dollar_path_is_not_flagged_unresolved() {
+        // `\$` produces a legitimate literal `$` in the value; resolving a WORKDIR
+        // that references it must NOT be mistaken for an unresolved variable, so
+        // the assertion is kept at High confidence with no warning.
+        let content = "FROM alpine\nENV LITERAL=\\$HOME\nWORKDIR $LITERAL\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let workdir = contract
+            .assertions
+            .iter()
+            .find(|a| {
+                matches!(&a.kind, AssertionKind::FileExists { filetype, .. }
+                if filetype.as_deref() == Some("directory"))
+            })
+            .expect("expected a workdir directory assertion");
+        assert_eq!(workdir.confidence, Confidence::High);
+        assert_eq!(contract.workdir, Some("/$HOME".to_string()));
+        assert!(
+            contract.warnings.is_empty(),
+            "a legitimate literal-dollar path must not warn: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn test_from_alias_via_build_arg_is_resolved() {
+        // `FROM ${BASE}` where BASE resolves to an internal stage alias must still
+        // follow the chain, inherit its ENV, and report the underlying image.
+        let content = r#"
+ARG BASE=base
+FROM node:20 AS base
+ENV APP_HOME=/app
+
+FROM ${BASE}
+WORKDIR $APP_HOME
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.base_image, "node:20");
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+    }
+
+    #[test]
+    fn test_effective_user_across_chain_is_emitted_once() {
+        // A parent USER overridden by a child USER must yield exactly one id -u
+        // assertion carrying the child's (effective) uid, not the parent's.
+        let content = r#"
+FROM alpine AS base
+USER 1000
+
+FROM base
+USER 2000
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let uid_assertions: Vec<&Vec<String>> = contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::CommandOutput {
+                    command,
+                    expected_output,
+                    ..
+                } if command == "id -u" => Some(expected_output),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uid_assertions.len(),
+            1,
+            "expected exactly one id -u assertion, got: {uid_assertions:?}"
+        );
+        assert_eq!(uid_assertions[0], &vec!["2000".to_string()]);
+        assert_eq!(contract.user, Some("2000".to_string()));
+    }
+
+    #[test]
+    fn test_unresolved_user_is_dropped_and_warns() {
+        let content = r#"
+FROM alpine
+USER $UNDECLARED
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::UserExists { username } if username.contains('$')
+            )),
+            "an unresolved USER must not be asserted: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("USER") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_stage_local_arg_does_not_cross_from_boundary() {
+        // Docker scopes ARG to the stage that declares it; a child stage does not
+        // inherit it. So `WORKDIR $BUILD_DIR` in the child is unresolved and gets
+        // dropped with a warning rather than resolving to the parent's ARG value.
+        let content = r#"
+FROM alpine AS base
+ARG BUILD_DIR=/build
+
+FROM base
+WORKDIR $BUILD_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("build")
+            )),
+            "stage-local ARG must not leak into the child stage: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("WORKDIR") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_env_still_crosses_from_boundary() {
+        // Complement to the ARG test: ENV *does* persist across the FROM boundary.
+        let content = r#"
+FROM alpine AS base
+ENV BUILD_DIR=/build
+
+FROM base
+WORKDIR $BUILD_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.workdir, Some("/build".to_string()));
+    }
+
+    #[test]
+    fn test_child_entrypoint_resets_inherited_cmd() {
+        // Docker resets a CMD inherited from the base image when the child stage
+        // sets its own ENTRYPOINT.
+        let content = "FROM alpine AS base\nENTRYPOINT [\"/base-ep\"]\nCMD [\"/base-cmd\"]\n\nFROM base\nENTRYPOINT [\"/child-ep\"]\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert!(contract.cmd.is_none(), "inherited CMD should be reset");
+        assert!(contract.entrypoint.is_some());
+    }
+
+    #[test]
+    fn test_parent_user_and_expose_inherited_by_child() {
+        // The child declares neither USER nor EXPOSE; both come from the base
+        // stage and must appear in the child's contract.
+        let content = r#"
+FROM alpine AS base
+USER 1500
+EXPOSE 7000
+
+FROM base
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.user, Some("1500".to_string()));
+        assert!(contract
+            .assertions
+            .iter()
+            .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: 7000, .. })));
     }
 
     #[test]
