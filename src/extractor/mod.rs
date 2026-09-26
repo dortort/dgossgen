@@ -1151,6 +1151,25 @@ CMD ["node", "server.js"]
     }
 
     #[test]
+    fn test_redeclared_global_arg_takes_later_default() {
+        let content = r#"
+ARG PICK=old
+ARG PICK=base
+FROM alpine:3.19 AS base
+ENV APP_HOME=/app
+FROM ${PICK}
+WORKDIR $APP_HOME
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.base_image, "alpine:3.19");
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+
+        let contract = extract_contract(&df, None, &[("PICK".to_string(), "other".to_string())]);
+        assert_eq!(contract.base_image, "other");
+    }
+
+    #[test]
     fn test_global_arg_with_unresolved_default_is_not_bound() {
         let content = r#"
 ARG APP_DIR=${PREFIX}/app
