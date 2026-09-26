@@ -35,12 +35,15 @@ impl VariableResolver {
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
-            if !self.vars.contains_key(&arg.name) {
-                if let Some(default) = &arg.default {
-                    let (resolved, unresolved) = self.resolve_checked(default);
-                    if !unresolved {
-                        self.vars.insert(arg.name.clone(), resolved);
-                    }
+            if self.locked.contains(&arg.name) {
+                continue;
+            }
+            if let Some(default) = &arg.default {
+                let (resolved, unresolved) = self.resolve_checked(default);
+                if unresolved {
+                    self.vars.remove(&arg.name);
+                } else {
+                    self.vars.insert(arg.name.clone(), resolved);
                 }
             }
         }
