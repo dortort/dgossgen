@@ -77,12 +77,22 @@ impl VariableResolver {
         self.locked.insert(key.to_string());
     }
 
-    /// Remove a binding, if present. Used when an ENV reassigns a variable to an
-    /// unresolvable value: the previous value no longer holds in the built image,
-    /// and leaving it would let a later reference resolve to a stale value.
+    /// Remove a binding and any lock, if present. Used for an ARG re-declared with
+    /// an unresolved default: the ARG carries no precedence, so a later ARG/ENV of
+    /// the same name may legitimately rebind it.
     pub fn unset(&mut self, key: &str) {
         self.locked.remove(key);
         self.vars.remove(key);
+    }
+
+    /// Drop a variable's value but keep it locked. Used when an ENV assignment is
+    /// unresolvable: Docker still binds the name (empty) and keeps ENV precedence
+    /// over any later ARG of the same name, so the lock must remain even though we
+    /// have no usable value — a reference to it resolves as unresolved (and is
+    /// dropped), while a later ARG cannot override it.
+    pub fn taint(&mut self, key: &str) {
+        self.vars.remove(key);
+        self.locked.insert(key.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string.
