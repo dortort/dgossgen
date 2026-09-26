@@ -1532,6 +1532,39 @@ FROM $BASE_IMAGE
     }
 
     #[test]
+    fn test_global_arg_default_references_earlier_global() {
+        // A global ARG default that references an earlier global ARG is expanded in
+        // declaration order, so the FROM image reference resolves correctly.
+        let content = r#"
+ARG ACTUAL=alpine:3.20
+ARG IMG=${ACTUAL}
+FROM ${IMG}
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.base_image, "alpine:3.20");
+    }
+
+    #[test]
+    fn test_global_arg_default_chain_resolves_internal_alias() {
+        // The chained global default also resolves an internal-stage alias so the
+        // FROM chain is followed and the base stage's ENV is inherited.
+        let content = r#"
+ARG ACTUAL=base
+ARG PICK=${ACTUAL}
+FROM node:20 AS base
+ENV APP_HOME=/app
+
+FROM ${PICK}
+WORKDIR $APP_HOME
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.base_image, "node:20");
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+    }
+
+    #[test]
     fn test_build_arg_overrides_global_arg_for_base_image() {
         let content = r#"
 ARG BASE_IMAGE=ubuntu:22.04

@@ -43,12 +43,16 @@ impl VariableResolver {
 
     /// Load ARGs declared before the first FROM. These are ARG defaults (not
     /// locked): a stage that re-declares the name with a new default overrides
-    /// them, while a build arg still wins.
+    /// them, while a build arg still wins. Defaults are resolved in declaration
+    /// order against the args loaded before them, so a global default that
+    /// references an earlier global (`ARG ACTUAL=base` / `ARG BASE=${ACTUAL}`) is
+    /// expanded rather than stored verbatim.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
             if !self.vars.contains_key(&arg.name) {
                 if let Some(default) = &arg.default {
-                    self.vars.insert(arg.name.clone(), default.clone());
+                    let resolved = self.resolve(default);
+                    self.vars.insert(arg.name.clone(), resolved);
                 }
             }
         }
