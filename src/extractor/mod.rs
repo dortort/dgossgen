@@ -190,11 +190,18 @@ pub fn extract_contract(
                         Some(def) => {
                             let (resolved_def, unresolved) = resolver.resolve_checked(def);
                             if unresolved {
-                                contract.warnings.push(format!(
-                                    "ARG '{name}={def}' references an unresolved variable (no \
-                                     ARG/ENV default in scope); '{name}' is left undefined"
-                                ));
-                                resolver.declare_arg(name, None);
+                                // A build-arg/ENV value legitimately wins and is kept
+                                // silently. Otherwise the default cannot be resolved:
+                                // clear any inherited ARG default this re-declaration
+                                // replaces and leave the name undefined, so a
+                                // downstream use is itself flagged and dropped.
+                                if !resolver.is_locked(name) {
+                                    resolver.unset(name);
+                                    contract.warnings.push(format!(
+                                        "ARG '{name}={def}' references an unresolved variable (no \
+                                         ARG/ENV default in scope); '{name}' is left undefined"
+                                    ));
+                                }
                             } else {
                                 resolver.declare_arg(name, Some(&resolved_def));
                             }
@@ -1252,6 +1259,72 @@ WORKDIR $DIR
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
         assert_eq!(contract.workdir, Some("/opt/sub".to_string()));
+    }
+
+    #[test]
+    fn test_child_arg_redeclaration_overrides_inherited_default() {
+        // A child stage that re-declares an inherited ARG with a new default takes
+        // that new default (Docker's last-declared default wins, absent a build-arg).
+        let content = r#"
+FROM alpine AS base
+ARG DIR=/base
+
+FROM base
+ARG DIR=/child
+WORKDIR $DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.workdir, Some("/child".to_string()));
+    }
+
+    #[test]
+    fn test_build_arg_wins_over_redeclared_arg_default() {
+        // A command-line build-arg outranks every ARG default, inherited or
+        // re-declared, in every stage.
+        let content = r#"
+FROM alpine AS base
+ARG DIR=/base
+
+FROM base
+ARG DIR=/child
+WORKDIR $DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "/cli".to_string())]);
+        assert_eq!(contract.workdir, Some("/cli".to_string()));
+    }
+
+    #[test]
+    fn test_arg_redeclared_unresolved_clears_prior_default() {
+        // Re-declaring an ARG with an unresolved default invalidates the inherited
+        // default (Docker would set it empty) rather than keeping the stale value.
+        let content = r#"
+FROM alpine
+ARG DIR=/good
+ARG DIR=$UNDEF
+WORKDIR $DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.workdir, None);
+        assert!(!contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path == "/good"
+        )));
+    }
+
+    #[test]
+    fn test_build_arg_survives_unresolved_arg_redeclaration() {
+        // A build-arg value must not be cleared by a later unresolved ARG default.
+        let content = r#"
+FROM alpine
+ARG DIR=$UNDEF
+WORKDIR $DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "/cli".to_string())]);
+        assert_eq!(contract.workdir, Some("/cli".to_string()));
     }
 
     #[test]
