@@ -75,6 +75,14 @@ const CASES: &[Case] = &[
         fixture: "cmd_before_entrypoint.Dockerfile",
         profile: Profile::Standard,
     },
+    // internal_base_stage's final stage is `FROM base`, an internal alias whose
+    // ENV/WORKDIR the final stage inherits (issue #23). The golden pins that the
+    // rendered paths resolve to /app with no literal `$APP_HOME` leaking through.
+    Case {
+        name: "internal_base_stage",
+        fixture: "internal_base_stage.Dockerfile",
+        profile: Profile::Standard,
+    },
 ];
 
 fn generate_case(case: &Case) -> generator::GeneratorOutput {

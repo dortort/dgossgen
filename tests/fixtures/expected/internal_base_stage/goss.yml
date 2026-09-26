@@ -1,0 +1,15 @@
+file:
+  # derived from WORKDIR $APP_HOME; confidence: high
+  /app:
+    exists: true
+    filetype: directory
+  # derived from COPY  $APP_HOME/package.json; confidence: medium
+  /app/package.json:
+    exists: true
+  # derived from COPY  $APP_HOME/server.js; confidence: medium
+  /app/server.js:
+    exists: true
+process:
+  # derived from ENTRYPOINT node server.js; confidence: medium
+  node:
+    running: true
