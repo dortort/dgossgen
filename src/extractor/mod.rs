@@ -4,7 +4,10 @@ mod model;
 pub use heuristics::*;
 pub use model::*;
 
-use crate::parser::{CommandForm, Dockerfile, Instruction, PortSpec, VariableResolver};
+use crate::parser::{
+    contains_variable_reference, CommandForm, Dockerfile, Instruction, PortSpec, Stage,
+    VariableResolver,
+};
 use crate::Confidence;
 
 /// Maximum number of individual ports expanded from a single `EXPOSE low-high`
@@ -23,14 +26,27 @@ pub fn extract_contract(
         None => return RuntimeContract::default(),
     };
 
+    // A final stage whose `FROM` names an earlier stage in the same file inherits
+    // that ancestor's accumulated filesystem and metadata (ENV, WORKDIR, USER,
+    // EXPOSE, ENTRYPOINT, ...). Walk the internal `FROM <alias>` chain so those
+    // ancestors are processed before the target stage; without this, a
+    // `WORKDIR $APP_HOME` in the final stage never sees the `ENV APP_HOME` set in
+    // its base stage and gets emitted as the literal path `/$APP_HOME`.
+    let chain = resolve_stage_chain(dockerfile, stage);
+
     let mut resolver = VariableResolver::new();
     resolver.load_build_args(build_args);
     resolver.load_global_args(&dockerfile.global_args);
 
     // Resolve the base image against build args and pre-FROM globals only: a stage-body
     // ARG/ENV appears after FROM and cannot influence how the image reference resolved.
+    // Report the chain's root image (the first non-alias FROM), not the internal alias.
+    let root_image = chain
+        .first()
+        .map(|s| s.image.as_str())
+        .unwrap_or(stage.image.as_str());
     let mut contract = RuntimeContract {
-        base_image: resolver.resolve(&stage.image),
+        base_image: resolver.resolve(root_image),
         ..Default::default()
     };
 
@@ -46,10 +62,13 @@ pub fn extract_contract(
     let mut fold_cmd: Option<(CommandForm, usize)> = None;
     let mut fold_healthcheck: Option<(HealthcheckInfo, usize)> = None;
 
-    // Walk instructions in source order, updating the variable map as ARG/ENV are seen so
-    // every instruction resolves against the variables defined above it. A later ENV
-    // redefinition therefore cannot retroactively change how an earlier instruction resolved.
-    for inst in &stage.instructions {
+    // Walk instructions in source order across the whole inherited chain (root
+    // ancestor first, target stage last), updating the variable map as ARG/ENV are
+    // seen so every instruction resolves against the variables defined above it. A
+    // later ENV redefinition therefore cannot retroactively change how an earlier
+    // instruction resolved, and a child stage's instructions resolve against the
+    // ENV/ARG its base stage established.
+    for inst in chain.iter().flat_map(|s| s.instructions.iter()) {
         match &inst.instruction {
             Instruction::Workdir(dir) => {
                 let resolved = resolver.resolve(dir);
@@ -320,7 +339,69 @@ pub fn extract_contract(
         heuristics::generate_service_assertions(&contract.installed_components);
     contract.assertions.extend(service_assertions);
 
+    // Safety net: a filesystem-path assertion whose path still contains an
+    // unresolved variable (e.g. `/$APP_HOME` because no ARG/ENV in scope defines
+    // it) can never pass in the built image. Never let such a path ship at High
+    // confidence — where it would read as a trustworthy assertion — and warn so
+    // the gap is visible instead of surfacing later as a baffling dgoss failure.
+    // This guards every reason resolution can fail, independent of chain walking.
+    let mut unresolved_path_warnings = Vec::new();
+    for assertion in &mut contract.assertions {
+        if let AssertionKind::FileExists { path, .. } = &assertion.kind {
+            if contains_variable_reference(path) {
+                unresolved_path_warnings.push(format!(
+                    "assertion path '{}' still contains an unresolved variable (no ARG/ENV \
+                     default in scope); it cannot match the built image",
+                    path
+                ));
+                if assertion.confidence == Confidence::High {
+                    assertion.confidence = Confidence::Low;
+                }
+            }
+        }
+    }
+    contract.warnings.extend(unresolved_path_warnings);
+
     contract
+}
+
+/// Resolve the chain of build stages the target stage inherits from, ordered
+/// root ancestor first and the target stage last.
+///
+/// A stage's `FROM` may name an earlier stage's alias (`FROM base`), in which
+/// case Docker starts it from that ancestor's final filesystem and metadata.
+/// Following the chain lets the extractor process the ancestors' `ARG`/`ENV`/
+/// `WORKDIR`/`USER`/... before the target stage so variable references resolve.
+///
+/// Alias matching mirrors [`Dockerfile::resolve_target`] (case-insensitive). A
+/// stage can only reference stages declared before it, so each hop moves to a
+/// strictly earlier `from_line`; that guarantees termination even if a malformed
+/// Dockerfile reused an alias. A `FROM` naming an external image (or an unknown
+/// alias) ends the walk, so a single-stage build yields just `[stage]`.
+fn resolve_stage_chain<'a>(dockerfile: &'a Dockerfile, target: &'a Stage) -> Vec<&'a Stage> {
+    let mut chain = vec![target];
+    let mut current = target;
+
+    loop {
+        let parent = dockerfile.stages.iter().find(|candidate| {
+            candidate.from_line < current.from_line
+                && candidate
+                    .alias
+                    .as_ref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&current.image))
+        });
+
+        match parent {
+            Some(parent) => {
+                chain.push(parent);
+                current = parent;
+            }
+            None => break,
+        }
+    }
+
+    chain.reverse();
+    chain
 }
 
 /// Whether a command form is an empty exec form (`[]`), which Docker treats as clearing
@@ -507,6 +588,154 @@ ENTRYPOINT ["/app/app"]
 
         assert_eq!(contract.base_image, "alpine:3.18");
         assert_eq!(contract.workdir, Some("/app".to_string()));
+    }
+
+    #[test]
+    fn test_internal_from_alias_inherits_parent_env() {
+        // The final stage is `FROM base`, an internal alias; it must inherit the
+        // ENV declared in the base stage so `WORKDIR $APP_HOME` resolves to /app
+        // and base_image reports the underlying image, not the alias.
+        let content = r#"
+FROM node:20 AS base
+ENV APP_HOME=/app
+
+FROM base
+WORKDIR $APP_HOME
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.base_image, "node:20");
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+
+        let has_app_dir = contract.assertions.iter().any(|a| {
+            matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, filetype, .. }
+                    if path == "/app" && filetype.as_deref() == Some("directory")
+            )
+        });
+        assert!(
+            has_app_dir,
+            "expected a FileExists directory assertion on /app, got: {:?}",
+            contract.assertions
+        );
+
+        // No assertion may retain a literal, unresolved `$`-bearing path.
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains('$')
+            )),
+            "an unresolved path leaked into the assertions: {:?}",
+            contract.assertions
+        );
+        assert!(
+            contract.warnings.is_empty(),
+            "inheritance should resolve cleanly with no warnings: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn test_internal_from_chain_transits_multiple_hops() {
+        // ENV set in the root stage `a` must reach the final stage through the
+        // intermediate stage `b` (a -> b -> final).
+        let content = r#"
+FROM debian:12 AS a
+ENV ROOT_DIR=/srv/app
+
+FROM a AS b
+ENV SUBDIR=data
+
+FROM b
+WORKDIR $ROOT_DIR/$SUBDIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.base_image, "debian:12");
+        assert_eq!(contract.workdir, Some("/srv/app/data".to_string()));
+    }
+
+    #[test]
+    fn test_case_insensitive_from_alias_is_followed() {
+        // Docker matches stage aliases case-insensitively; the chain walk must too.
+        let content = r#"
+FROM alpine:3.19 AS Build
+ENV DEST=/opt/tool
+
+FROM build
+WORKDIR $DEST
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.base_image, "alpine:3.19");
+        assert_eq!(contract.workdir, Some("/opt/tool".to_string()));
+    }
+
+    #[test]
+    fn test_unresolved_workdir_path_not_high_confidence() {
+        // Safety net, independent of chain walking: a WORKDIR referencing a
+        // variable that no ARG/ENV in scope defines must not ship at High
+        // confidence and must surface a warning.
+        let content = r#"
+FROM alpine
+WORKDIR $UNDECLARED
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        let workdir = contract
+            .assertions
+            .iter()
+            .find(|a| {
+                matches!(
+                    &a.kind,
+                    AssertionKind::FileExists { path, .. } if path.contains('$')
+                )
+            })
+            .expect("expected the unresolved workdir assertion to be present");
+        assert_ne!(
+            workdir.confidence,
+            Confidence::High,
+            "an unresolved path must not be High confidence"
+        );
+        assert!(
+            contract
+                .warnings
+                .iter()
+                .any(|w| w.contains("unresolved variable")),
+            "expected a warning about the unresolved path, got: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn test_no_high_confidence_assertion_retains_variable_path() {
+        // Invariant: across a Dockerfile that mixes resolvable and unresolvable
+        // paths, no FileExists assertion carrying a `$` in its path is High.
+        let content = r#"
+FROM alpine
+WORKDIR /real
+WORKDIR $MISSING
+COPY app /real/app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        for assertion in &contract.assertions {
+            if let AssertionKind::FileExists { path, .. } = &assertion.kind {
+                if path.contains('$') {
+                    assert_ne!(
+                        assertion.confidence,
+                        Confidence::High,
+                        "assertion with unresolved path {path} must not be High"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
