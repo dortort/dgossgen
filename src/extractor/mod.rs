@@ -158,6 +158,17 @@ pub fn extract_contract(
                             contract.warnings.push(w);
                         }
                         for port_spec in specs {
+                            // The image config represents an exposed port as one
+                            // effective entry, but walking the chain can encounter the
+                            // same port in an ancestor and a child. Deduplicate by
+                            // (protocol, port) so a single port is not counted twice
+                            // (which would, e.g., make the interactive flow's
+                            // `exposed_ports.len() > 1` branch prompt spuriously).
+                            if contract.exposed_ports.iter().any(|p| {
+                                p.port == port_spec.port && p.protocol == port_spec.protocol
+                            }) {
+                                continue;
+                            }
                             contract.exposed_ports.push(port_spec.clone());
                             contract.assertions.push(ContractAssertion::new(
                                 AssertionKind::PortListening {
@@ -222,11 +233,13 @@ pub fn extract_contract(
                                 "ENV '{key}={value}' references an unresolved variable (no \
                                  ARG/ENV default in scope); '{key}' is left undefined"
                             ));
-                            // Invalidate any prior binding: a reassignment
-                            // (`ENV DIR=/old` then `ENV DIR=$MISSING`) replaced the
-                            // old value in the built image, so a later `$DIR` must be
-                            // unresolved and dropped, not resolve to the stale value.
-                            resolver.unset(key);
+                            // Drop the value but keep the name locked: a
+                            // reassignment (`ENV DIR=/old` then `ENV DIR=$MISSING`)
+                            // replaced the old value, so a later `$DIR` must be
+                            // unresolved and dropped, not resolve to the stale value;
+                            // and ENV keeps precedence over any later ARG of the same
+                            // name, so the lock must remain.
+                            resolver.taint(key);
                             continue;
                         }
                         resolver.set_var(key, &resolved_val);
@@ -1244,6 +1257,53 @@ WORKDIR $FOO
             .warnings
             .iter()
             .any(|w| w.contains("ENV") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_env_unresolved_keeps_precedence_over_later_arg() {
+        // An unresolved ENV assignment still holds ENV precedence: a later ARG of
+        // the same name must NOT override it, so the value stays unknown (dropped),
+        // never the ARG's value.
+        let content = r#"
+FROM alpine
+ENV DIR=$MISSING
+ARG DIR=new
+WORKDIR /app/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("new")
+            )),
+            "a later ARG must not override an ENV's precedence: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_duplicate_exposed_port_across_chain_deduped() {
+        // The same port EXPOSEd in an ancestor and its child must appear once.
+        let content = r#"
+FROM alpine AS base
+EXPOSE 8080
+
+FROM base
+EXPOSE 8080
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(
+            contract.exposed_ports.len(),
+            1,
+            "duplicate inherited port should be deduped: {:?}",
+            contract.exposed_ports
+        );
+        assert_eq!(contract.exposed_ports[0].port, 8080);
     }
 
     #[test]
