@@ -75,9 +75,7 @@ const CASES: &[Case] = &[
         fixture: "cmd_before_entrypoint.Dockerfile",
         profile: Profile::Standard,
     },
-    // internal_base_stage's final stage is `FROM base`, an internal alias whose
-    // ENV/WORKDIR the final stage inherits (issue #23). The golden pins that the
-    // rendered paths resolve to /app with no literal `$APP_HOME` leaking through.
+    // internal_base_stage: `FROM base` (an internal alias) must resolve $APP_HOME, not leak it.
     Case {
         name: "internal_base_stage",
         fixture: "internal_base_stage.Dockerfile",
