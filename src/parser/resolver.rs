@@ -154,7 +154,13 @@ impl VariableResolver {
     }
 }
 
-fn contains_variable_reference(input: &str) -> bool {
+/// Whether `input` still contains a syntactic variable reference (`$NAME` or
+/// `${NAME}`). Unlike [`VariableResolver::has_unresolved`], this is a pure
+/// textual check that does **not** re-resolve `input` against any variable map,
+/// so it reports what is literally present in an already-resolved string. Use it
+/// to detect a stored path that was captured before its variable could be
+/// resolved, where re-resolving with a later-populated map would mask the gap.
+pub fn contains_variable_reference(input: &str) -> bool {
     let mut iter = input.char_indices().peekable();
     while let Some((_, ch)) = iter.next() {
         if ch != '$' {
