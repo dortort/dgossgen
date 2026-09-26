@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::ArgInstruction;
 
@@ -13,6 +13,12 @@ pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 #[derive(Default)]
 pub struct VariableResolver {
     vars: HashMap<String, String>,
+    /// Names whose value is *locked* by a CLI `--build-arg` or an `ENV` binding.
+    /// Docker gives both precedence over an `ARG` instruction's default, so a
+    /// later `ARG NAME=default` must not overwrite a locked value. An `ARG`
+    /// default binding is *not* locked, so a re-declaration in a child stage can
+    /// replace it.
+    locked: HashSet<String>,
 }
 
 impl VariableResolver {
@@ -20,14 +26,18 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load build args (from CLI --build-arg flags).
+    /// Load build args (from CLI --build-arg flags). These lock the name so a
+    /// later `ARG NAME=default` cannot overwrite the command-line value.
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
             self.vars.insert(k.clone(), v.clone());
+            self.locked.insert(k.clone());
         }
     }
 
-    /// Load ARGs declared before the first FROM.
+    /// Load ARGs declared before the first FROM. These are ARG defaults (not
+    /// locked): a stage that re-declares the name with a new default overrides
+    /// them, while a build arg still wins.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
             if !self.vars.contains_key(&arg.name) {
@@ -38,27 +48,40 @@ impl VariableResolver {
         }
     }
 
-    /// Declare a stage-body ARG, adopting its default only when the name is not
-    /// already bound. A build arg or an earlier declaration therefore wins, and a
-    /// bare `ARG NAME` (no default) leaves any prior binding untouched.
+    /// Declare a stage-body `ARG NAME[=default]`. A value locked by a build arg
+    /// or ENV always wins, so the default is ignored there. Otherwise the default
+    /// (when present) becomes the binding, *overwriting* an inherited ARG default
+    /// so a child stage's `ARG NAME=other` re-declaration takes effect. A bare
+    /// `ARG NAME` only brings the name into scope and leaves any binding untouched.
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
-        if !self.vars.contains_key(name) {
-            if let Some(val) = default {
-                self.vars.insert(name.to_string(), val.to_string());
-            }
+        if self.locked.contains(name) {
+            return;
+        }
+        if let Some(val) = default {
+            self.vars.insert(name.to_string(), val.to_string());
         }
     }
 
+    /// Whether a name's value is locked by a build arg or ENV (and so must not be
+    /// treated as an undefined ARG default even when a re-declaration fails to
+    /// resolve).
+    pub fn is_locked(&self, name: &str) -> bool {
+        self.locked.contains(name)
+    }
+
     /// Bind an ENV variable to an already-resolved value, overwriting any prior
-    /// binding. The binding takes effect only for instructions that follow it.
+    /// binding and locking it against a later ARG default. The binding takes
+    /// effect only for instructions that follow it.
     pub fn set_var(&mut self, key: &str, value: &str) {
         self.vars.insert(key.to_string(), value.to_string());
+        self.locked.insert(key.to_string());
     }
 
     /// Remove a binding, if present. Used when an ENV reassigns a variable to an
     /// unresolvable value: the previous value no longer holds in the built image,
     /// and leaving it would let a later reference resolve to a stale value.
     pub fn unset(&mut self, key: &str) {
+        self.locked.remove(key);
         self.vars.remove(key);
     }
 
