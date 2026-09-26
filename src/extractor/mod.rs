@@ -49,14 +49,16 @@ pub fn extract_contract(
         ..Default::default()
     };
 
-    let mut current_workdir = String::from("/");
+    // `None` marks the working directory as unknown: an earlier WORKDIR referenced
+    // a variable we could not resolve, so we cannot compute where a later relative
+    // COPY/ADD would land. An absolute, resolvable WORKDIR re-establishes it.
+    let mut current_workdir: Option<String> = Some(String::from("/"));
 
-    // ENV persists across a `FROM <alias>` boundary — it is part of the image
-    // config the child inherits — but ARG does not: a stage's ARG goes out of
-    // scope at its end. Carry the resolved ENV forward across stages and reset the
-    // ARG scope (rebuild the resolver from build args + globals + inherited ENV) at
-    // each new stage.
-    let mut inherited_env: Vec<(String, String)> = Vec::new();
+    // A stage started with `FROM <alias>` inherits its ancestor's image config,
+    // and Docker inherits both ENV *and* ARG into a stage based on the one that
+    // declared them. A single resolver shared across the whole chain therefore
+    // models the inheritance directly — a child stage's instructions resolve
+    // against the ARG/ENV its base stage established.
 
     // Docker applies last-wins semantics to ENTRYPOINT, CMD, HEALTHCHECK, and USER:
     // only the final effective occurrence takes effect. Rather than emit an
@@ -75,49 +77,54 @@ pub fn extract_contract(
     // seen so every instruction resolves against the variables defined above it. A
     // later ENV redefinition therefore cannot retroactively change how an earlier
     // instruction resolved, and a child stage's instructions resolve against the
-    // ENV its base stage established.
+    // ARG/ENV its base stage established.
     for (stage_idx, chain_stage) in chain.iter().enumerate() {
-        if stage_idx > 0 {
-            // New stage: ENV carries over, but the ARG scope resets.
-            resolver = VariableResolver::new();
-            resolver.load_build_args(build_args);
-            resolver.load_global_args(&dockerfile.global_args);
-            for (key, value) in &inherited_env {
-                resolver.set_var(key, value);
-            }
-        }
-
         for inst in &chain_stage.instructions {
             match &inst.instruction {
                 Instruction::Workdir(dir) => {
                     let (resolved, unresolved) = resolver.resolve_checked(dir);
-                    if unresolved {
-                        // We cannot determine the real directory, so an assertion on it
-                        // could never match the built image. Drop it (in every profile)
-                        // and warn rather than ship silent wrong output.
+                    // Determine the new absolute working directory, or `None` if it
+                    // cannot be known: an unresolved variable, or a relative WORKDIR
+                    // stacked on an already-unknown directory. A directory we cannot
+                    // determine must not be asserted (it could never match), and it
+                    // also invalidates later relative COPY/ADD destinations.
+                    let new_workdir = if unresolved {
                         contract.warnings.push(format!(
                             "WORKDIR '{dir}' contains an unresolved variable (no ARG/ENV \
-                         default in scope); no directory assertion generated"
+                             default in scope); no directory assertion generated"
                         ));
-                        continue;
-                    }
-                    if resolved.starts_with('/') {
-                        current_workdir = resolved.clone();
+                        None
+                    } else if resolved.starts_with('/') {
+                        Some(resolved.clone())
                     } else {
-                        current_workdir =
-                            format!("{}/{}", current_workdir.trim_end_matches('/'), resolved);
+                        match &current_workdir {
+                            Some(base) => {
+                                Some(format!("{}/{}", base.trim_end_matches('/'), resolved))
+                            }
+                            None => {
+                                contract.warnings.push(format!(
+                                    "WORKDIR '{dir}' is relative to a working directory that \
+                                     could not be resolved; no directory assertion generated"
+                                ));
+                                None
+                            }
+                        }
+                    };
+
+                    current_workdir = new_workdir.clone();
+                    contract.workdir = new_workdir.clone();
+                    if let Some(path) = new_workdir {
+                        contract.assertions.push(ContractAssertion::new(
+                            AssertionKind::FileExists {
+                                path,
+                                filetype: Some("directory".to_string()),
+                                mode: None,
+                            },
+                            format!("WORKDIR {}", dir),
+                            inst.line_number,
+                            Confidence::High,
+                        ));
                     }
-                    contract.workdir = Some(current_workdir.clone());
-                    contract.assertions.push(ContractAssertion::new(
-                        AssertionKind::FileExists {
-                            path: current_workdir.clone(),
-                            filetype: Some("directory".to_string()),
-                            mode: None,
-                        },
-                        format!("WORKDIR {}", dir),
-                        inst.line_number,
-                        Confidence::High,
-                    ));
                 }
 
                 Instruction::User(user) => {
@@ -180,32 +187,26 @@ pub fn extract_contract(
                     for (key, value) in pairs {
                         let resolved_val = resolver.resolve(value);
                         resolver.set_var(key, &resolved_val);
-                        // Record for inheritance into later stages (last-wins), so a
-                        // child stage seeded from inherited_env sees this ENV.
-                        if let Some(entry) = inherited_env.iter_mut().find(|(k, _)| k == key) {
-                            entry.1 = resolved_val.clone();
-                        } else {
-                            inherited_env.push((key.clone(), resolved_val.clone()));
-                        }
                         contract.env.push((key.clone(), resolved_val));
                     }
                 }
 
                 Instruction::Entrypoint(cmd) => {
-                    // Docker treats an empty exec form (`ENTRYPOINT []`) as clearing the
-                    // entrypoint; any other form overrides the previous one (last wins).
+                    // Docker resets a CMD inherited from the base image whenever a
+                    // derived stage sets ENTRYPOINT — in any form, including the empty
+                    // reset form `ENTRYPOINT []`. Clear a CMD that came from an earlier
+                    // stage in the chain; a CMD set within this same stage is unaffected.
+                    if let Some((_, _, cmd_stage)) = &fold_cmd {
+                        if *cmd_stage < stage_idx {
+                            fold_cmd = None;
+                        }
+                    }
+                    // An empty exec form clears the entrypoint; any other form
+                    // overrides the previous one (last wins).
                     if is_reset_exec(cmd) {
                         fold_entrypoint = None;
                     } else {
                         fold_entrypoint = Some((cmd.clone(), inst.line_number, stage_idx));
-                        // Docker resets a CMD inherited from the base image when a new
-                        // stage sets its own ENTRYPOINT. Clear a CMD that came from an
-                        // earlier stage in the chain; a CMD set within this stage stays.
-                        if let Some((_, _, cmd_stage)) = &fold_cmd {
-                            if *cmd_stage < stage_idx {
-                                fold_cmd = None;
-                            }
-                        }
                     }
                 }
 
@@ -251,15 +252,24 @@ pub fn extract_contract(
                 } => {
                     // Only assert on files copied from within the build (not from other stages
                     // where we can't know what was built), unless the dest is an absolute path
-                    let (full_dest, unresolved) =
-                        resolve_dest_path(dest, &resolver, &current_workdir);
-                    if unresolved {
-                        contract.warnings.push(format!(
-                            "COPY destination '{dest}' contains an unresolved variable (no \
-                         ARG/ENV default in scope); no file assertion generated"
-                        ));
-                        continue;
-                    }
+                    let full_dest =
+                        match resolve_dest_path(dest, &resolver, current_workdir.as_deref()) {
+                            DestPath::Resolved(path) => path,
+                            DestPath::UnresolvedVar => {
+                                contract.warnings.push(format!(
+                                    "COPY destination '{dest}' contains an unresolved variable \
+                                     (no ARG/ENV default in scope); no file assertion generated"
+                                ));
+                                continue;
+                            }
+                            DestPath::UnknownWorkdir => {
+                                contract.warnings.push(format!(
+                                    "COPY destination '{dest}' is relative to a working directory \
+                                     that could not be resolved; no file assertion generated"
+                                ));
+                                continue;
+                            }
+                        };
 
                     let confidence = Confidence::Medium;
 
@@ -312,15 +322,24 @@ pub fn extract_contract(
                     dest,
                     chmod,
                 } => {
-                    let (full_dest, unresolved) =
-                        resolve_dest_path(dest, &resolver, &current_workdir);
-                    if unresolved {
-                        contract.warnings.push(format!(
-                            "ADD destination '{dest}' contains an unresolved variable (no \
-                         ARG/ENV default in scope); no file assertion generated"
-                        ));
-                        continue;
-                    }
+                    let full_dest =
+                        match resolve_dest_path(dest, &resolver, current_workdir.as_deref()) {
+                            DestPath::Resolved(path) => path,
+                            DestPath::UnresolvedVar => {
+                                contract.warnings.push(format!(
+                                    "ADD destination '{dest}' contains an unresolved variable \
+                                     (no ARG/ENV default in scope); no file assertion generated"
+                                ));
+                                continue;
+                            }
+                            DestPath::UnknownWorkdir => {
+                                contract.warnings.push(format!(
+                                    "ADD destination '{dest}' is relative to a working directory \
+                                     that could not be resolved; no file assertion generated"
+                                ));
+                                continue;
+                            }
+                        };
 
                     contract.assertions.push(ContractAssertion::new(
                         AssertionKind::FileExists {
@@ -354,14 +373,20 @@ pub fn extract_contract(
     // Emit phase: generate the folded assertions once, from the effective final
     // state.
 
-    // USER: emit the effective final value. An unresolved value can never match
-    // the built image, so drop it (in every profile) and warn instead.
+    // USER: emit the effective final value. A value that is unresolved (still
+    // holds a variable) or empty (e.g. a variable that resolved to "") can never
+    // match the built image, so drop it (in every profile) and warn instead.
     if let Some(user) = &fold_user {
         contract.user = Some(user.resolved.clone());
         if user.unresolved {
             contract.warnings.push(format!(
                 "USER '{}' contains an unresolved variable (no ARG/ENV default in \
                  scope); no user assertion generated",
+                user.raw
+            ));
+        } else if user.resolved.is_empty() {
+            contract.warnings.push(format!(
+                "USER '{}' resolved to an empty value; no user assertion generated",
                 user.raw
             ));
         } else {
@@ -420,7 +445,9 @@ struct FoldedUser {
 /// Build the assertion for a resolved USER value: a numeric uid is checked via
 /// `id -u`, a named user via a user-exists assertion (dropping any `:group`).
 fn make_user_assertion(user: &FoldedUser) -> ContractAssertion {
-    if user.resolved.chars().all(|c| c.is_ascii_digit()) {
+    // An empty value is filtered out before this point; require at least one digit
+    // so an empty string is never mistaken for a numeric uid.
+    if !user.resolved.is_empty() && user.resolved.chars().all(|c| c.is_ascii_digit()) {
         ContractAssertion::new(
             AssertionKind::CommandOutput {
                 command: "id -u".to_string(),
@@ -600,27 +627,42 @@ fn make_process_assertion(
     ))
 }
 
-/// Resolve a COPY/ADD destination against variables and the current WORKDIR,
-/// returning the absolute path and whether resolution left an unresolved variable
-/// (in which case the caller must not emit an assertion — the real path is
-/// unknown). `current_workdir` is always fully resolved (an unresolved WORKDIR is
-/// dropped upstream), so any unresolved reference comes from `dest` itself.
+/// Outcome of resolving a COPY/ADD destination.
+enum DestPath {
+    /// A fully-resolved absolute destination path.
+    Resolved(String),
+    /// The destination itself contained an unresolved variable.
+    UnresolvedVar,
+    /// The destination is relative but the current working directory is unknown
+    /// (an earlier WORKDIR could not be resolved), so the absolute path is unknown.
+    UnknownWorkdir,
+}
+
+/// Resolve a COPY/ADD destination against variables and the current WORKDIR. An
+/// absolute destination stands on its own; a relative one is joined onto
+/// `current_workdir`, which is `None` when an earlier WORKDIR could not be
+/// resolved. Either failure means the real path is unknown and the caller must
+/// not emit an assertion for it.
 fn resolve_dest_path(
     dest: &str,
     resolver: &crate::parser::VariableResolver,
-    current_workdir: &str,
-) -> (String, bool) {
+    current_workdir: Option<&str>,
+) -> DestPath {
     let (resolved_dest, unresolved) = resolver.resolve_checked(dest);
-    let full = if resolved_dest.starts_with('/') {
-        resolved_dest
-    } else {
-        format!(
+    if unresolved {
+        return DestPath::UnresolvedVar;
+    }
+    if resolved_dest.starts_with('/') {
+        return DestPath::Resolved(resolved_dest);
+    }
+    match current_workdir {
+        Some(workdir) => DestPath::Resolved(format!(
             "{}/{}",
-            current_workdir.trim_end_matches('/'),
+            workdir.trim_end_matches('/'),
             resolved_dest
-        )
-    };
-    (full, unresolved)
+        )),
+        None => DestPath::UnknownWorkdir,
+    }
 }
 
 fn is_entrypoint_path(path: &str) -> bool {
@@ -940,10 +982,10 @@ USER $UNDECLARED
     }
 
     #[test]
-    fn test_stage_local_arg_does_not_cross_from_boundary() {
-        // Docker scopes ARG to the stage that declares it; a child stage does not
-        // inherit it. So `WORKDIR $BUILD_DIR` in the child is unresolved and gets
-        // dropped with a warning rather than resolving to the parent's ARG value.
+    fn test_stage_arg_inherited_by_dependent_stage() {
+        // Docker inherits an ARG declared in a base stage into a stage based on it
+        // (a `FROM <that-stage>`), just like ENV. So `WORKDIR $BUILD_DIR` in the
+        // child resolves to the base stage's ARG value.
         let content = r#"
 FROM alpine AS base
 ARG BUILD_DIR=/build
@@ -954,24 +996,12 @@ WORKDIR $BUILD_DIR
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[]);
 
-        assert_eq!(contract.workdir, None);
-        assert!(
-            !contract.assertions.iter().any(|a| matches!(
-                &a.kind,
-                AssertionKind::FileExists { path, .. } if path.contains("build")
-            )),
-            "stage-local ARG must not leak into the child stage: {:?}",
-            contract.assertions
-        );
-        assert!(contract
-            .warnings
-            .iter()
-            .any(|w| w.contains("WORKDIR") && w.contains("unresolved variable")));
+        assert_eq!(contract.workdir, Some("/build".to_string()));
     }
 
     #[test]
-    fn test_env_still_crosses_from_boundary() {
-        // Complement to the ARG test: ENV *does* persist across the FROM boundary.
+    fn test_env_crosses_from_boundary() {
+        // ENV also persists across the FROM boundary into a dependent stage.
         let content = r#"
 FROM alpine AS base
 ENV BUILD_DIR=/build
@@ -985,6 +1015,114 @@ WORKDIR $BUILD_DIR
     }
 
     #[test]
+    fn test_default_with_defined_nested_variable_resolves() {
+        // A `${VAR:-default}` default that itself references a defined variable is
+        // expanded, not emitted verbatim.
+        let content = r#"
+FROM alpine
+ENV SUB=inner
+WORKDIR ${MISSING:-/opt/$SUB}
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.workdir, Some("/opt/inner".to_string()));
+    }
+
+    #[test]
+    fn test_default_with_undefined_nested_variable_is_dropped() {
+        // A `${VAR:-default}` default that references an UNDEFINED variable must be
+        // flagged unresolved and dropped — never shipped as a literal `$`-path.
+        let content = r#"
+FROM alpine
+WORKDIR ${MISSING:-/x$BAR}
+COPY app ${DEST:-/opt/$SUB}/a
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains('$')
+            )),
+            "a nested-default unresolved path must not survive: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_unterminated_brace_path_is_dropped() {
+        // A malformed, unterminated `${...}` must be treated as unresolved, not
+        // shipped as a literal `$`-path.
+        let content = "FROM alpine\nWORKDIR /a/${UNTERM\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(!contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path.contains('$')
+        )));
+    }
+
+    #[test]
+    fn test_relative_copy_after_unresolved_workdir_is_suppressed() {
+        // Once a WORKDIR fails to resolve, the working directory is unknown, so a
+        // later *relative* COPY must not be asserted against the stale directory.
+        // An absolute COPY is still fine.
+        let content = r#"
+FROM alpine
+WORKDIR /real
+WORKDIR $MISSING
+COPY app app
+COPY other /abs/other
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path == "/real/app"
+            )),
+            "a relative COPY after an unresolved WORKDIR must not use the stale dir: {:?}",
+            contract.assertions
+        );
+        // The absolute COPY still lands.
+        assert!(contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path == "/abs/other"
+        )));
+    }
+
+    #[test]
+    fn test_empty_user_is_dropped_and_warns() {
+        // A USER whose variable resolves to an empty string must not be emitted as
+        // an `id -u` == "" assertion.
+        let content = r#"
+FROM alpine
+ARG U=
+USER $U
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::CommandOutput { command, .. } if command == "id -u"
+            )),
+            "an empty USER must not produce an id -u assertion: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("USER") && w.contains("empty")));
+    }
+
+    #[test]
     fn test_child_entrypoint_resets_inherited_cmd() {
         // Docker resets a CMD inherited from the base image when the child stage
         // sets its own ENTRYPOINT.
@@ -993,6 +1131,41 @@ WORKDIR $BUILD_DIR
         let contract = extract_contract(&df, None, &[]);
         assert!(contract.cmd.is_none(), "inherited CMD should be reset");
         assert!(contract.entrypoint.is_some());
+    }
+
+    #[test]
+    fn test_empty_entrypoint_resets_inherited_cmd() {
+        // Docker resets an inherited CMD when a derived stage sets ENTRYPOINT in any
+        // form, including the empty reset form `ENTRYPOINT []`. The inherited CMD
+        // must therefore not survive to become the process assertion.
+        let content = "FROM alpine AS base\nENTRYPOINT [\"/base-ep\"]\nCMD [\"/base-cmd\"]\n\nFROM base\nENTRYPOINT []\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert!(
+            contract.cmd.is_none(),
+            "inherited CMD should be reset by an empty ENTRYPOINT"
+        );
+        assert!(
+            !contract
+                .assertions
+                .iter()
+                .any(|a| matches!(&a.kind, AssertionKind::ProcessRunning { .. })),
+            "no process should be asserted from the reset base CMD: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_same_stage_cmd_after_entrypoint_is_kept() {
+        // The reset targets a CMD inherited from an earlier stage, not a CMD set in
+        // the same stage as the ENTRYPOINT.
+        let content = "FROM alpine\nENTRYPOINT [\"/ep\"]\nCMD [\"/cmd\"]\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert!(
+            contract.cmd.is_some(),
+            "a same-stage CMD must not be reset by the stage's ENTRYPOINT"
+        );
     }
 
     #[test]
