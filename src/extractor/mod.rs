@@ -180,12 +180,43 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    resolver.declare_arg(name, default.as_deref());
+                    // Resolve the default before binding so a default that references
+                    // another variable is expanded. If it references an *unresolved*
+                    // variable, do not bind a `$`-bearing value — that would launder
+                    // the unresolved reference past the resolve_checked guard when a
+                    // later instruction reads this ARG. Warn and leave it undefined so
+                    // the downstream use is itself flagged and dropped.
+                    match default.as_deref() {
+                        Some(def) => {
+                            let (resolved_def, unresolved) = resolver.resolve_checked(def);
+                            if unresolved {
+                                contract.warnings.push(format!(
+                                    "ARG '{name}={def}' references an unresolved variable (no \
+                                     ARG/ENV default in scope); '{name}' is left undefined"
+                                ));
+                                resolver.declare_arg(name, None);
+                            } else {
+                                resolver.declare_arg(name, Some(&resolved_def));
+                            }
+                        }
+                        None => resolver.declare_arg(name, None),
+                    }
                 }
 
                 Instruction::Env(pairs) => {
                     for (key, value) in pairs {
-                        let resolved_val = resolver.resolve(value);
+                        // Same guard as ARG: never bind a `$`-bearing value, which
+                        // would launder an unresolved reference (`ENV FOO=$UNDEF` then
+                        // `WORKDIR $FOO`) past the resolve_checked guard and ship a
+                        // `$`-path. Warn and leave the variable undefined instead.
+                        let (resolved_val, unresolved) = resolver.resolve_checked(value);
+                        if unresolved {
+                            contract.warnings.push(format!(
+                                "ENV '{key}={value}' references an unresolved variable (no \
+                                 ARG/ENV default in scope); '{key}' is left undefined"
+                            ));
+                            continue;
+                        }
                         resolver.set_var(key, &resolved_val);
                         contract.env.push((key.clone(), resolved_val));
                     }
@@ -1120,6 +1151,79 @@ USER $U
             .warnings
             .iter()
             .any(|w| w.contains("USER") && w.contains("empty")));
+    }
+
+    #[test]
+    fn test_env_referencing_undefined_var_does_not_launder() {
+        // `ENV FOO=$UNDEF` must not bind a `$`-bearing value that a later `$FOO`
+        // would then substitute back in, laundering the unresolved reference past
+        // the drop guard into a shipped `/$UNDEF` path/user.
+        let content = r#"
+FROM alpine
+ENV FOO=$UNDEF
+WORKDIR $FOO
+COPY app $FOO/app
+USER $FOO
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains('$')
+            )),
+            "no `$`-bearing path may ship: {:?}",
+            contract.assertions
+        );
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::UserExists { username } if username.contains('$')
+            )),
+            "no `$`-bearing username may ship: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("ENV") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_arg_referencing_undefined_var_does_not_launder() {
+        let content = r#"
+FROM alpine
+ARG FOO=$UNDEF
+WORKDIR $FOO
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(!contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path.contains('$')
+        )));
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("ARG") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_arg_default_referencing_defined_var_resolves() {
+        // An ARG default that references an already-defined variable is expanded,
+        // not stored verbatim.
+        let content = r#"
+FROM alpine
+ENV BASE=/opt
+ARG DIR=$BASE/sub
+WORKDIR $DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+        assert_eq!(contract.workdir, Some("/opt/sub".to_string()));
     }
 
     #[test]
