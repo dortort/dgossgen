@@ -186,7 +186,13 @@ pub fn extract_contract(
                 Instruction::Volume(volumes) => {
                     for vol in volumes {
                         let resolved = resolver.resolve(vol);
-                        contract.volumes.push(resolved);
+                        // One effective volume entry per path: walking the chain can
+                        // meet the same VOLUME in an ancestor and a child, and the
+                        // interactive flow iterates contract.volumes directly, so a
+                        // duplicate would prompt twice for the same mount.
+                        if !contract.volumes.contains(&resolved) {
+                            contract.volumes.push(resolved);
+                        }
                     }
                 }
 
@@ -1281,6 +1287,27 @@ WORKDIR /app/$DIR
             )),
             "a later ARG must not override an ENV's precedence: {:?}",
             contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_duplicate_volume_across_chain_deduped() {
+        // The same volume declared in an ancestor and its child must appear once.
+        let content = r#"
+FROM alpine AS base
+VOLUME /data
+
+FROM base
+VOLUME /data
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(
+            contract.volumes,
+            vec!["/data".to_string()],
+            "duplicate inherited volume should be deduped: {:?}",
+            contract.volumes
         );
     }
 
