@@ -215,6 +215,11 @@ pub fn extract_contract(
                                 "ENV '{key}={value}' references an unresolved variable (no \
                                  ARG/ENV default in scope); '{key}' is left undefined"
                             ));
+                            // Invalidate any prior binding: a reassignment
+                            // (`ENV DIR=/old` then `ENV DIR=$MISSING`) replaced the
+                            // old value in the built image, so a later `$DIR` must be
+                            // unresolved and dropped, not resolve to the stale value.
+                            resolver.unset(key);
                             continue;
                         }
                         resolver.set_var(key, &resolved_val);
@@ -1209,6 +1214,29 @@ WORKDIR $FOO
             .warnings
             .iter()
             .any(|w| w.contains("ARG") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_env_reassignment_to_unresolved_invalidates_prior_value() {
+        // Reassigning a variable to an unresolved value must invalidate its prior
+        // binding, not leave the stale value for a later reference to pick up.
+        let content = "FROM alpine\nENV DIR=/old\nENV DIR=$MISSING\nWORKDIR $DIR\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[]);
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path == "/old"
+            )),
+            "the stale /old value must not survive the reassignment: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.contains("ENV") && w.contains("unresolved variable")));
     }
 
     #[test]

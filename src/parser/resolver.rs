@@ -55,6 +55,13 @@ impl VariableResolver {
         self.vars.insert(key.to_string(), value.to_string());
     }
 
+    /// Remove a binding, if present. Used when an ENV reassigns a variable to an
+    /// unresolvable value: the previous value no longer holds in the built image,
+    /// and leaving it would let a later reference resolve to a stale value.
+    pub fn unset(&mut self, key: &str) {
+        self.vars.remove(key);
+    }
+
     /// Resolve ${VAR} and $VAR references in a string.
     pub fn resolve(&self, input: &str) -> String {
         self.resolve_checked(input).0
