@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::ArgInstruction;
 
@@ -13,6 +13,18 @@ pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 #[derive(Default)]
 pub struct VariableResolver {
     vars: HashMap<String, String>,
+    /// Names whose value is *locked* by a CLI `--build-arg` or an `ENV` binding.
+    /// Docker gives both precedence over an `ARG` instruction's default, so a
+    /// later `ARG NAME=default` must not overwrite a locked value. An `ARG`
+    /// default binding is *not* locked, so a re-declaration in a child stage can
+    /// replace it.
+    locked: HashSet<String>,
+    /// Names that are *set to an unknown value* — bound by an ENV whose value
+    /// could not be resolved (e.g. `ENV DIR=$MISSING`). The name is set (so a
+    /// `${DIR-word}`/`${DIR:-word}` default must not be substituted for it), but we
+    /// have no usable value, so any reference to it resolves as unresolved and is
+    /// dropped. A later resolvable binding clears the taint.
+    tainted: HashSet<String>,
 }
 
 impl VariableResolver {
@@ -20,44 +32,100 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load build args (from CLI --build-arg flags).
+    /// Load build args (from CLI --build-arg flags). These lock the name so a
+    /// later `ARG NAME=default` cannot overwrite the command-line value.
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
             self.vars.insert(k.clone(), v.clone());
+            self.locked.insert(k.clone());
         }
     }
 
-    /// Load ARGs declared before the first FROM.
+    /// Load ARGs declared before the first FROM. These are ARG defaults (not
+    /// locked): a stage that re-declares the name with a new default overrides
+    /// them, while a build arg still wins. Defaults are resolved in declaration
+    /// order against the args loaded before them, so a global default that
+    /// references an earlier global (`ARG ACTUAL=base` / `ARG BASE=${ACTUAL}`) is
+    /// expanded rather than stored verbatim.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
             if !self.vars.contains_key(&arg.name) {
                 if let Some(default) = &arg.default {
-                    self.vars.insert(arg.name.clone(), default.clone());
+                    let resolved = self.resolve(default);
+                    self.vars.insert(arg.name.clone(), resolved);
                 }
             }
         }
     }
 
-    /// Declare a stage-body ARG, adopting its default only when the name is not
-    /// already bound. A build arg or an earlier declaration therefore wins, and a
-    /// bare `ARG NAME` (no default) leaves any prior binding untouched.
+    /// Declare a stage-body `ARG NAME[=default]`. A value locked by a build arg
+    /// or ENV always wins, so the default is ignored there. Otherwise the default
+    /// (when present) becomes the binding, *overwriting* an inherited ARG default
+    /// so a child stage's `ARG NAME=other` re-declaration takes effect. A bare
+    /// `ARG NAME` only brings the name into scope and leaves any binding untouched.
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
-        if !self.vars.contains_key(name) {
-            if let Some(val) = default {
-                self.vars.insert(name.to_string(), val.to_string());
-            }
+        if self.locked.contains(name) {
+            return;
+        }
+        if let Some(val) = default {
+            self.vars.insert(name.to_string(), val.to_string());
         }
     }
 
+    /// Whether a name's value is locked by a build arg or ENV (and so must not be
+    /// treated as an undefined ARG default even when a re-declaration fails to
+    /// resolve).
+    pub fn is_locked(&self, name: &str) -> bool {
+        self.locked.contains(name)
+    }
+
     /// Bind an ENV variable to an already-resolved value, overwriting any prior
-    /// binding. The binding takes effect only for instructions that follow it.
+    /// binding and locking it against a later ARG default. The binding takes
+    /// effect only for instructions that follow it.
     pub fn set_var(&mut self, key: &str, value: &str) {
         self.vars.insert(key.to_string(), value.to_string());
+        self.locked.insert(key.to_string());
+        self.tainted.remove(key);
+    }
+
+    /// Remove a binding and any lock/taint, if present. Used for an ARG re-declared
+    /// with an unresolved default: the ARG carries no precedence, so a later
+    /// ARG/ENV of the same name may legitimately rebind it.
+    pub fn unset(&mut self, key: &str) {
+        self.locked.remove(key);
+        self.tainted.remove(key);
+        self.vars.remove(key);
+    }
+
+    /// Mark a variable set-but-unknown. Used when an ENV assignment is
+    /// unresolvable: Docker still binds the name and keeps ENV precedence over any
+    /// later ARG of the same name (so it is locked), but we have no usable value —
+    /// any reference to it resolves as unresolved (and is dropped), a `-`/`:-`
+    /// default is not substituted for it (the name is set), and a later ARG cannot
+    /// override it. A later resolvable ENV clears the taint via `set_var`.
+    pub fn taint(&mut self, key: &str) {
+        self.vars.remove(key);
+        self.locked.insert(key.to_string());
+        self.tainted.insert(key.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string.
     pub fn resolve(&self, input: &str) -> String {
+        self.resolve_checked(input).0
+    }
+
+    /// Resolve like [`VariableResolver::resolve`], additionally reporting whether
+    /// any `$VAR`/`${VAR}` reference could not be substituted (the variable was
+    /// undefined and carried no `:-`/`-` default).
+    ///
+    /// The flag is set during substitution, so a literal dollar produced by an
+    /// escaped `\$` never counts as unresolved — a value that legitimately
+    /// contains a literal `$NAME` is distinguished from one whose variable was
+    /// simply undefined. A textual scan of the *resolved* string cannot make that
+    /// distinction, because by then the escape marker has become a real `$`.
+    pub fn resolve_checked(&self, input: &str) -> (String, bool) {
         let mut result = String::with_capacity(input.len());
+        let mut unresolved = false;
         let mut iter = input.char_indices().peekable();
 
         while let Some((idx, ch)) = iter.next() {
@@ -100,14 +168,29 @@ impl VariableResolver {
 
                     if let Some(val) = self.vars.get(var_name) {
                         result.push_str(val);
+                    } else if self.tainted.contains(var_name) {
+                        // The name is set to an unknown value, so its `-`/`:-`
+                        // default does not apply and we cannot resolve it: flag
+                        // unresolved so the assertion is dropped.
+                        result.push_str(&input[idx..end_idx + 1]);
+                        unresolved = true;
                     } else if let Some(def) = default {
-                        result.push_str(def);
+                        // Resolve the default recursively so `${VAR:-$OTHER}`
+                        // expands `$OTHER` (and is flagged unresolved when `$OTHER`
+                        // is itself undefined) instead of emitting the literal
+                        // default text, which would leak a `$`-bearing value.
+                        let (resolved_def, def_unresolved) = self.resolve_checked(def);
+                        result.push_str(&resolved_def);
+                        unresolved |= def_unresolved;
                     } else {
                         result.push_str(&input[idx..end_idx + 1]);
+                        unresolved = true;
                     }
                 } else {
-                    // Unterminated ${...}: preserve the tail literally.
+                    // Unterminated ${...}: preserve the tail literally and flag it,
+                    // so a malformed reference is never treated as fully resolved.
                     result.push_str(&input[idx..]);
+                    unresolved = true;
                     break;
                 }
                 continue;
@@ -132,6 +215,7 @@ impl VariableResolver {
                     result.push_str(val);
                 } else {
                     result.push_str(&input[idx..name_end]);
+                    unresolved = true;
                 }
                 continue;
             }
@@ -139,72 +223,18 @@ impl VariableResolver {
             result.push('$');
         }
 
-        result
+        (result, unresolved)
     }
 
     /// Check if a string contains unresolved variables.
     pub fn has_unresolved(&self, input: &str) -> bool {
-        let resolved = self.resolve(input);
-        contains_variable_reference(&resolved)
+        self.resolve_checked(input).1
     }
 
     /// Get current variable map.
     pub fn variables(&self) -> &HashMap<String, String> {
         &self.vars
     }
-}
-
-fn contains_variable_reference(input: &str) -> bool {
-    let mut iter = input.char_indices().peekable();
-    while let Some((_, ch)) = iter.next() {
-        if ch != '$' {
-            continue;
-        }
-
-        let Some((_, next_ch)) = iter.peek().copied() else {
-            continue;
-        };
-
-        if next_ch == '{' {
-            iter.next(); // consume '{'
-            let mut name = String::new();
-            while let Some((_, current)) = iter.peek().copied() {
-                iter.next();
-                if current == '}' {
-                    if is_valid_var_name(&name) {
-                        return true;
-                    }
-                    break;
-                }
-                name.push(current);
-            }
-            continue;
-        }
-
-        if next_ch.is_ascii_alphabetic() || next_ch == '_' {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_valid_var_name(expr: &str) -> bool {
-    let var_name = if let Some(sep) = expr.find(":-") {
-        &expr[..sep]
-    } else if let Some(sep) = expr.find('-') {
-        &expr[..sep]
-    } else {
-        expr
-    };
-
-    let mut chars = var_name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -265,5 +295,51 @@ mod tests {
         assert!(!resolver.has_unresolved("Price is $5.00"));
         assert!(!resolver.has_unresolved("echo $$"));
         assert!(!resolver.has_unresolved("status is $?"));
+    }
+
+    #[test]
+    fn test_resolve_checked_default_with_defined_nested_var() {
+        let mut resolver = VariableResolver::new();
+        resolver.vars.insert("SUB".to_string(), "inner".to_string());
+        // The default is resolved recursively, and the reference is satisfied.
+        assert_eq!(
+            resolver.resolve_checked("${MISSING:-/opt/$SUB}"),
+            ("/opt/inner".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn test_resolve_checked_default_with_undefined_nested_var_is_unresolved() {
+        let resolver = VariableResolver::new();
+        // The default text itself carries an unresolved reference, so the whole
+        // result must be flagged unresolved rather than reported as clean.
+        let (value, unresolved) = resolver.resolve_checked("${MISSING:-/x$BAR}");
+        assert_eq!(value, "/x$BAR");
+        assert!(unresolved);
+    }
+
+    #[test]
+    fn test_resolve_checked_unterminated_brace_is_unresolved() {
+        let resolver = VariableResolver::new();
+        let (value, unresolved) = resolver.resolve_checked("/a/${UNTERM");
+        assert_eq!(value, "/a/${UNTERM");
+        assert!(unresolved);
+    }
+
+    #[test]
+    fn test_tainted_var_reference_is_unresolved_ignoring_default() {
+        let mut resolver = VariableResolver::new();
+        resolver.taint("DIR");
+        // A set-but-unknown var is unresolved for a bare reference and for both
+        // default forms — the default must not be substituted for a set name.
+        assert!(resolver.resolve_checked("$DIR").1);
+        assert!(resolver.resolve_checked("/srv/${DIR-fallback}").1);
+        assert!(resolver.resolve_checked("/srv/${DIR:-fallback}").1);
+        // A later resolvable binding clears the taint.
+        resolver.set_var("DIR", "real");
+        assert_eq!(
+            resolver.resolve_checked("/srv/${DIR-fallback}"),
+            ("/srv/real".to_string(), false)
+        );
     }
 }
