@@ -51,8 +51,10 @@ impl VariableResolver {
         for arg in args {
             if !self.vars.contains_key(&arg.name) {
                 if let Some(default) = &arg.default {
-                    let resolved = self.resolve(default);
-                    self.vars.insert(arg.name.clone(), resolved);
+                    let (resolved, unresolved) = self.resolve_checked(default);
+                    if !unresolved {
+                        self.vars.insert(arg.name.clone(), resolved);
+                    }
                 }
             }
         }
