@@ -6,7 +6,8 @@ pub use model::*;
 
 use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
 use crate::parser::{
-    CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage, VariableResolver,
+    escape_literal_dollars, CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage,
+    VariableResolver,
 };
 use crate::Confidence;
 
@@ -67,7 +68,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(dir);
+                    } = resolver.resolve_checked(&escape_literal_dollars(dir));
                     // `None` means unknown (unresolved, secret, or unknown base); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
@@ -120,7 +121,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(user);
+                    } = resolver.resolve_checked(&escape_literal_dollars(user));
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
                         resolved,
@@ -136,7 +137,7 @@ pub fn extract_contract(
                             value: resolved,
                             unresolved,
                             secret,
-                        } = resolver.resolve_checked(raw_token);
+                        } = resolver.resolve_checked(&escape_literal_dollars(raw_token));
                         if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
@@ -183,7 +184,7 @@ pub fn extract_contract(
                             value: resolved,
                             secret,
                             ..
-                        } = resolver.resolve_checked(vol);
+                        } = resolver.resolve_checked(&escape_literal_dollars(vol));
                         if secret {
                             contract.warnings.push(format!(
                                 "VOLUME '{vol}' uses a secret build arg; volume not recorded"
@@ -200,7 +201,8 @@ pub fn extract_contract(
                 Instruction::Arg { name, default } => {
                     match default.as_deref() {
                         Some(def) => {
-                            let resolved_def = resolver.resolve_checked(def);
+                            let resolved_def =
+                                resolver.resolve_checked(&escape_literal_dollars(def));
                             if resolved_def.unresolved {
                                 // Leave the name undefined so later uses drop with a warning.
                                 if !resolver.is_locked(name) {
@@ -687,7 +689,7 @@ fn resolve_dest_path(
         value: resolved_dest,
         unresolved,
         secret,
-    } = resolver.resolve_checked(dest);
+    } = resolver.resolve_checked(&escape_literal_dollars(dest));
     if unresolved {
         return DestPath::UnresolvedVar;
     }
@@ -735,6 +737,85 @@ CMD ["node", "server.js"]
         assert_eq!(contract.exposed_ports.len(), 1);
         assert_eq!(contract.exposed_ports[0].port, 3000);
         assert!(!contract.assertions.is_empty());
+    }
+
+    /// Collect every directory path asserted by a WORKDIR/COPY FileExists.
+    fn dir_paths(contract: &RuntimeContract) -> Vec<String> {
+        contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::FileExists { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_workdir_escaped_dollar_is_literal_path() {
+        // `\$HOME` is a literal `$HOME` path segment, not an (undefined) reference.
+        // Regression for issue #46: it must yield a High-confidence assertion for
+        // the literal path, not be dropped with an "unresolved variable" warning.
+        let content = "FROM alpine\nWORKDIR /opt/\\$HOME\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/$HOME".to_string()));
+        assert!(dir_paths(&contract).contains(&"/opt/$HOME".to_string()));
+        assert!(
+            contract.warnings.is_empty(),
+            "no unresolved-variable warning expected, got: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn test_workdir_braced_escaped_dollar_is_literal_path() {
+        // The `\${VAR}` brace form is escaped identically.
+        let content = "FROM alpine\nWORKDIR /opt/\\${HOME}\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/${HOME}".to_string()));
+    }
+
+    #[test]
+    fn test_workdir_double_backslash_keeps_reference_live() {
+        // `\\$APP` is a literal backslash followed by a *live* $APP reference.
+        let content = "FROM alpine\nENV APP=myapp\nWORKDIR /opt/\\\\$APP\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/\\myapp".to_string()));
+    }
+
+    #[test]
+    fn test_copy_dest_escaped_dollar_is_literal_path() {
+        // A COPY destination with an escaped `$` resolves to the literal path.
+        let content = "FROM alpine\nCOPY app.conf /etc/\\$CONF/app.conf\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert!(dir_paths(&contract).contains(&"/etc/$CONF/app.conf".to_string()));
+    }
+
+    #[test]
+    fn test_expose_escaped_dollar_flags_unresolved_not_a_reference() {
+        // `\$PORT` is a literal `$PORT`, which is not a valid port number; it must
+        // be reported as an invalid port, never expanded as an (undefined) variable.
+        let content = "FROM alpine\nEXPOSE \\$PORT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert!(contract.exposed_ports.is_empty());
+        assert!(
+            contract
+                .warnings
+                .iter()
+                .any(|w| w.contains("$PORT") && !w.contains("unresolved variable")),
+            "expected an invalid-port warning, got: {:?}",
+            contract.warnings
+        );
     }
 
     #[test]
