@@ -308,3 +308,65 @@ fn test_probe_with_warnings_code_path() {
     // the same emit_output helper, so the above test validates the fixed behavior.
     // This comment serves as documentation of the bug fix in cmd_probe.
 }
+
+#[test]
+fn test_explain_with_malformed_config_fails_loudly() {
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE 8080\n").unwrap();
+    fs::write(temp.path().join(".dgossgen.yml"), "assert_ports: [\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args(["explain", "-f", dockerfile.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("config"));
+}
+
+#[test]
+fn test_init_secret_build_arg_from_custom_pattern_never_reaches_output() {
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(
+        &dockerfile,
+        "FROM alpine\nARG INTERNAL_DIR\nWORKDIR /srv/$INTERNAL_DIR\nEXPOSE 8080\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join(".dgossgen.yml"),
+        "secret_patterns:\n  - INTERNAL\n",
+    )
+    .unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--build-arg",
+            "INTERNAL_DIR=xs3cr3tx",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "WORKDIR '/srv/$INTERNAL_DIR' uses a secret build arg",
+        ))
+        .stderr(predicates::str::contains("xs3cr3tx").not());
+    let output = assert.get_output();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("xs3cr3tx"));
+
+    for file in ["goss.yml", "goss_wait.yml"] {
+        let content = fs::read_to_string(output_dir.join(file)).unwrap();
+        assert!(!content.contains("xs3cr3tx"), "{file} leaked the secret");
+    }
+    assert!(fs::read_to_string(output_dir.join("goss_wait.yml"))
+        .unwrap()
+        .contains("8080"));
+}
