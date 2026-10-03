@@ -2663,4 +2663,62 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
         assert_eq!(ports, vec![8080]);
         assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
     }
+
+    #[test]
+    fn test_secret_build_arg_bound_at_stage_arg_drops_derived_workdir() {
+        let content = "FROM alpine\nARG DB_PASSWORD=/default\nARG DIR=/srv/$DB_PASSWORD\nWORKDIR $DIR\nWORKDIR /opt/$DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, None);
+        assert_eq!(
+            contract.warnings,
+            vec![
+                "WORKDIR '$DIR' uses a secret build arg; no directory assertion generated",
+                "WORKDIR '/opt/$DB_PASSWORD' uses a secret build arg; no directory assertion \
+                 generated",
+            ]
+        );
+        assert_no_leak(&contract, &["s3cr3tvalue", "/default"]);
+    }
+
+    #[test]
+    fn test_secret_build_arg_via_global_arg_redeclared_in_stage_drops_workdir() {
+        let content =
+            "ARG DB_PASSWORD=/default\nFROM alpine\nARG DB_PASSWORD\nWORKDIR /srv/$DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, None);
+        assert_eq!(
+            contract.warnings,
+            vec![
+                "WORKDIR '/srv/$DB_PASSWORD' uses a secret build arg; no directory assertion \
+                 generated"
+            ]
+        );
+        assert_no_leak(&contract, &["s3cr3tvalue"]);
+    }
+
+    #[test]
+    fn test_secret_build_arg_used_before_its_arg_neither_resolves_nor_leaks() {
+        let content =
+            "FROM alpine\nWORKDIR /srv/$DB_PASSWORD\nUSER ${DB_PASSWORD:-app}\nARG DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, None);
+        assert_eq!(contract.user, Some("app".to_string()));
+        assert_eq!(
+            contract.warnings,
+            vec![
+                "WORKDIR '/srv/$DB_PASSWORD' contains an unresolved variable (no ARG/ENV default \
+                 in scope); no directory assertion generated"
+            ]
+        );
+        assert_no_leak(&contract, &["s3cr3tvalue"]);
+    }
 }
