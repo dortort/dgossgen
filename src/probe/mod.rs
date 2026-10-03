@@ -80,10 +80,7 @@ pub struct ProbeEvidence {
     /// User info
     pub user: Option<String>,
     pub uid: Option<u32>,
-    /// Environment variables, with values redacted for keys the policy
-    /// classifies as secrets (see [`collect_evidence`]). The container's
-    /// runtime env can include secrets injected via `--env`/`--env-file`, so
-    /// this collection is sanitized at the point of capture.
+    /// Container env pairs; values of keys matching `secret_patterns` are `***REDACTED***`.
     pub env_vars: Vec<(String, String)>,
     /// Image inspect data
     pub image_config: Option<serde_json::Value>,
@@ -345,10 +342,6 @@ fn collect_evidence(
     if inspect_output.status.success() {
         let json_str = String::from_utf8_lossy(&inspect_output.stdout);
         if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            // `image inspect` echoes the image's `Config.Env` (and
-            // `ContainerConfig.Env`), which hold secret values verbatim. Redact
-            // them before storing so the stored evidence carries no cleartext
-            // secret, matching the treatment of the exec-collected env.
             redact_inspect_env(&mut val, policy);
             evidence.image_config = Some(val);
         }
@@ -415,11 +408,7 @@ fn collect_evidence(
     Ok(evidence)
 }
 
-/// Recursively redact secret values inside `image inspect` JSON. Any object key
-/// named `Env` holding an array of `KEY=VALUE` strings (Docker exposes the image
-/// env at `Config.Env` and `ContainerConfig.Env`) has each secret-keyed entry's
-/// value replaced with [`REDACTED_PLACEHOLDER`], leaving keys and structure
-/// intact. This keeps [`ProbeEvidence::image_config`] free of cleartext secrets.
+/// Replace secret-keyed values in every `Env` array of `image inspect` JSON with the placeholder.
 fn redact_inspect_env(value: &mut serde_json::Value, policy: &PolicyConfig) {
     match value {
         serde_json::Value::Object(map) => {
@@ -450,10 +439,7 @@ fn redact_inspect_env(value: &mut serde_json::Value, policy: &PolicyConfig) {
     }
 }
 
-/// Parse `env` command output into key/value pairs, redacting the value of any
-/// key the policy classifies as a secret. This is the enforcement point that
-/// keeps [`ProbeEvidence::env_vars`] sanitized regardless of what the container
-/// exposes (Dockerfile `ENV` values or secrets injected via `--env`/`--env-file`).
+/// Parse `env` output into key/value pairs, redacting the value of every secret-named key.
 fn parse_env_output(text: &str, policy: &PolicyConfig) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| line.split_once('='))
@@ -551,9 +537,7 @@ mod tests {
 
     #[test]
     fn test_parse_env_output_redacts_secrets() {
-        // A value whose whole line contains '=' (e.g. a base64 token) must split
-        // only on the first '='; non-secret keys are preserved verbatim while
-        // secret-keyed values are replaced, never stored.
+        // Values may contain '=', so each line splits on the first one only.
         let raw = "PATH=/usr/bin\nAPI_TOKEN=abc123\nDB_PASSWORD=p=a=ss\nLANG=C.UTF-8\n";
         let vars = parse_env_output(raw, &PolicyConfig::default());
 
@@ -576,8 +560,6 @@ mod tests {
 
     #[test]
     fn test_redact_inspect_env_sanitizes_config_env() {
-        // Mirrors `docker image inspect` shape: a top-level array of objects,
-        // each with Config.Env and ContainerConfig.Env holding KEY=VALUE strings.
         let mut val = serde_json::json!([{
             "Config": { "Env": ["PATH=/usr/bin", "DB_PASSWORD=hunter2"] },
             "ContainerConfig": { "Env": ["API_TOKEN=abc123", "LANG=C.UTF-8"] }
