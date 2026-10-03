@@ -40,7 +40,7 @@ pub fn extract_contract(
         .first()
         .map(|s| s.image.as_str())
         .unwrap_or(stage.image.as_str());
-    let resolved_root = resolver.resolve_checked(root_image);
+    let resolved_root = resolver.resolve_image(root_image);
     let mut contract = RuntimeContract {
         base_image: if resolved_root.secret {
             root_image.to_string()
@@ -545,7 +545,7 @@ fn resolve_stage_chain<'a>(
     let mut current = target;
 
     loop {
-        let resolved_image = resolver.resolve(&current.image);
+        let resolved_image = resolver.resolve_image(&current.image).value;
         let parent = dockerfile
             .stages
             .iter()
@@ -1687,6 +1687,73 @@ WORKDIR /app
             &PolicyConfig::default(),
         );
         assert_eq!(contract.base_image, "alpine:3.18");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_resolves_from_without_global_arg() {
+        // A supplied BuildKit automatic platform arg is in global scope, so a FROM can
+        // reference it without an ARG and the base image resolves.
+        let content = r#"
+FROM alpine:$TARGETARCH
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_not_in_stage_body_without_arg() {
+        // A platform arg is global-scope only: referenced in a stage body without an
+        // ARG it must not resolve, so no wrong assertion is emitted (Docker leaves it
+        // undefined there).
+        let content = r#"
+FROM alpine
+WORKDIR /opt/$TARGETARCH
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("arm64")
+            )),
+            "a platform arg must not resolve in a stage body without an ARG: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '/opt/$TARGETARCH'")));
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_in_stage_body_after_arg() {
+        // Redeclaring the platform arg with a stage ARG brings it into the stage body.
+        let content = r#"
+FROM alpine
+ARG TARGETARCH
+WORKDIR /opt/$TARGETARCH
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, Some("/opt/arm64".to_string()));
     }
 
     #[test]
