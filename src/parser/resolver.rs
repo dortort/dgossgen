@@ -8,6 +8,40 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
+/// Docker's predefined proxy build args. A supplied `--build-arg` value for one of
+/// these is usable *without* a corresponding `ARG` instruction anywhere in the build
+/// (global `FROM` lines and stage bodies alike), so dgossgen binds it immediately.
+/// See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
+const PROXY_BUILD_ARGS: &[&str] = &[
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// BuildKit's automatic platform build args. Unlike the proxy args, these live in the
+/// *global* scope only: a `FROM` may reference one without an `ARG`, but a stage body
+/// must redeclare it with `ARG` first. A supplied value is therefore available for
+/// `FROM`/global resolution but, like an ordinary build arg, stays deferred until a
+/// stage `ARG` brings it into the stage body.
+/// See <https://docs.docker.com/reference/dockerfile/#automatic-platform-args-in-the-global-scope>.
+const PLATFORM_BUILD_ARGS: &[&str] = &[
+    "TARGETPLATFORM",
+    "TARGETOS",
+    "TARGETARCH",
+    "TARGETVARIANT",
+    "BUILDPLATFORM",
+    "BUILDOS",
+    "BUILDARCH",
+    "BUILDVARIANT",
+];
+
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
 #[derive(Default)]
@@ -17,6 +51,9 @@ pub struct VariableResolver {
     locked: HashSet<String>,
     /// Names set to an unknown value (e.g. `ENV DIR=$MISSING`); resolve unresolved, no defaults.
     tainted: HashSet<String>,
+    /// CLI `--build-arg` values awaiting their `ARG` declaration before they enter scope.
+    /// Docker only binds a build arg at its global or stage `ARG`, not up front.
+    supplied_build_args: HashMap<String, String>,
 }
 
 impl VariableResolver {
@@ -24,12 +61,42 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load CLI --build-arg values; these lock the name against a later ARG default.
+    /// Store CLI `--build-arg` values. An ordinary build arg does not enter scope
+    /// here: it is bound only when its matching global or stage `ARG` declaration is
+    /// reached (see [`VariableResolver::declare_arg`]), matching Docker's scoping, and
+    /// a value with no corresponding `ARG` declaration is never in scope.
+    ///
+    /// The predefined proxy args are the exception: usable without an `ARG` anywhere,
+    /// so a supplied value is bound immediately. Automatic platform args are deferred
+    /// like an ordinary build arg (a stage body must redeclare them with `ARG`), but
+    /// are additionally honored in global/`FROM` resolution via [`Self::resolve_image`].
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
-            self.vars.insert(k.clone(), v.clone());
-            self.locked.insert(k.clone());
+            if PROXY_BUILD_ARGS.contains(&k.as_str()) {
+                self.vars.insert(k.clone(), v.clone());
+                self.locked.insert(k.clone());
+            } else {
+                self.supplied_build_args.insert(k.clone(), v.clone());
+            }
         }
+    }
+
+    /// Whether a `--build-arg` value was supplied for `name` (whether or not it is yet in scope).
+    pub fn has_supplied_build_arg(&self, name: &str) -> bool {
+        self.supplied_build_args.contains_key(name)
+    }
+
+    /// Look up `name` for resolution. In global scope (`FROM` lines), a supplied
+    /// automatic platform arg resolves even without an `ARG`; in stage-body scope it
+    /// does not (it must be redeclared with `ARG`, which binds it into `vars`).
+    fn lookup(&self, name: &str, global_scope: bool) -> Option<&str> {
+        if let Some(val) = self.vars.get(name) {
+            return Some(val);
+        }
+        if global_scope && PLATFORM_BUILD_ARGS.contains(&name) {
+            return self.supplied_build_args.get(name).map(String::as_str);
+        }
+        None
     }
 
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
@@ -38,8 +105,17 @@ impl VariableResolver {
             if self.locked.contains(&arg.name) {
                 continue;
             }
+            // A supplied build arg enters scope at its global ARG declaration and
+            // outranks the default (which Docker never evaluates in that case).
+            if let Some(val) = self.supplied_build_args.get(&arg.name).cloned() {
+                self.vars.insert(arg.name.clone(), val);
+                self.locked.insert(arg.name.clone());
+                continue;
+            }
             if let Some(default) = &arg.default {
-                let (resolved, unresolved) = self.resolve_checked(default);
+                // Global ARG defaults resolve in global scope, so one may reference an
+                // earlier global or an automatic platform arg.
+                let (resolved, unresolved) = self.resolve_checked_inner(default, true);
                 if unresolved {
                     self.vars.remove(&arg.name);
                 } else {
@@ -49,9 +125,18 @@ impl VariableResolver {
         }
     }
 
-    /// Declare a stage ARG default; a locked value wins, else it overwrites any inherited default.
+    /// Declare a stage ARG: a supplied build arg enters scope (and locks) here, else a
+    /// locked value wins, else the given default overwrites any inherited default.
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
         if self.locked.contains(name) {
+            return;
+        }
+        // A supplied build arg comes into scope at its ARG declaration, overriding the
+        // default, and locks the name against any later ARG default.
+        if let Some(val) = self.supplied_build_args.get(name).cloned() {
+            self.vars.insert(name.to_string(), val);
+            self.locked.insert(name.to_string());
+            self.tainted.remove(name);
             return;
         }
         if let Some(val) = default {
@@ -85,13 +170,26 @@ impl VariableResolver {
         self.tainted.insert(key.to_string());
     }
 
-    /// Resolve ${VAR} and $VAR references in a string.
+    /// Resolve ${VAR} and $VAR references in a string (stage-body scope).
     pub fn resolve(&self, input: &str) -> String {
         self.resolve_checked(input).0
     }
 
+    /// Resolve an image reference (`FROM`/base image) in global scope, where a supplied
+    /// automatic platform arg is in scope without an `ARG`.
+    pub fn resolve_image(&self, input: &str) -> String {
+        self.resolve_checked_inner(input, true).0
+    }
+
     /// Like [`VariableResolver::resolve`], also flags an undefined, defaultless reference.
+    /// Resolution uses stage-body scope.
     pub fn resolve_checked(&self, input: &str) -> (String, bool) {
+        self.resolve_checked_inner(input, false)
+    }
+
+    /// Resolve `${VAR}`/`$VAR` references. `global_scope` selects whether a supplied
+    /// automatic platform arg resolves without an `ARG` (see [`Self::lookup`]).
+    fn resolve_checked_inner(&self, input: &str, global_scope: bool) -> (String, bool) {
         let mut result = String::with_capacity(input.len());
         let mut unresolved = false;
         let mut iter = input.char_indices().peekable();
@@ -134,7 +232,7 @@ impl VariableResolver {
                         (var_expr, None)
                     };
 
-                    if let Some(val) = self.vars.get(var_name) {
+                    if let Some(val) = self.lookup(var_name, global_scope) {
                         result.push_str(val);
                     } else if self.tainted.contains(var_name) {
                         // Tainted: its dash-default doesn't apply since the name is set.
@@ -142,7 +240,8 @@ impl VariableResolver {
                         unresolved = true;
                     } else if let Some(def) = default {
                         // Resolve the default recursively so nested `$OTHER` refs expand too.
-                        let (resolved_def, def_unresolved) = self.resolve_checked(def);
+                        let (resolved_def, def_unresolved) =
+                            self.resolve_checked_inner(def, global_scope);
                         result.push_str(&resolved_def);
                         unresolved |= def_unresolved;
                     } else {
@@ -173,7 +272,7 @@ impl VariableResolver {
                 }
 
                 let var_name = &input[name_start..name_end];
-                if let Some(val) = self.vars.get(var_name) {
+                if let Some(val) = self.lookup(var_name, global_scope) {
                     result.push_str(val);
                 } else {
                     result.push_str(&input[idx..name_end]);
@@ -285,6 +384,220 @@ mod tests {
         let (value, unresolved) = resolver.resolve_checked("/a/${UNTERM");
         assert_eq!(value, "/a/${UNTERM");
         assert!(unresolved);
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_before_its_arg_declaration() {
+        // A supplied build arg must not resolve until its ARG declaration is reached.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())]);
+        let (value, unresolved) = resolver.resolve_checked("/base/$DIR");
+        assert_eq!(value, "/base/$DIR");
+        assert!(unresolved);
+        assert!(resolver.has_supplied_build_arg("DIR"));
+    }
+
+    #[test]
+    fn test_build_arg_enters_scope_at_arg_declaration() {
+        // declare_arg brings the supplied build arg into scope and locks it.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())]);
+        resolver.declare_arg("DIR", None);
+        assert_eq!(resolver.resolve("/base/$DIR"), "/base/child");
+        assert!(resolver.is_locked("DIR"));
+    }
+
+    #[test]
+    fn test_build_arg_overrides_default_at_declaration() {
+        // The build arg outranks the ARG default, which Docker never evaluates.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())]);
+        resolver.declare_arg("DIR", Some("/fallback"));
+        assert_eq!(resolver.resolve("$DIR"), "child");
+    }
+
+    #[test]
+    fn test_global_build_arg_enters_scope_at_global_arg() {
+        // A build arg matching a global ARG enters scope when the globals are loaded.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())]);
+        resolver.load_global_args(&[ArgInstruction {
+            name: "TAG".to_string(),
+            default: Some("latest".to_string()),
+        }]);
+        assert_eq!(resolver.resolve("alpine:$TAG"), "alpine:3.18");
+        assert!(resolver.is_locked("TAG"));
+    }
+
+    #[test]
+    fn test_build_arg_without_declaration_never_resolves() {
+        // With no global and no stage ARG, a supplied build arg stays out of scope.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())]);
+        resolver.load_global_args(&[]);
+        let (value, unresolved) = resolver.resolve_checked("alpine:$TAG");
+        assert_eq!(value, "alpine:$TAG");
+        assert!(unresolved);
+    }
+
+    #[test]
+    fn test_predefined_proxy_build_arg_in_scope_without_arg() {
+        // A predefined proxy build arg is usable without any ARG declaration.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("HTTPS_PROXY".to_string(), "http://proxy:8080".to_string())]);
+        let (value, unresolved) = resolver.resolve_checked("$HTTPS_PROXY");
+        assert_eq!(value, "http://proxy:8080");
+        assert!(!unresolved);
+        assert!(resolver.is_locked("HTTPS_PROXY"));
+        // It is bound immediately, not deferred to an ARG declaration.
+        assert!(!resolver.has_supplied_build_arg("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn test_lowercase_predefined_proxy_build_arg_in_scope_without_arg() {
+        // Docker predefines both cases; the lowercase variant is recognized too.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("no_proxy".to_string(), "localhost".to_string())]);
+        assert_eq!(resolver.resolve("$no_proxy"), "localhost");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_in_global_scope_only() {
+        // A supplied automatic platform arg resolves for a FROM image (global scope)
+        // without an ARG, but NOT in stage-body scope, where it must be redeclared.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        // Global scope (FROM): resolves.
+        assert_eq!(resolver.resolve_image("alpine:$TARGETARCH"), "alpine:arm64");
+        // Stage-body scope: unresolved (not bound without an ARG).
+        let (value, unresolved) = resolver.resolve_checked("/opt/$TARGETARCH");
+        assert_eq!(value, "/opt/$TARGETARCH");
+        assert!(unresolved);
+        // Deferred, not locked, until a stage ARG brings it in.
+        assert!(!resolver.is_locked("TARGETARCH"));
+        assert!(resolver.has_supplied_build_arg("TARGETARCH"));
+    }
+
+    #[test]
+    fn test_global_scope_propagates_into_dash_default_expansion() {
+        // A platform arg nested inside a `${VAR:-default}` dash-default of a FROM image
+        // must still resolve, i.e. the default text is expanded in global scope too.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        let (value, unresolved) =
+            resolver.resolve_checked_inner("${IMG:-alpine:$TARGETARCH}", true);
+        assert_eq!(value, "alpine:arm64");
+        assert!(!unresolved);
+        // Same expression via resolve_image (the FROM path).
+        assert_eq!(
+            resolver.resolve_image("${IMG:-alpine:$TARGETARCH}"),
+            "alpine:arm64"
+        );
+        // In stage-body scope the nested platform arg stays unresolved.
+        assert!(resolver.resolve_checked("${IMG:-alpine:$TARGETARCH}").1);
+    }
+
+    /// Independent copy of the proxy names, so dropping/misspelling an entry in the
+    /// production constant is caught by the equality assertion below (iterating the
+    /// constant itself could not detect a removed entry).
+    const EXPECTED_PROXY_ARGS: &[&str] = &[
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "FTP_PROXY",
+        "ftp_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    /// Independent copy of the automatic platform names; see [`EXPECTED_PROXY_ARGS`].
+    const EXPECTED_PLATFORM_ARGS: &[&str] = &[
+        "TARGETPLATFORM",
+        "TARGETOS",
+        "TARGETARCH",
+        "TARGETVARIANT",
+        "BUILDPLATFORM",
+        "BUILDOS",
+        "BUILDARCH",
+        "BUILDVARIANT",
+    ];
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_every_proxy_build_arg_resolves_immediately_anywhere() {
+        // The constant must match the expected set exactly (catches a dropped, added, or
+        // misspelled entry), and each proxy name must be usable without an ARG in
+        // stage-body scope.
+        assert_eq!(
+            sorted(PROXY_BUILD_ARGS),
+            sorted(EXPECTED_PROXY_ARGS),
+            "PROXY_BUILD_ARGS drifted from the expected set"
+        );
+        for name in EXPECTED_PROXY_ARGS {
+            let mut resolver = VariableResolver::new();
+            resolver.load_build_args(&[((*name).to_string(), "PVAL".to_string())]);
+            assert_eq!(
+                resolver.resolve(&format!("/p/${name}/x")),
+                "/p/PVAL/x",
+                "proxy arg {name} should resolve in stage-body scope"
+            );
+            assert!(
+                resolver.is_locked(name),
+                "proxy arg {name} should be locked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_platform_build_arg_is_global_scope_only() {
+        // The constant must match the expected set exactly, and each platform name must
+        // resolve for a FROM (global scope) but stay deferred in stage-body scope.
+        assert_eq!(
+            sorted(PLATFORM_BUILD_ARGS),
+            sorted(EXPECTED_PLATFORM_ARGS),
+            "PLATFORM_BUILD_ARGS drifted from the expected set"
+        );
+        for name in EXPECTED_PLATFORM_ARGS {
+            let mut resolver = VariableResolver::new();
+            resolver.load_build_args(&[((*name).to_string(), "VAL".to_string())]);
+            assert_eq!(
+                resolver.resolve_image(&format!("img:${name}")),
+                "img:VAL",
+                "platform arg {name} should resolve for a FROM image"
+            );
+            let (value, unresolved) = resolver.resolve_checked(&format!("/p/${name}/x"));
+            assert_eq!(
+                value,
+                format!("/p/${name}/x"),
+                "platform arg {name} must not resolve in stage-body scope without an ARG"
+            );
+            assert!(
+                unresolved,
+                "platform arg {name} should be unresolved in stage-body scope"
+            );
+            assert!(
+                !resolver.is_locked(name),
+                "platform arg {name} should stay deferred (unlocked) without an ARG"
+            );
+        }
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_enters_stage_scope_at_arg() {
+        // Redeclaring the platform arg with a stage ARG binds it into stage-body scope.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        resolver.declare_arg("TARGETARCH", None);
+        assert_eq!(resolver.resolve("/opt/$TARGETARCH"), "/opt/arm64");
+        assert!(resolver.is_locked("TARGETARCH"));
     }
 
     #[test]

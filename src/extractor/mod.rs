@@ -36,7 +36,7 @@ pub fn extract_contract(
         .map(|s| s.image.as_str())
         .unwrap_or(stage.image.as_str());
     let mut contract = RuntimeContract {
-        base_image: resolver.resolve(root_image),
+        base_image: resolver.resolve_image(root_image),
         ..Default::default()
     };
 
@@ -153,19 +153,25 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    match default.as_deref() {
-                        Some(def) => {
-                            let (resolved_def, unresolved) = resolver.resolve_checked(def);
-                            if unresolved {
-                                // Leave the name undefined so later uses drop with a warning.
-                                if !resolver.is_locked(name) {
-                                    resolver.unset(name);
+                    // A supplied --build-arg enters scope here and overrides the default
+                    // (which Docker never evaluates), so bind it before touching the default.
+                    if resolver.has_supplied_build_arg(name) {
+                        resolver.declare_arg(name, None);
+                    } else {
+                        match default.as_deref() {
+                            Some(def) => {
+                                let (resolved_def, unresolved) = resolver.resolve_checked(def);
+                                if unresolved {
+                                    // Leave the name undefined so later uses drop with a warning.
+                                    if !resolver.is_locked(name) {
+                                        resolver.unset(name);
+                                    }
+                                } else {
+                                    resolver.declare_arg(name, Some(&resolved_def));
                                 }
-                            } else {
-                                resolver.declare_arg(name, Some(&resolved_def));
                             }
+                            None => resolver.declare_arg(name, None),
                         }
-                        None => resolver.declare_arg(name, None),
                     }
                 }
 
@@ -461,7 +467,7 @@ fn resolve_stage_chain<'a>(
     let mut current = target;
 
     loop {
-        let resolved_image = resolver.resolve(&current.image);
+        let resolved_image = resolver.resolve_image(&current.image);
         let parent = dockerfile
             .stages
             .iter()
@@ -1341,6 +1347,285 @@ WORKDIR $DIR
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[("DIR".to_string(), "/cli".to_string())]);
         assert_eq!(contract.workdir, Some("/cli".to_string()));
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_before_arg_declaration_single_stage() {
+        // A build arg used before its ARG declaration is out of scope; no assertion is emitted.
+        let content = r#"
+FROM alpine
+WORKDIR /x/$DIR
+ARG DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "child".to_string())]);
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("child")
+            )),
+            "a build arg must not be in scope before its ARG declaration: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '/x/$DIR'")));
+    }
+
+    #[test]
+    fn test_build_arg_in_scope_after_arg_declaration() {
+        // Once the ARG declaration is reached, the build arg resolves for later instructions.
+        let content = r#"
+FROM alpine
+ARG DIR
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "child".to_string())]);
+        assert_eq!(contract.workdir, Some("/x/child".to_string()));
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_in_earlier_stage() {
+        // The issue's example: a later stage's ARG must not retroactively scope the build
+        // arg into an earlier stage's WORKDIR.
+        let content = r#"
+FROM alpine AS base
+WORKDIR /base/$DIR
+FROM base
+ARG DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "child".to_string())]);
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("child")
+            )),
+            "a later stage's ARG must not scope the build arg into an earlier WORKDIR: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_for_from_without_global_arg() {
+        // A build arg with no global ARG declaration must not resolve in a FROM image.
+        let content = r#"
+FROM alpine:$TAG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("TAG".to_string(), "3.18".to_string())]);
+        assert_eq!(contract.base_image, "alpine:$TAG");
+    }
+
+    #[test]
+    fn test_build_arg_in_scope_for_from_with_global_arg() {
+        // A build arg declared globally is in scope for the FROM image.
+        let content = r#"
+ARG TAG=latest
+FROM alpine:$TAG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("TAG".to_string(), "3.18".to_string())]);
+        assert_eq!(contract.base_image, "alpine:3.18");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_resolves_from_without_global_arg() {
+        // A supplied BuildKit automatic platform arg is in global scope, so a FROM can
+        // reference it without an ARG and the base image resolves.
+        let content = r#"
+FROM alpine:$TARGETARCH
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
+    fn test_global_arg_default_references_platform_arg_for_from() {
+        // A global ARG default may reference an automatic platform arg (global scope),
+        // and the resolved default then feeds a later FROM.
+        let content = r#"
+ARG IMG=alpine:$TARGETARCH
+FROM $IMG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
+    fn test_from_dash_default_resolves_nested_platform_arg() {
+        // A FROM image whose `${VAR:-default}` default nests a platform arg resolves in
+        // global scope: IMG is undeclared, so the default applies and must expand.
+        let content = r#"
+FROM ${IMG:-alpine:$TARGETARCH}
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_not_in_stage_body_without_arg() {
+        // A platform arg is global-scope only: referenced in a stage body without an
+        // ARG it must not resolve, so no wrong assertion is emitted (Docker leaves it
+        // undefined there).
+        let content = r#"
+FROM alpine
+WORKDIR /opt/$TARGETARCH
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("arm64")
+            )),
+            "a platform arg must not resolve in a stage body without an ARG: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '/opt/$TARGETARCH'")));
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_in_stage_body_after_arg() {
+        // Redeclaring the platform arg with a stage ARG brings it into the stage body.
+        let content = r#"
+FROM alpine
+ARG TARGETARCH
+WORKDIR /opt/$TARGETARCH
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.workdir, Some("/opt/arm64".to_string()));
+    }
+
+    #[test]
+    fn test_predefined_proxy_build_arg_resolves_env_without_arg() {
+        // A predefined proxy build arg (no ARG declaration) must be in scope for ENV,
+        // matching Docker, which predefines the proxy args.
+        let content = r#"
+FROM alpine
+ENV HTTPS_PROXY=$HTTPS_PROXY
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("HTTPS_PROXY".to_string(), "http://proxy:8080".to_string())],
+        );
+        assert!(
+            contract
+                .env
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://proxy:8080"),
+            "predefined proxy build arg should resolve the ENV: {:?}",
+            contract.env
+        );
+        assert!(
+            !contract
+                .warnings
+                .iter()
+                .any(|w| w.contains("HTTPS_PROXY") && w.contains("unresolved")),
+            "no unresolved-variable warning expected: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn test_build_arg_overrides_unresolved_default_before_evaluating_it() {
+        // A build arg wins over the default even when the default would be unresolved;
+        // Docker never evaluates the default in that case.
+        let content = r#"
+FROM alpine
+ARG DIR=$UNDEF
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "child".to_string())]);
+        assert_eq!(contract.workdir, Some("/x/child".to_string()));
+    }
+
+    #[test]
+    fn test_env_wins_over_same_name_build_arg_bound_arg() {
+        // Docker: ENV always overrides a same-name ARG, even with a --build-arg. This
+        // pins declare_arg checking `locked` BEFORE binding the supplied build arg;
+        // reversing that order would let the build arg wrongly override the ENV.
+        let content = r#"
+FROM alpine
+ENV DIR=/env
+ARG DIR
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "cli".to_string())]);
+        assert_eq!(contract.workdir, Some("/x//env".to_string()));
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("cli")
+            )),
+            "the supplied build arg must not override the ENV: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_tainted_env_wins_over_same_name_build_arg_bound_arg() {
+        // An unresolved (tainted) ENV also outranks a later same-name ARG bound from a
+        // --build-arg, so the reference drops with a warning rather than taking `cli`.
+        let content = r#"
+FROM alpine
+ENV DIR=$MISSING
+ARG DIR
+WORKDIR /app/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "cli".to_string())]);
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("cli")
+            )),
+            "a tainted ENV must keep precedence over a build-arg-bound ARG: {:?}",
+            contract.assertions
+        );
     }
 
     #[test]
