@@ -1453,6 +1453,24 @@ WORKDIR /app
     }
 
     #[test]
+    fn test_global_arg_default_references_platform_arg_for_from() {
+        // A global ARG default may reference an automatic platform arg (global scope),
+        // and the resolved default then feeds a later FROM.
+        let content = r#"
+ARG IMG=alpine:$TARGETARCH
+FROM $IMG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
     fn test_automatic_platform_build_arg_not_in_stage_body_without_arg() {
         // A platform arg is global-scope only: referenced in a stage body without an
         // ARG it must not resolve, so no wrong assertion is emitted (Docker leaves it
