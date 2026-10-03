@@ -716,4 +716,49 @@ mod tests {
         assert!(output.contains("exec: second"));
         assert!(output.contains("# derived from second; confidence: high"));
     }
+
+    #[test]
+    fn test_adversarial_strings_round_trip() {
+        let samples = [
+            "it's \"quoted\"",
+            "a: b",
+            "x #y",
+            "line one\nline two\n",
+            "-v",
+            "*alias",
+            "&anchor",
+            "!tag",
+            "%directive",
+            "@at",
+            "`tick`",
+            "yes",
+            "no",
+            "null",
+            "~",
+            "0755",
+            "1e5",
+            "a\u{2028}b\u{2029}c\u{85}d",
+            "",
+        ];
+        for sample in samples {
+            let resources = vec![GossResource::CommandWithOutput {
+                name: sample.to_string(),
+                command: sample.to_string(),
+                exit_status: 0,
+                stdout: vec![sample.to_string()],
+                timeout: 1000,
+                provenance: "RUN".to_string(),
+                confidence: Confidence::Low,
+            }];
+            let output = render_goss(&resources);
+            let parsed: serde_json::Value = serde_saphyr::from_str(&output)
+                .unwrap_or_else(|e| panic!("must parse: {e}\n{output}"));
+            let entry = &parsed["command"][sample];
+            assert_eq!(entry["exec"], sample, "exec must round-trip:\n{output}");
+            assert_eq!(
+                entry["stdout"][0], sample,
+                "stdout must round-trip:\n{output}"
+            );
+        }
+    }
 }

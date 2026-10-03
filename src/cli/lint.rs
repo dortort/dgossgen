@@ -96,4 +96,86 @@ mod tests {
         lint_goss_content(yaml, "goss.yml", &mut issues);
         assert!(issues.iter().any(|i| i.message.contains("ephemeral path")));
     }
+
+    fn lint(yaml: &str) -> Vec<String> {
+        let mut issues = Vec::new();
+        lint_goss_content(yaml, "goss.yml", &mut issues);
+        issues.into_iter().map(|i| i.message).collect()
+    }
+
+    #[test]
+    fn test_lint_non_string_keys_are_checked_as_strings() {
+        assert_eq!(
+            lint("command:\n  123:\n    exec: x\n  true:\n    exec: y\n"),
+            vec![
+                "Command '123' has no timeout (may hang)",
+                "Command 'true' has no timeout (may hang)",
+            ]
+        );
+        assert!(lint("1: x\nfile:\n  42:\n    exists: true\n").is_empty());
+    }
+
+    #[test]
+    fn test_lint_null_values_parse() {
+        assert!(lint("command:\nfile:\n").is_empty());
+        assert!(lint("command:\n  a:\n").is_empty());
+        assert_eq!(
+            lint("command:\n  a:\n    exec: x\n    timeout: ~\n"),
+            vec!["Command 'a' has no timeout (may hang)"]
+        );
+        assert!(lint("").is_empty());
+    }
+
+    #[test]
+    fn test_lint_null_or_complex_keys_are_invalid() {
+        assert_eq!(
+            lint("command:\n  ~:\n    exec: x\n"),
+            vec!["Invalid YAML syntax"]
+        );
+        assert_eq!(
+            lint("command:\n  ? [a, b]\n  : exec: x\n"),
+            vec!["Invalid YAML syntax"]
+        );
+    }
+
+    #[test]
+    fn test_lint_resolves_anchors_aliases_and_merge_keys() {
+        let yaml = "command:\n  a: &d\n    exec: x\n    timeout: 1000\n  b: *d\n  c:\n    <<: *d\n    exec: y\n";
+        assert!(lint(yaml).is_empty());
+    }
+
+    #[test]
+    fn test_lint_accepts_many_aliases_of_one_anchor() {
+        let mut yaml = String::from("defaults: &d {timeout: 1000}\ncommand:\n");
+        for i in 0..300 {
+            yaml.push_str(&format!("  c{i}:\n    <<: *d\n    exec: x\n"));
+        }
+        assert!(lint(&yaml).is_empty());
+    }
+
+    #[test]
+    fn test_lint_accepts_non_finite_floats() {
+        assert!(lint("command:\n  a:\n    exec: .nan\n    timeout: .inf\n")
+            .iter()
+            .all(|m| m != "Invalid YAML syntax"));
+    }
+
+    #[test]
+    fn test_lint_reports_in_document_order() {
+        assert_eq!(
+            lint("command:\n  zeta:\n    exec: x\n  alpha:\n    exec: y\n"),
+            vec![
+                "Command 'zeta' has no timeout (may hang)",
+                "Command 'alpha' has no timeout (may hang)",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lint_duplicate_key_is_invalid() {
+        assert_eq!(
+            lint("command:\n  a:\n    exec: x\n  a:\n    exec: y\n"),
+            vec!["Invalid YAML syntax"]
+        );
+    }
 }
