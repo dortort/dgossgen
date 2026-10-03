@@ -478,6 +478,25 @@ mod tests {
         assert!(resolver.has_supplied_build_arg("TARGETARCH"));
     }
 
+    #[test]
+    fn test_global_scope_propagates_into_dash_default_expansion() {
+        // A platform arg nested inside a `${VAR:-default}` dash-default of a FROM image
+        // must still resolve, i.e. the default text is expanded in global scope too.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        let (value, unresolved) =
+            resolver.resolve_checked_inner("${IMG:-alpine:$TARGETARCH}", true);
+        assert_eq!(value, "alpine:arm64");
+        assert!(!unresolved);
+        // Same expression via resolve_image (the FROM path).
+        assert_eq!(
+            resolver.resolve_image("${IMG:-alpine:$TARGETARCH}"),
+            "alpine:arm64"
+        );
+        // In stage-body scope the nested platform arg stays unresolved.
+        assert!(resolver.resolve_checked("${IMG:-alpine:$TARGETARCH}").1);
+    }
+
     /// Independent copy of the proxy names, so dropping/misspelling an entry in the
     /// production constant is caught by the equality assertion below (iterating the
     /// constant itself could not detect a removed entry).

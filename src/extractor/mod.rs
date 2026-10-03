@@ -1471,6 +1471,23 @@ WORKDIR /app
     }
 
     #[test]
+    fn test_from_dash_default_resolves_nested_platform_arg() {
+        // A FROM image whose `${VAR:-default}` default nests a platform arg resolves in
+        // global scope: IMG is undeclared, so the default applies and must expand.
+        let content = r#"
+FROM ${IMG:-alpine:$TARGETARCH}
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
     fn test_automatic_platform_build_arg_not_in_stage_body_without_arg() {
         // A platform arg is global-scope only: referenced in a stage body without an
         // ARG it must not resolve, so no wrong assertion is emitted (Docker leaves it
