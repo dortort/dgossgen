@@ -1436,6 +1436,39 @@ WORKDIR /app
     }
 
     #[test]
+    fn test_predefined_proxy_build_arg_resolves_env_without_arg() {
+        // A predefined proxy build arg (no ARG declaration) must be in scope for ENV,
+        // matching Docker, which predefines the proxy args.
+        let content = r#"
+FROM alpine
+ENV HTTPS_PROXY=$HTTPS_PROXY
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("HTTPS_PROXY".to_string(), "http://proxy:8080".to_string())],
+        );
+        assert!(
+            contract
+                .env
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://proxy:8080"),
+            "predefined proxy build arg should resolve the ENV: {:?}",
+            contract.env
+        );
+        assert!(
+            !contract
+                .warnings
+                .iter()
+                .any(|w| w.contains("HTTPS_PROXY") && w.contains("unresolved")),
+            "no unresolved-variable warning expected: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
     fn test_build_arg_overrides_unresolved_default_before_evaluating_it() {
         // A build arg wins over the default even when the default would be unresolved;
         // Docker never evaluates the default in that case.

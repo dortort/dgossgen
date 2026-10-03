@@ -8,6 +8,22 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
+/// Build args Docker predefines: a `--build-arg` value for one of these is in scope
+/// throughout the build *without* a corresponding `ARG` instruction, unlike every
+/// other build arg. See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
+const PREDEFINED_BUILD_ARGS: &[&str] = &[
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
 #[derive(Default)]
@@ -27,13 +43,20 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Store CLI `--build-arg` values. They do not enter scope here: a build arg is
-    /// bound only when its matching global or stage `ARG` declaration is reached
-    /// (see [`VariableResolver::declare_arg`]), matching Docker's scoping. A value
-    /// with no corresponding `ARG` declaration is never in scope.
+    /// Store CLI `--build-arg` values. An ordinary build arg does not enter scope
+    /// here: it is bound only when its matching global or stage `ARG` declaration is
+    /// reached (see [`VariableResolver::declare_arg`]), matching Docker's scoping, and
+    /// a value with no corresponding `ARG` declaration is never in scope. Docker's
+    /// predefined build args (the proxy variables) are the exception — they are usable
+    /// without an `ARG`, so a supplied value for one enters scope immediately.
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
-            self.supplied_build_args.insert(k.clone(), v.clone());
+            if PREDEFINED_BUILD_ARGS.contains(&k.as_str()) {
+                self.vars.insert(k.clone(), v.clone());
+                self.locked.insert(k.clone());
+            } else {
+                self.supplied_build_args.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -365,6 +388,27 @@ mod tests {
         let (value, unresolved) = resolver.resolve_checked("alpine:$TAG");
         assert_eq!(value, "alpine:$TAG");
         assert!(unresolved);
+    }
+
+    #[test]
+    fn test_predefined_proxy_build_arg_in_scope_without_arg() {
+        // A predefined proxy build arg is usable without any ARG declaration.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("HTTPS_PROXY".to_string(), "http://proxy:8080".to_string())]);
+        let (value, unresolved) = resolver.resolve_checked("$HTTPS_PROXY");
+        assert_eq!(value, "http://proxy:8080");
+        assert!(!unresolved);
+        assert!(resolver.is_locked("HTTPS_PROXY"));
+        // It is bound immediately, not deferred to an ARG declaration.
+        assert!(!resolver.has_supplied_build_arg("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn test_lowercase_predefined_proxy_build_arg_in_scope_without_arg() {
+        // Docker predefines both cases; the lowercase variant is recognized too.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("no_proxy".to_string(), "localhost".to_string())]);
+        assert_eq!(resolver.resolve("$no_proxy"), "localhost");
     }
 
     #[test]
