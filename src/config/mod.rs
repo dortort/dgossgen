@@ -325,4 +325,10 @@ secret_patterns:
         assert!(config.http_checks);
         assert_eq!(config.wait.retries, 30);
     }
+
+    #[test]
+    fn test_duplicate_key_is_error() {
+        let yaml = "assert_ports: required\nassert_ports: off\n";
+        assert!(serde_saphyr::from_str::<PolicyConfig>(yaml).is_err());
+    }
 }
