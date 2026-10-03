@@ -261,6 +261,11 @@ impl VariableResolver {
             result.push('$');
         }
 
+        // Unresolved references are copied verbatim and may still carry the marker.
+        if result.contains(ESCAPED_DOLLAR) {
+            result = result.replace(ESCAPED_DOLLAR, "$");
+        }
+
         Resolution {
             value: result,
             unresolved,
@@ -418,6 +423,22 @@ mod tests {
                 secret: false,
             }
         );
+    }
+
+    #[test]
+    fn test_escaped_dollar_marker_never_leaks_from_verbatim_unresolved_text() {
+        let mut resolver = VariableResolver::new();
+        resolver.taint("T");
+        let cases = [
+            ("${T:-\\$x}", "${T:-$x}"),
+            ("${UNSET\\$}", "${UNSET$}"),
+            ("/a/${UNTERM\\$x", "/a/${UNTERM$x"),
+        ];
+        for (input, expected) in cases {
+            let resolved = resolver.resolve_checked(&escape_literal_dollars(input));
+            assert!(resolved.unresolved, "{input}");
+            assert_eq!(resolved.value, expected);
+        }
     }
 
     #[test]
