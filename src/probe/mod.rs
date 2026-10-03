@@ -393,15 +393,21 @@ fn collect_evidence(
         }
     }
 
-    // Check env, redacting secret values at the point of capture.
+    // Structured env keeps multi-line values in one entry, so redaction can't miss a continuation line.
     let mut env_cmd = Command::new(runtime);
-    env_cmd.args(["exec", container, "env"]);
+    env_cmd.args([
+        "container",
+        "inspect",
+        "--format",
+        "{{json .Config.Env}}",
+        container,
+    ]);
     let env_output = run_command_with_timeout(env_cmd, timeout);
 
     if let Ok(output) = env_output {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
-            evidence.env_vars = parse_env_output(&text, policy);
+            evidence.env_vars = parse_env_entries(&text, policy);
         }
     }
 
@@ -439,10 +445,12 @@ fn redact_inspect_env(value: &mut serde_json::Value, policy: &PolicyConfig) {
     }
 }
 
-/// Parse `env` output into key/value pairs, redacting the value of every secret-named key.
-fn parse_env_output(text: &str, policy: &PolicyConfig) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| line.split_once('='))
+/// Parse a JSON `Config.Env` array into key/value pairs, redacting every secret-named key's value.
+fn parse_env_entries(json: &str, policy: &PolicyConfig) -> Vec<(String, String)> {
+    let entries: Vec<String> = serde_json::from_str(json.trim()).unwrap_or_default();
+    entries
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
         .map(|(key, val)| {
             let value = if policy.is_secret_key(key) {
                 REDACTED_PLACEHOLDER.to_string()
@@ -536,10 +544,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_env_output_redacts_secrets() {
-        // Values may contain '=', so each line splits on the first one only.
-        let raw = "PATH=/usr/bin\nAPI_TOKEN=abc123\nDB_PASSWORD=p=a=ss\nLANG=C.UTF-8\n";
-        let vars = parse_env_output(raw, &PolicyConfig::default());
+    fn test_parse_env_entries_redacts_secrets() {
+        let raw = r#"["PATH=/usr/bin","API_TOKEN=abc123","DB_PASSWORD=p=a=ss","LANG=C.UTF-8"]"#;
+        let vars = parse_env_entries(raw, &PolicyConfig::default());
 
         let get = |k: &str| {
             vars.iter()
@@ -556,6 +563,26 @@ mod tests {
                 .any(|(_, v)| v.contains("abc123") || v.contains("p=a=ss")),
             "no secret value may survive in collected env_vars"
         );
+    }
+
+    #[test]
+    fn test_parse_env_entries_redacts_multiline_secret_whole() {
+        let raw = "[\"DB_PASSWORD=hunter2\\nPUBLIC=tail\",\"LANG=C\"]\n";
+        let vars = parse_env_entries(raw, &PolicyConfig::default());
+
+        assert_eq!(
+            vars,
+            vec![
+                ("DB_PASSWORD".to_string(), REDACTED_PLACEHOLDER.to_string()),
+                ("LANG".to_string(), "C".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_env_entries_tolerates_null_or_garbage() {
+        assert!(parse_env_entries("null\n", &PolicyConfig::default()).is_empty());
+        assert!(parse_env_entries("not json", &PolicyConfig::default()).is_empty());
     }
 
     #[test]
@@ -580,13 +607,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_env_output_honors_custom_patterns() {
+    fn test_parse_env_entries_honors_custom_patterns() {
         let policy = PolicyConfig {
             secret_patterns: vec!["INTERNAL".to_string()],
             ..PolicyConfig::default()
         };
-        let raw = "INTERNAL_URL=https://svc.internal\nAPI_TOKEN=abc123\n";
-        let vars = parse_env_output(raw, &policy);
+        let raw = r#"["INTERNAL_URL=https://svc.internal","API_TOKEN=abc123"]"#;
+        let vars = parse_env_entries(raw, &policy);
 
         let get = |k: &str| {
             vars.iter()
