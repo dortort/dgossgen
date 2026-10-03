@@ -1436,6 +1436,23 @@ WORKDIR /app
     }
 
     #[test]
+    fn test_automatic_platform_build_arg_resolves_from_without_global_arg() {
+        // A supplied BuildKit automatic platform arg is in global scope, so a FROM can
+        // reference it without an ARG and the base image resolves.
+        let content = r#"
+FROM alpine:$TARGETARCH
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TARGETARCH".to_string(), "arm64".to_string())],
+        );
+        assert_eq!(contract.base_image, "alpine:arm64");
+    }
+
+    #[test]
     fn test_predefined_proxy_build_arg_resolves_env_without_arg() {
         // A predefined proxy build arg (no ARG declaration) must be in scope for ENV,
         // matching Docker, which predefines the proxy args.

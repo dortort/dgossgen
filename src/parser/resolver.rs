@@ -8,10 +8,21 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
-/// Build args Docker predefines: a `--build-arg` value for one of these is in scope
-/// throughout the build *without* a corresponding `ARG` instruction, unlike every
-/// other build arg. See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
-const PREDEFINED_BUILD_ARGS: &[&str] = &[
+/// Build-arg names that are in scope *without* a corresponding `ARG` instruction,
+/// unlike an ordinary build arg. A supplied `--build-arg` value for one of these is
+/// bound immediately rather than deferred to an `ARG` declaration. Two groups:
+///
+/// - The predefined proxy args, usable without an `ARG` throughout the build.
+///   See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
+/// - BuildKit's automatic platform args, which live in the global scope (so a
+///   `FROM` can reference them without an `ARG`). Docker requires an `ARG`
+///   redeclaration only to use them in a stage body; dgossgen resolves variables
+///   in a single flat scope, so binding them up front matches the global `FROM`
+///   case — the stage-redeclaration distinction is the separate global-scope-leak
+///   concern, not this fix.
+///   See <https://docs.docker.com/reference/dockerfile/#automatic-platform-args-in-the-global-scope>.
+const PREDECLARED_BUILD_ARGS: &[&str] = &[
+    // Predefined proxy args.
     "HTTP_PROXY",
     "http_proxy",
     "HTTPS_PROXY",
@@ -22,6 +33,15 @@ const PREDEFINED_BUILD_ARGS: &[&str] = &[
     "no_proxy",
     "ALL_PROXY",
     "all_proxy",
+    // BuildKit automatic platform args (global scope).
+    "TARGETPLATFORM",
+    "TARGETOS",
+    "TARGETARCH",
+    "TARGETVARIANT",
+    "BUILDPLATFORM",
+    "BUILDOS",
+    "BUILDARCH",
+    "BUILDVARIANT",
 ];
 
 /// Resolve ARG/ENV variable references in a stage.
@@ -46,12 +66,13 @@ impl VariableResolver {
     /// Store CLI `--build-arg` values. An ordinary build arg does not enter scope
     /// here: it is bound only when its matching global or stage `ARG` declaration is
     /// reached (see [`VariableResolver::declare_arg`]), matching Docker's scoping, and
-    /// a value with no corresponding `ARG` declaration is never in scope. Docker's
-    /// predefined build args (the proxy variables) are the exception — they are usable
-    /// without an `ARG`, so a supplied value for one enters scope immediately.
+    /// a value with no corresponding `ARG` declaration is never in scope. The
+    /// predeclared build args (proxy and automatic platform variables) are the
+    /// exception — they are usable without an `ARG`, so a supplied value for one
+    /// enters scope immediately.
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
-            if PREDEFINED_BUILD_ARGS.contains(&k.as_str()) {
+            if PREDECLARED_BUILD_ARGS.contains(&k.as_str()) {
                 self.vars.insert(k.clone(), v.clone());
                 self.locked.insert(k.clone());
             } else {
@@ -409,6 +430,18 @@ mod tests {
         let mut resolver = VariableResolver::new();
         resolver.load_build_args(&[("no_proxy".to_string(), "localhost".to_string())]);
         assert_eq!(resolver.resolve("$no_proxy"), "localhost");
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_in_scope_without_arg() {
+        // A supplied BuildKit automatic platform arg is in scope (global FROM case)
+        // without an ARG declaration.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        let (value, unresolved) = resolver.resolve_checked("alpine:$TARGETARCH");
+        assert_eq!(value, "alpine:arm64");
+        assert!(!unresolved);
+        assert!(resolver.is_locked("TARGETARCH"));
     }
 
     #[test]
