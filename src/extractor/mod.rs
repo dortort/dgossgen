@@ -199,24 +199,30 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    match default.as_deref() {
-                        Some(def) => {
-                            let resolved_def =
-                                resolver.resolve_checked(&escape_literal_dollars(def));
-                            if resolved_def.unresolved {
-                                // Leave the name undefined so later uses drop with a warning.
-                                if !resolver.is_locked(name) {
-                                    resolver.unset(name);
+                    // A supplied --build-arg enters scope here and overrides the default
+                    // (which Docker never evaluates), so bind it before touching the default.
+                    if resolver.has_supplied_build_arg(name) {
+                        resolver.declare_arg(name, None, false);
+                    } else {
+                        match default.as_deref() {
+                            Some(def) => {
+                                let resolved_def =
+                                    resolver.resolve_checked(&escape_literal_dollars(def));
+                                if resolved_def.unresolved {
+                                    // Leave the name undefined so later uses drop with a warning.
+                                    if !resolver.is_locked(name) {
+                                        resolver.unset(name);
+                                    }
+                                } else {
+                                    resolver.declare_arg(
+                                        name,
+                                        Some(&resolved_def.value),
+                                        resolved_def.secret,
+                                    );
                                 }
-                            } else {
-                                resolver.declare_arg(
-                                    name,
-                                    Some(&resolved_def.value),
-                                    resolved_def.secret,
-                                );
                             }
+                            None => resolver.declare_arg(name, None, false),
                         }
-                        None => resolver.declare_arg(name, None, false),
                     }
                 }
 
