@@ -201,15 +201,13 @@ Every generated assertion includes comments showing where it was derived from:
 
 ```yaml
 file:
-  # derived from COPY nginx.conf /etc/nginx/nginx.conf; confidence: medium
+  # derived from COPY  /etc/nginx/nginx.conf; confidence: medium
   /etc/nginx/nginx.conf:
     exists: true
-    filetype: file
-
-port:
-  # derived from EXPOSE 8080/tcp; confidence: medium
-  "tcp:8080":
-    listening: true
+process:
+  # derived from CMD nginx -g daemon off;; confidence: medium
+  nginx:
+    running: true
 ```
 
 ### goss_wait.yml generation
@@ -299,20 +297,13 @@ command:
 **Generated `goss.yml`:**
 ```yaml
 file:
-  # derived from COPY nginx.conf /etc/nginx/nginx.conf; confidence: medium
+  # derived from COPY  /etc/nginx/nginx.conf; confidence: medium
   /etc/nginx/nginx.conf:
     exists: true
-    filetype: file
 process:
   # derived from CMD nginx -g daemon off;; confidence: medium
   nginx:
     running: true
-command:
-  # derived from nginx service pattern; confidence: medium
-  nginx--v:
-    exec: nginx -v
-    exit-status: 0
-    timeout: 10000
 ```
 
 ### Go multi-stage Dockerfile
@@ -331,28 +322,35 @@ USER 65534
 ENTRYPOINT ["/server"]
 ```
 
+**Generated `goss_wait.yml`:**
+```yaml
+port:
+  # derived from EXPOSE 8080/tcp; confidence: medium
+  "tcp:8080":
+    listening: true
+process:
+  # derived from ENTRYPOINT (wait gate); confidence: medium
+  server:
+    running: true
+```
+
 **Generated `goss.yml`:**
 ```yaml
 file:
   # derived from COPY --from=build /server; confidence: medium
   /server:
     exists: true
-
-port:
-  # derived from EXPOSE 8080/tcp; confidence: medium
-  "tcp:8080":
-    listening: true
-
 process:
   # derived from ENTRYPOINT /server; confidence: medium
   server:
     running: true
-
 command:
   # derived from USER 65534; confidence: high
-  id--u---grep--q-65534:
-    exec: "id -u | grep -q 65534"
+  id--u:
+    exec: id -u
     exit-status: 0
+    stdout:
+    - "65534"
     timeout: 10000
 ```
 
