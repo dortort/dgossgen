@@ -6,7 +6,13 @@ pub struct LintIssue {
 
 pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
     // Check YAML validity
-    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(content);
+    let options = serde_saphyr::options! {
+        // Goss suites routinely reuse one anchor many times, which the ratio heuristic rejects.
+        budget: serde_saphyr::budget! { enforce_alias_anchor_ratio: false },
+        reject_non_finite_typeless_float: false,
+    };
+    let parsed: Result<serde_json::Value, _> =
+        serde_saphyr::from_str_with_options(content, options);
     if parsed.is_err() {
         issues.push(LintIssue {
             file: filename.to_string(),
@@ -18,32 +24,30 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
     let doc = parsed.expect("checked above");
 
     // Check for common flake patterns
-    if let Some(mapping) = doc.as_mapping() {
+    if let Some(mapping) = doc.as_object() {
         // Check for ephemeral paths
-        if let Some(files) = mapping.get(serde_yml::Value::String("file".to_string())) {
-            if let Some(file_map) = files.as_mapping() {
-                for (key, _) in file_map {
-                    if let Some(path) = key.as_str() {
-                        if path.contains("/tmp/")
-                            || path.contains("/var/cache/")
-                            || path.contains("/proc/")
-                        {
-                            issues.push(LintIssue {
-                                file: filename.to_string(),
-                                message: format!(
-                                    "File assertion on ephemeral path '{}' may be flaky",
-                                    path
-                                ),
-                            });
-                        }
+        if let Some(files) = mapping.get("file") {
+            if let Some(file_map) = files.as_object() {
+                for path in file_map.keys() {
+                    if path.contains("/tmp/")
+                        || path.contains("/var/cache/")
+                        || path.contains("/proc/")
+                    {
+                        issues.push(LintIssue {
+                            file: filename.to_string(),
+                            message: format!(
+                                "File assertion on ephemeral path '{}' may be flaky",
+                                path
+                            ),
+                        });
                     }
                 }
             }
         }
 
         // Check for process assertions (often flaky)
-        if let Some(processes) = mapping.get(serde_yml::Value::String("process".to_string())) {
-            if let Some(proc_map) = processes.as_mapping() {
+        if let Some(processes) = mapping.get("process") {
+            if let Some(proc_map) = processes.as_object() {
                 if proc_map.len() > 3 {
                     issues.push(LintIssue {
                         file: filename.to_string(),
@@ -54,24 +58,17 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
         }
 
         // Check command timeouts
-        if let Some(commands) = mapping.get(serde_yml::Value::String("command".to_string())) {
-            if let Some(cmd_map) = commands.as_mapping() {
+        if let Some(commands) = mapping.get("command") {
+            if let Some(cmd_map) = commands.as_object() {
                 for (key, val) in cmd_map {
-                    if let Some(cmd_val) = val.as_mapping() {
-                        let timeout = cmd_val
-                            .get(serde_yml::Value::String("timeout".to_string()))
-                            .and_then(|v| v.as_u64());
+                    if let Some(cmd_val) = val.as_object() {
+                        let timeout = cmd_val.get("timeout").and_then(|v| v.as_u64());
 
                         if timeout.is_none() || timeout == Some(0) {
-                            if let Some(name) = key.as_str() {
-                                issues.push(LintIssue {
-                                    file: filename.to_string(),
-                                    message: format!(
-                                        "Command '{}' has no timeout (may hang)",
-                                        name
-                                    ),
-                                });
-                            }
+                            issues.push(LintIssue {
+                                file: filename.to_string(),
+                                message: format!("Command '{}' has no timeout (may hang)", key),
+                            });
                         }
                     }
                 }

@@ -38,12 +38,12 @@ struct HttpAssertion {
 }
 
 /// A single rendered assertion: the provenance comment to place above it, and
-/// the complete `serde_yml`-serialized mapping entry (key and value together).
+/// the complete `serde_saphyr`-serialized mapping entry (key and value together).
 struct Entry {
     /// `# derived from ...; confidence: ...`
     comment: String,
-    /// The whole `serde_yml` mapping entry, e.g. `/app:\n  exists: true`, or
-    /// the explicit `? <key>\n: <value>` form `serde_yml` uses for keys past
+    /// The whole `serde_saphyr` mapping entry, e.g. `/app:\n  exists: true`, or
+    /// the explicit `? <key>\n: <value>` form `serde_saphyr` uses for keys past
     /// the YAML simple-key length limit. Stored verbatim (never re-split) so we
     /// never corrupt an explicit-form key.
     block: String,
@@ -70,7 +70,7 @@ impl Sections {
 }
 
 /// True if `c` is allowed in a single-line YAML comment: YAML's `c-printable`
-/// set minus every line break. The libyaml-family scanners used by `serde_yml`
+/// set minus every line break. The YAML scanners used by `serde_saphyr`
 /// and common goss YAML parsers treat LF, CR, NEL (U+0085), LS (U+2028) and PS
 /// (U+2029) as line breaks, so all five must be excluded or the remainder of
 /// the provenance would escape the `#` comment. Rust `char`s can never be
@@ -95,7 +95,7 @@ fn is_comment_safe(c: char) -> bool {
 ///
 /// `GossResource` is a public type, so a provenance string could carry
 /// characters the YAML character set forbids. This comment is hand-written (not
-/// routed through `serde_yml`, which escapes such data in scalars), so any such
+/// routed through `serde_saphyr`, which escapes such data in scalars), so any such
 /// character would make the whole document unparseable — a line break lets the
 /// remainder escape the comment into active YAML, and control characters and
 /// Unicode noncharacters (U+FFFE/U+FFFF) are rejected by the parser even inside
@@ -109,8 +109,8 @@ fn comment_line(provenance: &str, confidence: Confidence) -> String {
     format!("# derived from {}; confidence: {}", sanitized, confidence)
 }
 
-/// Serialize a single `{ key: value }` map through `serde_yml` and return the
-/// entry verbatim (trailing newline trimmed). Reusing `serde_yml` keeps key
+/// Serialize a single `{ key: value }` map through `serde_saphyr` and return the
+/// entry verbatim (trailing newline trimmed). Reusing `serde_saphyr` keeps key
 /// quoting and value formatting identical to a whole-document serialization,
 /// including the explicit `? <key>\n: <value>` form it emits for keys past the
 /// YAML simple-key length limit. The caller must indent the whole block as a
@@ -118,7 +118,8 @@ fn comment_line(provenance: &str, confidence: Confidence) -> String {
 fn render_entry<T: Serialize>(key: &str, value: &T) -> String {
     let mut map = BTreeMap::new();
     map.insert(key, value);
-    let yaml = serde_yml::to_string(&map).unwrap_or_default();
+    let options = serde_saphyr::ser_options! { prefer_block_scalars: false };
+    let yaml = serde_saphyr::to_string_with_options(&map, options).unwrap_or_default();
     yaml.trim_end_matches('\n').to_string()
 }
 
@@ -411,7 +412,7 @@ mod tests {
         let comment_pos = output
             .find("# derived from EXPOSE 80/tcp; confidence: medium")
             .unwrap();
-        let key_pos = output.find("tcp:80:").unwrap();
+        let key_pos = output.find("\"tcp:80\":").unwrap();
         assert!(
             comment_pos < key_pos,
             "comment should precede its key, got:\n{output}"
@@ -468,7 +469,7 @@ mod tests {
 
         let output = render_goss(&resources);
         // Comments must not break YAML parsing.
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(
             parsed.is_ok(),
             "commented YAML should parse, got:\n{output}"
@@ -487,7 +488,7 @@ mod tests {
         }];
 
         let output = render_goss(&resources);
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(parsed.is_ok());
     }
 
@@ -503,7 +504,7 @@ mod tests {
             ),
             "minimal wait should carry a synthesized provenance comment, got:\n{output}"
         );
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(parsed.is_ok(), "minimal wait should parse, got:\n{output}");
     }
 
@@ -558,7 +559,7 @@ mod tests {
             output.contains("# derived from line one malicious: true  more; confidence: medium"),
             "provenance line breaks should collapse to spaces, got:\n{output}"
         );
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(
             parsed.is_ok(),
             "sanitized output should parse, got:\n{output}"
@@ -585,7 +586,7 @@ mod tests {
             output.contains("# derived from a b c d; confidence: high"),
             "control characters should collapse to spaces, got:\n{output:?}"
         );
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(
             parsed.is_ok(),
             "sanitized output should parse, got:\n{output}"
@@ -611,7 +612,7 @@ mod tests {
             output.contains("# derived from x y z; confidence: medium"),
             "noncharacters should collapse to spaces, got:\n{output:?}"
         );
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(
             parsed.is_ok(),
             "sanitized output should parse, got:\n{output}"
@@ -645,7 +646,7 @@ mod tests {
             !output.contains("\ninjected: true"),
             "a Unicode line break must not inject active YAML, got:\n{output:?}"
         );
-        let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output);
+        let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output);
         assert!(
             parsed.is_ok(),
             "sanitized output should parse, got:\n{output}"
@@ -654,11 +655,11 @@ mod tests {
 
     #[test]
     fn test_long_key_past_simple_key_limit_renders_valid_yaml() {
-        // A key long enough to exceed YAML's 128-byte simple-key limit forces
-        // serde_yml into explicit `? key`/`: value` form. The whole entry block
+        // A key long enough to exceed YAML's 1024-character simple-key limit forces
+        // serde_saphyr into explicit `? key`/`: value` form. The whole entry block
         // must be indented as a unit so it stays valid and the key round-trips
         // as a scalar string (not corrupted into a nested mapping).
-        let long_path = format!("/opt/{}", "a".repeat(200));
+        let long_path = format!("/opt/{}", "a".repeat(1100));
         let resources = vec![GossResource::File {
             path: long_path.clone(),
             exists: true,
@@ -669,14 +670,14 @@ mod tests {
         }];
         let output = render_goss(&resources);
 
-        let parsed: serde_yml::Value =
-            serde_yml::from_str(&output).unwrap_or_else(|e| panic!("must parse: {e}\n{output}"));
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(&output).unwrap_or_else(|e| panic!("must parse: {e}\n{output}"));
         let file = parsed
             .get("file")
-            .and_then(|f| f.as_mapping())
+            .and_then(|f| f.as_object())
             .expect("file section should be a mapping");
         let entry = file
-            .get(serde_yml::Value::String(long_path.clone()))
+            .get(&long_path)
             .expect("long path must round-trip as a scalar string key");
         assert_eq!(
             entry.get("exists").and_then(|v| v.as_bool()),
