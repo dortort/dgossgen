@@ -1500,6 +1500,53 @@ WORKDIR /x/$DIR
     }
 
     #[test]
+    fn test_env_wins_over_same_name_build_arg_bound_arg() {
+        // Docker: ENV always overrides a same-name ARG, even with a --build-arg. This
+        // pins declare_arg checking `locked` BEFORE binding the supplied build arg;
+        // reversing that order would let the build arg wrongly override the ENV.
+        let content = r#"
+FROM alpine
+ENV DIR=/env
+ARG DIR
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "cli".to_string())]);
+        assert_eq!(contract.workdir, Some("/x//env".to_string()));
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("cli")
+            )),
+            "the supplied build arg must not override the ENV: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_tainted_env_wins_over_same_name_build_arg_bound_arg() {
+        // An unresolved (tainted) ENV also outranks a later same-name ARG bound from a
+        // --build-arg, so the reference drops with a warning rather than taking `cli`.
+        let content = r#"
+FROM alpine
+ENV DIR=$MISSING
+ARG DIR
+WORKDIR /app/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[("DIR".to_string(), "cli".to_string())]);
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("cli")
+            )),
+            "a tainted ENV must keep precedence over a build-arg-bound ARG: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
     fn test_arg_redeclared_unresolved_clears_prior_default() {
         // Re-declaring an ARG with an unresolved default invalidates the prior one, not stale.
         let content = r#"
