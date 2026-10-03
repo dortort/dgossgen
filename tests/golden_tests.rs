@@ -612,24 +612,139 @@ fn test_variable_port_generates_single_port_wait_file() {
 
 // --- Secret redaction tests ---
 
+fn generated_text(
+    contract: &extractor::RuntimeContract,
+    output: &generator::GeneratorOutput,
+) -> String {
+    let mut haystack = output.goss_yml.clone();
+    if let Some(wait) = &output.goss_wait_yml {
+        haystack.push_str(wait);
+    }
+    for line in output.warnings.iter().chain(&output.notes) {
+        haystack.push_str(line);
+    }
+    haystack.push_str(&format!("{contract:?}"));
+    haystack
+}
+
+fn env_value<'a>(contract: &'a extractor::RuntimeContract, key: &str) -> Option<&'a str> {
+    contract
+        .env
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
 #[test]
-fn test_secret_keys_not_in_output() {
-    // End-to-end: a Dockerfile carrying secret ENV values, run through the full
-    // extract -> generate pipeline, must never emit those values into goss.yml,
-    // goss_wait.yml, or any diagnostic, and the contract itself must hold a
-    // redacted placeholder for secret keys while non-secret keys are untouched.
+fn test_secret_build_args_never_reach_generated_output() {
     let content = r#"
 FROM alpine
-ENV DB_PASSWORD=hunter2
-ENV API_TOKEN=abc123
-ENV APP_PORT=3000
-EXPOSE 3000
+ARG DB_PASSWORD
+ARG API_TOKEN
+ENV API_TOKEN=$API_TOKEN
+ENV DSN=/srv/$DB_PASSWORD
+WORKDIR $DSN
+COPY app.conf /etc/$DB_PASSWORD/
+USER $DB_PASSWORD
+EXPOSE $API_TOKEN
+EXPOSE 8080
+"#;
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let policy = PolicyConfig::default();
+    let build_args = vec![
+        ("DB_PASSWORD".to_string(), "s3cr3tvalue".to_string()),
+        ("API_TOKEN".to_string(), "4242".to_string()),
+    ];
+    let contract = extractor::extract_contract(&df, None, &build_args, &policy);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+
+    let haystack = generated_text(&contract, &output);
+    for secret in ["s3cr3tvalue", "4242"] {
+        assert!(
+            !haystack.contains(secret),
+            "secret value {secret:?} leaked into generated output: {haystack}"
+        );
+    }
+
+    let wait = output.goss_wait_yml.as_deref().unwrap_or_default();
+    assert!(wait.contains("tcp:8080"), "benign port lost: {wait}");
+    assert_eq!(env_value(&contract, "API_TOKEN"), Some("***REDACTED***"));
+    assert_eq!(env_value(&contract, "DSN"), Some("***REDACTED***"));
+    for raw in [
+        "WORKDIR '$DSN'",
+        "COPY destination '/etc/$DB_PASSWORD/'",
+        "USER '$DB_PASSWORD'",
+        "EXPOSE '$API_TOKEN'",
+    ] {
+        assert!(
+            output
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(raw) && w.contains("secret build arg")),
+            "missing secret-drop warning for {raw}: {:?}",
+            output.warnings
+        );
+    }
+}
+
+#[test]
+fn test_secret_like_names_defined_in_dockerfile_resolve_normally() {
+    let content = r#"
+FROM alpine
+ENV KEYCLOAK_HOME=/opt/keycloak
+WORKDIR $KEYCLOAK_HOME
+ENV AUTH_PORT=8080
+EXPOSE $AUTH_PORT
 "#;
     let df = parser::parse_dockerfile_content(content).unwrap();
     let policy = PolicyConfig::default();
     let contract = extractor::extract_contract(&df, None, &[], &policy);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None);
 
-    // Contract state: secrets redacted, non-secrets preserved.
+    assert!(
+        output.goss_yml.contains("/opt/keycloak"),
+        "{}",
+        output.goss_yml
+    );
+    let wait = output.goss_wait_yml.as_deref().unwrap_or_default();
+    assert!(wait.contains("tcp:8080"), "{wait}");
+    let generated = format!("{}{wait}", output.goss_yml);
+    assert!(!generated.contains("REDACTED"), "{generated}");
+    assert!(output.warnings.is_empty(), "{:?}", output.warnings);
+}
+
+#[test]
+fn test_secret_named_build_arg_port_is_dropped_with_warning() {
+    let content = "FROM alpine\nARG AUTH_PORT\nEXPOSE $AUTH_PORT\n";
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let policy = PolicyConfig::default();
+    let build_args = vec![("AUTH_PORT".to_string(), "8080".to_string())];
+    let contract = extractor::extract_contract(&df, None, &build_args, &policy);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+
+    assert!(!generated_text(&contract, &output).contains("8080"));
+    assert!(output
+        .warnings
+        .iter()
+        .any(|w| w == "EXPOSE '$AUTH_PORT' uses a secret build arg; no port assertion generated"));
+}
+
+#[test]
+fn test_custom_secret_patterns_feed_redaction_end_to_end() {
+    // The user-facing `secret_patterns` knob must actually drive enforcement:
+    // a custom pattern redacts a key the defaults would ignore.
+    let content = r#"
+FROM alpine
+ENV INTERNAL_URL=https://svc.internal:9000
+ENV APP_PORT=3000
+"#;
+    let df = parser::parse_dockerfile_content(content).unwrap();
+    let policy = PolicyConfig {
+        secret_patterns: vec!["INTERNAL".to_string()],
+        ..PolicyConfig::default()
+    };
+    let contract = extractor::extract_contract(&df, None, &[], &policy);
+
     let env_value = |key: &str| {
         contract
             .env
@@ -637,33 +752,12 @@ EXPOSE 3000
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     };
-    assert_eq!(env_value("DB_PASSWORD"), Some("***REDACTED***"));
-    assert_eq!(env_value("API_TOKEN"), Some("***REDACTED***"));
+    assert_eq!(env_value("INTERNAL_URL"), Some("***REDACTED***"));
     assert_eq!(env_value("APP_PORT"), Some("3000"));
-
-    // Full output artifacts must contain zero occurrences of any secret value.
-    let output = generator::generate(&contract, Profile::Standard, &policy, None);
-    let mut haystack = output.goss_yml.clone();
-    if let Some(wait) = &output.goss_wait_yml {
-        haystack.push_str(wait);
-    }
-    for w in &output.warnings {
-        haystack.push_str(w);
-    }
-    for n in &output.notes {
-        haystack.push_str(n);
-    }
-    for secret in ["hunter2", "abc123"] {
-        assert!(
-            !haystack.contains(secret),
-            "secret value {secret:?} leaked into generated output"
-        );
-    }
-
-    // The classifier still recognizes these keys (guards against a defaults regression).
-    assert!(policy.is_secret_key("DB_PASSWORD"));
-    assert!(policy.is_secret_key("API_TOKEN"));
-    assert!(!policy.is_secret_key("APP_PORT"));
+    assert!(
+        !contract.env.iter().any(|(_, v)| v.contains("svc.internal")),
+        "custom-pattern secret value must not survive in the contract"
+    );
 }
 
 // --- Heredoc fixture tests (issue #19) ---
@@ -770,37 +864,6 @@ EXPOSE 80
             .iter()
             .any(|a| matches!(&a.kind, AssertionKind::PortListening { port: 80, .. })),
         "EXPOSE after the heredoc was lost"
-    );
-}
-
-#[test]
-fn test_custom_secret_patterns_feed_redaction_end_to_end() {
-    // The user-facing `secret_patterns` knob must actually drive enforcement:
-    // a custom pattern redacts a key the defaults would ignore.
-    let content = r#"
-FROM alpine
-ENV INTERNAL_URL=https://svc.internal:9000
-ENV APP_PORT=3000
-"#;
-    let df = parser::parse_dockerfile_content(content).unwrap();
-    let policy = PolicyConfig {
-        secret_patterns: vec!["INTERNAL".to_string()],
-        ..PolicyConfig::default()
-    };
-    let contract = extractor::extract_contract(&df, None, &[], &policy);
-
-    let env_value = |key: &str| {
-        contract
-            .env
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    };
-    assert_eq!(env_value("INTERNAL_URL"), Some("***REDACTED***"));
-    assert_eq!(env_value("APP_PORT"), Some("3000"));
-    assert!(
-        !contract.env.iter().any(|(_, v)| v.contains("svc.internal")),
-        "custom-pattern secret value must not survive in the contract"
     );
 }
 
