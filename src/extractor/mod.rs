@@ -15,13 +15,7 @@ use crate::Confidence;
 /// thousands of assertions.
 const MAX_EXPOSE_RANGE: u32 = 128;
 
-/// Extract a RuntimeContract from a parsed Dockerfile.
-///
-/// `policy` governs secret redaction: any `ENV` value whose key
-/// [`PolicyConfig::is_secret_key`] matches is stored as [`REDACTED_PLACEHOLDER`]
-/// rather than its real value, so secrets never enter the contract (and thus
-/// never reach generated output). The variable resolver still sees the real
-/// value, so later instructions that reference the variable resolve correctly.
+/// Extract a RuntimeContract from a parsed Dockerfile, keeping secret-named values out of it.
 pub fn extract_contract(
     dockerfile: &Dockerfile,
     target: Option<&str>,
@@ -45,8 +39,13 @@ pub fn extract_contract(
         .first()
         .map(|s| s.image.as_str())
         .unwrap_or(stage.image.as_str());
+    let resolved_root = resolver.resolve_checked(root_image);
     let mut contract = RuntimeContract {
-        base_image: resolver.resolve(root_image),
+        base_image: if resolved_root.secret {
+            root_image.to_string()
+        } else {
+            resolved_root.value
+        },
         ..Default::default()
     };
 
@@ -67,13 +66,19 @@ pub fn extract_contract(
                     let Resolution {
                         value: resolved,
                         unresolved,
-                        ..
+                        secret,
                     } = resolver.resolve_checked(dir);
-                    // `None` means unknown (unresolved var, or unknown base dir); never asserted.
+                    // `None` means unknown (unresolved, secret, or unknown base); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
                             "WORKDIR '{dir}' contains an unresolved variable (no ARG/ENV \
                              default in scope); no directory assertion generated"
+                        ));
+                        None
+                    } else if secret {
+                        contract.warnings.push(format!(
+                            "WORKDIR '{dir}' uses a secret build arg; no directory assertion \
+                             generated"
                         ));
                         None
                     } else if resolved.starts_with('/') {
@@ -114,13 +119,14 @@ pub fn extract_contract(
                     let Resolution {
                         value: resolved,
                         unresolved,
-                        ..
+                        secret,
                     } = resolver.resolve_checked(user);
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
                         resolved,
                         line: inst.line_number,
                         unresolved,
+                        secret,
                     });
                 }
 
@@ -129,13 +135,20 @@ pub fn extract_contract(
                         let Resolution {
                             value: resolved,
                             unresolved,
-                            ..
+                            secret,
                         } = resolver.resolve_checked(raw_token);
                         if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
                              in scope); no port assertion generated",
                                 raw_token
+                            ));
+                            continue;
+                        }
+                        if secret {
+                            contract.warnings.push(format!(
+                                "EXPOSE '{raw_token}' uses a secret build arg; no port assertion \
+                                 generated"
                             ));
                             continue;
                         }
@@ -166,7 +179,17 @@ pub fn extract_contract(
 
                 Instruction::Volume(volumes) => {
                     for vol in volumes {
-                        let resolved = resolver.resolve(vol);
+                        let Resolution {
+                            value: resolved,
+                            secret,
+                            ..
+                        } = resolver.resolve_checked(vol);
+                        if secret {
+                            contract.warnings.push(format!(
+                                "VOLUME '{vol}' uses a secret build arg; volume not recorded"
+                            ));
+                            continue;
+                        }
                         // One entry per path: repeats across the chain are deduped.
                         if !contract.volumes.contains(&resolved) {
                             contract.volumes.push(resolved);
@@ -203,11 +226,9 @@ pub fn extract_contract(
                             contract.env.retain(|(k, _)| k != key);
                             continue;
                         }
-                        // The resolver keeps the real value so later `$KEY` references
-                        // still expand during static analysis; only the value stored in
-                        // the contract is redacted when the key looks like a secret.
+                        // The resolver keeps the real value; only the stored copy is redacted.
                         resolver.set_var(key, &resolved_val.value, resolved_val.secret);
-                        let stored_val = if policy.is_secret_key(key) {
+                        let stored_val = if resolved_val.secret || policy.is_secret_key(key) {
                             REDACTED_PLACEHOLDER.to_string()
                         } else {
                             resolved_val.value
@@ -291,6 +312,13 @@ pub fn extract_contract(
                                 ));
                                 continue;
                             }
+                            DestPath::Secret => {
+                                contract.warnings.push(format!(
+                                    "COPY destination '{dest}' uses a secret build arg; no file \
+                                     assertion generated"
+                                ));
+                                continue;
+                            }
                         };
 
                     let confidence = Confidence::Medium;
@@ -361,6 +389,13 @@ pub fn extract_contract(
                                 ));
                                 continue;
                             }
+                            DestPath::Secret => {
+                                contract.warnings.push(format!(
+                                    "ADD destination '{dest}' uses a secret build arg; no file \
+                                     assertion generated"
+                                ));
+                                continue;
+                            }
                         };
 
                     contract.assertions.push(ContractAssertion::new(
@@ -396,11 +431,16 @@ pub fn extract_contract(
 
     // Drop USER if unresolved or empty (can never match the built image); warn instead.
     if let Some(user) = &fold_user {
-        contract.user = Some(user.resolved.clone());
+        contract.user = (!user.secret).then(|| user.resolved.clone());
         if user.unresolved {
             contract.warnings.push(format!(
                 "USER '{}' contains an unresolved variable (no ARG/ENV default in \
                  scope); no user assertion generated",
+                user.raw
+            ));
+        } else if user.secret {
+            contract.warnings.push(format!(
+                "USER '{}' uses a secret build arg; no user assertion generated",
                 user.raw
             ));
         } else if user.resolved.is_empty() {
@@ -457,6 +497,8 @@ struct FoldedUser {
     line: usize,
     /// Whether resolution left an unresolved variable reference.
     unresolved: bool,
+    /// Whether resolution substituted a secret-derived variable.
+    secret: bool,
 }
 
 /// Build the USER assertion: numeric uid via `id -u`, else user-exists (drops `:group`).
@@ -631,6 +673,8 @@ enum DestPath {
     UnresolvedVar,
     /// Relative but the current WORKDIR is unknown (an earlier WORKDIR failed to resolve).
     UnknownWorkdir,
+    /// The destination substituted a secret-derived variable.
+    Secret,
 }
 
 /// Resolve a COPY/ADD dest; a relative one joins `current_workdir`, `None` if unknown.
@@ -642,10 +686,13 @@ fn resolve_dest_path(
     let Resolution {
         value: resolved_dest,
         unresolved,
-        ..
+        secret,
     } = resolver.resolve_checked(dest);
     if unresolved {
         return DestPath::UnresolvedVar;
+    }
+    if secret {
+        return DestPath::Secret;
     }
     if resolved_dest.starts_with('/') {
         return DestPath::Resolved(resolved_dest);
@@ -2032,5 +2079,132 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
             Some(REDACTED_PLACEHOLDER)
         );
         assert_eq!(env_value(&contract, "WORKROOT"), Some("/opt/app/data"));
+    }
+
+    fn secret_args(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn assert_no_leak(contract: &RuntimeContract, secrets: &[&str]) {
+        let dump = format!("{contract:?}");
+        for secret in secrets {
+            assert!(!dump.contains(secret), "{secret:?} leaked: {dump}");
+        }
+    }
+
+    #[test]
+    fn test_secret_build_arg_drops_derived_assertions_with_raw_warnings() {
+        let content = "FROM alpine\nARG DB_PASSWORD\nENV DSN=/srv/$DB_PASSWORD\nWORKDIR $DSN\nCOPY app.conf conf/\nADD app.tgz /opt/$DB_PASSWORD/\nUSER $DB_PASSWORD\nVOLUME /data/$DB_PASSWORD\nEXPOSE $DB_PASSWORD 8080\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "4242")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_no_leak(&contract, &["4242"]);
+        assert_eq!(contract.workdir, None);
+        assert_eq!(contract.user, None);
+        assert!(contract.volumes.is_empty());
+        assert_eq!(env_value(&contract, "DSN"), Some(REDACTED_PLACEHOLDER));
+        let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![8080]);
+        assert!(!contract
+            .assertions
+            .iter()
+            .any(|a| matches!(&a.kind, AssertionKind::FileExists { .. })));
+
+        let expected = [
+            "WORKDIR '$DSN' uses a secret build arg",
+            "COPY destination 'conf/' is relative to a working directory",
+            "ADD destination '/opt/$DB_PASSWORD/' uses a secret build arg",
+            "VOLUME '/data/$DB_PASSWORD' uses a secret build arg",
+            "EXPOSE '$DB_PASSWORD' uses a secret build arg",
+            "USER '$DB_PASSWORD' uses a secret build arg",
+        ];
+        assert_eq!(
+            contract.warnings.len(),
+            expected.len(),
+            "{:?}",
+            contract.warnings
+        );
+        for prefix in expected {
+            assert!(
+                contract.warnings.iter().any(|w| w.starts_with(prefix)),
+                "missing warning {prefix:?}: {:?}",
+                contract.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_named_build_arg_port_is_dropped() {
+        let content = "FROM alpine\nARG AUTH_PORT\nEXPOSE $AUTH_PORT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("AUTH_PORT", "8080")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert!(contract.exposed_ports.is_empty());
+        assert_eq!(
+            contract.warnings,
+            vec!["EXPOSE '$AUTH_PORT' uses a secret build arg; no port assertion generated"]
+        );
+    }
+
+    #[test]
+    fn test_secret_taint_clears_on_literal_rebind() {
+        let content =
+            "FROM alpine\nARG DB_PASSWORD\nENV DB_PASSWORD=/literal\nWORKDIR $DB_PASSWORD\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/literal".to_string()));
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
+        assert_eq!(
+            env_value(&contract, "DB_PASSWORD"),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        assert_no_leak(&contract, &["s3cr3tvalue"]);
+    }
+
+    #[test]
+    fn test_secret_taint_propagates_across_from_chain() {
+        let content = "FROM alpine AS base\nARG DB_PASSWORD\nENV DSN=/srv/$DB_PASSWORD\nARG MIRROR=$DSN\n\nFROM base\nWORKDIR $MIRROR\nUSER app\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("DB_PASSWORD", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, None);
+        assert_eq!(contract.user, Some("app".to_string()));
+        assert_eq!(
+            contract.warnings,
+            vec!["WORKDIR '$MIRROR' uses a secret build arg; no directory assertion generated"]
+        );
+        assert_no_leak(&contract, &["s3cr3tvalue"]);
+    }
+
+    #[test]
+    fn test_secret_global_arg_keeps_base_image_unresolved() {
+        let content =
+            "ARG REGISTRY_TOKEN\nARG IMAGE=registry.example/$REGISTRY_TOKEN/app\nFROM $IMAGE\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = secret_args(&[("REGISTRY_TOKEN", "s3cr3tvalue")]);
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.base_image, "$IMAGE");
+        assert_no_leak(&contract, &["s3cr3tvalue"]);
+    }
+
+    #[test]
+    fn test_dockerfile_defaults_with_secret_like_names_resolve_normally() {
+        let content = "FROM alpine\nENV KEYCLOAK_HOME=/opt/keycloak\nWORKDIR $KEYCLOAK_HOME\nARG AUTH_PORT=8080\nEXPOSE $AUTH_PORT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/keycloak".to_string()));
+        let ports: Vec<u16> = contract.exposed_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![8080]);
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
     }
 }
