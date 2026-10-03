@@ -8,23 +8,8 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
-/// Apply Dockerfile backslash-escape rules to a variable-expanded argument so a
-/// literal `\$` survives resolution instead of being read as a `$VAR` reference.
-///
-/// This mirrors the treatment [`super::parse_env_value`] already gives ENV
-/// values, centralizing it for every other variable-expanded instruction
-/// (WORKDIR, USER, EXPOSE, VOLUME, COPY/ADD destinations, ARG defaults):
-///   - `\$` becomes the [`ESCAPED_DOLLAR`] marker (a literal `$`, never expanded).
-///   - `\\` collapses to a single literal backslash, so `\\$VAR` is a literal
-///     backslash followed by a *live* `$VAR` reference (matching Docker).
-///   - a backslash before any other character is preserved verbatim, so paths
-///     such as `/a\b` are not mangled.
-///
-/// It must NOT be applied to strings that already carry the marker (ENV values
-/// decoded by [`super::parse_env_value`]); doing so would corrupt a `\\$VAR`
-/// ENV value whose decoded form is a literal backslash plus a `$VAR` reference.
+/// Mark `\$` as a literal dollar and collapse `\\`; never apply to already-decoded ENV values.
 pub(crate) fn escape_literal_dollars(input: &str) -> String {
-    // Fast path: nothing to escape, avoid allocating a new buffer's worth of work.
     if !input.contains('\\') {
         return input.to_string();
     }
@@ -45,8 +30,7 @@ pub(crate) fn escape_literal_dollars(input: &str) -> String {
                 out.push('\\');
                 chars.next();
             }
-            // A backslash before any other character (or at end of string) is
-            // kept literally so non-escape paths survive intact.
+            // Keep a backslash before any other char so paths like `/a\b` survive.
             _ => out.push('\\'),
         }
     }
@@ -373,8 +357,6 @@ mod tests {
 
     #[test]
     fn test_escape_literal_dollars_marks_escaped_dollar() {
-        // `\$VAR` and `\${VAR}` become literal after resolution, never expanded,
-        // even when a matching variable is defined.
         let mut resolver = VariableResolver::new();
         resolver
             .vars
@@ -402,18 +384,13 @@ mod tests {
 
     #[test]
     fn test_escape_literal_dollars_preserves_non_escape_backslash() {
-        // A backslash before a non-`$`, non-`\` character is kept verbatim, and a
-        // trailing backslash is not dropped.
         assert_eq!(escape_literal_dollars("/a\\b"), "/a\\b");
         assert_eq!(escape_literal_dollars("trailing\\"), "trailing\\");
-        // No backslash at all is returned unchanged.
         assert_eq!(escape_literal_dollars("/plain/path"), "/plain/path");
     }
 
     #[test]
     fn test_escape_literal_dollars_escaped_dollar_flags_resolved() {
-        // An escaped `$` must resolve cleanly (not flagged unresolved) even when
-        // no such variable exists.
         let resolver = VariableResolver::new();
         assert_eq!(
             resolver.resolve_checked(&escape_literal_dollars("/opt/\\$MISSING")),
