@@ -199,8 +199,7 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    // A supplied --build-arg enters scope here and overrides the default
-                    // (which Docker never evaluates), so bind it before touching the default.
+                    // Docker never evaluates the default when a build arg is supplied.
                     if resolver.has_supplied_build_arg(name) {
                         resolver.declare_arg(name, None, false);
                     } else {
@@ -1580,7 +1579,6 @@ WORKDIR $DIR
 
     #[test]
     fn test_build_arg_not_in_scope_before_arg_declaration_single_stage() {
-        // A build arg used before its ARG declaration is out of scope; no assertion is emitted.
         let content = r#"
 FROM alpine
 WORKDIR /x/$DIR
@@ -1610,7 +1608,6 @@ ARG DIR
 
     #[test]
     fn test_build_arg_in_scope_after_arg_declaration() {
-        // Once the ARG declaration is reached, the build arg resolves for later instructions.
         let content = r#"
 FROM alpine
 ARG DIR
@@ -1628,8 +1625,6 @@ WORKDIR /x/$DIR
 
     #[test]
     fn test_build_arg_not_in_scope_in_earlier_stage() {
-        // The issue's example: a later stage's ARG must not retroactively scope the build
-        // arg into an earlier stage's WORKDIR.
         let content = r#"
 FROM alpine AS base
 WORKDIR /base/$DIR
@@ -1656,7 +1651,6 @@ ARG DIR
 
     #[test]
     fn test_build_arg_not_in_scope_for_from_without_global_arg() {
-        // A build arg with no global ARG declaration must not resolve in a FROM image.
         let content = r#"
 FROM alpine:$TAG
 WORKDIR /app
@@ -1673,7 +1667,6 @@ WORKDIR /app
 
     #[test]
     fn test_build_arg_in_scope_for_from_with_global_arg() {
-        // A build arg declared globally is in scope for the FROM image.
         let content = r#"
 ARG TAG=latest
 FROM alpine:$TAG
@@ -1691,8 +1684,6 @@ WORKDIR /app
 
     #[test]
     fn test_automatic_platform_build_arg_resolves_from_without_global_arg() {
-        // A supplied BuildKit automatic platform arg is in global scope, so a FROM can
-        // reference it without an ARG and the base image resolves.
         let content = r#"
 FROM alpine:$TARGETARCH
 WORKDIR /app
@@ -1709,8 +1700,6 @@ WORKDIR /app
 
     #[test]
     fn test_global_arg_default_references_platform_arg_for_from() {
-        // A global ARG default may reference an automatic platform arg (global scope),
-        // and the resolved default then feeds a later FROM.
         let content = r#"
 ARG IMG=alpine:$TARGETARCH
 FROM $IMG
@@ -1728,8 +1717,6 @@ WORKDIR /app
 
     #[test]
     fn test_from_dash_default_resolves_nested_platform_arg() {
-        // A FROM image whose `${VAR:-default}` default nests a platform arg resolves in
-        // global scope: IMG is undeclared, so the default applies and must expand.
         let content = r#"
 FROM ${IMG:-alpine:$TARGETARCH}
 WORKDIR /app
@@ -1746,9 +1733,6 @@ WORKDIR /app
 
     #[test]
     fn test_automatic_platform_build_arg_not_in_stage_body_without_arg() {
-        // A platform arg is global-scope only: referenced in a stage body without an
-        // ARG it must not resolve, so no wrong assertion is emitted (Docker leaves it
-        // undefined there).
         let content = r#"
 FROM alpine
 WORKDIR /opt/$TARGETARCH
@@ -1777,7 +1761,6 @@ WORKDIR /opt/$TARGETARCH
 
     #[test]
     fn test_automatic_platform_build_arg_in_stage_body_after_arg() {
-        // Redeclaring the platform arg with a stage ARG brings it into the stage body.
         let content = r#"
 FROM alpine
 ARG TARGETARCH
@@ -1795,8 +1778,6 @@ WORKDIR /opt/$TARGETARCH
 
     #[test]
     fn test_predefined_proxy_build_arg_resolves_env_without_arg() {
-        // A predefined proxy build arg (no ARG declaration) must be in scope for ENV,
-        // matching Docker, which predefines the proxy args.
         let content = r#"
 FROM alpine
 ENV HTTPS_PROXY=$HTTPS_PROXY
@@ -1829,8 +1810,6 @@ WORKDIR /app
 
     #[test]
     fn test_build_arg_overrides_unresolved_default_before_evaluating_it() {
-        // A build arg wins over the default even when the default would be unresolved;
-        // Docker never evaluates the default in that case.
         let content = r#"
 FROM alpine
 ARG DIR=$UNDEF
@@ -1848,9 +1827,6 @@ WORKDIR /x/$DIR
 
     #[test]
     fn test_env_wins_over_same_name_build_arg_bound_arg() {
-        // Docker: ENV always overrides a same-name ARG, even with a --build-arg. This
-        // pins declare_arg checking `locked` BEFORE binding the supplied build arg;
-        // reversing that order would let the build arg wrongly override the ENV.
         let content = r#"
 FROM alpine
 ENV DIR=/env
@@ -1877,8 +1853,6 @@ WORKDIR /x/$DIR
 
     #[test]
     fn test_tainted_env_wins_over_same_name_build_arg_bound_arg() {
-        // An unresolved (tainted) ENV also outranks a later same-name ARG bound from a
-        // --build-arg, so the reference drops with a warning rather than taking `cli`.
         let content = r#"
 FROM alpine
 ENV DIR=$MISSING
