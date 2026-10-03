@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dialoguer = "0.11"
 
 # Pretty output
-console = "0.15"
+console = "0.16"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
