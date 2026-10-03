@@ -5,7 +5,9 @@ pub use heuristics::*;
 pub use model::*;
 
 use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
-use crate::parser::{CommandForm, Dockerfile, Instruction, PortSpec, Stage, VariableResolver};
+use crate::parser::{
+    CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage, VariableResolver,
+};
 use crate::Confidence;
 
 /// Maximum number of individual ports expanded from a single `EXPOSE low-high`
@@ -32,7 +34,7 @@ pub fn extract_contract(
     };
 
     let mut resolver = VariableResolver::new();
-    resolver.load_build_args(build_args);
+    resolver.load_build_args(build_args, |k| policy.is_secret_key(k));
     resolver.load_global_args(&dockerfile.global_args);
 
     // Walk the internal `FROM <alias>` chain so the final stage inherits the base stage's ENV/etc.
@@ -62,7 +64,11 @@ pub fn extract_contract(
         for inst in &chain_stage.instructions {
             match &inst.instruction {
                 Instruction::Workdir(dir) => {
-                    let (resolved, unresolved) = resolver.resolve_checked(dir);
+                    let Resolution {
+                        value: resolved,
+                        unresolved,
+                        ..
+                    } = resolver.resolve_checked(dir);
                     // `None` means unknown (unresolved var, or unknown base dir); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
@@ -105,7 +111,11 @@ pub fn extract_contract(
 
                 Instruction::User(user) => {
                     // Fold USER to its effective value; avoids keeping a stale parent uid.
-                    let (resolved, unresolved) = resolver.resolve_checked(user);
+                    let Resolution {
+                        value: resolved,
+                        unresolved,
+                        ..
+                    } = resolver.resolve_checked(user);
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
                         resolved,
@@ -116,7 +126,11 @@ pub fn extract_contract(
 
                 Instruction::Expose(tokens) => {
                     for raw_token in tokens {
-                        let (resolved, unresolved) = resolver.resolve_checked(raw_token);
+                        let Resolution {
+                            value: resolved,
+                            unresolved,
+                            ..
+                        } = resolver.resolve_checked(raw_token);
                         if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
@@ -163,24 +177,28 @@ pub fn extract_contract(
                 Instruction::Arg { name, default } => {
                     match default.as_deref() {
                         Some(def) => {
-                            let (resolved_def, unresolved) = resolver.resolve_checked(def);
-                            if unresolved {
+                            let resolved_def = resolver.resolve_checked(def);
+                            if resolved_def.unresolved {
                                 // Leave the name undefined so later uses drop with a warning.
                                 if !resolver.is_locked(name) {
                                     resolver.unset(name);
                                 }
                             } else {
-                                resolver.declare_arg(name, Some(&resolved_def));
+                                resolver.declare_arg(
+                                    name,
+                                    Some(&resolved_def.value),
+                                    resolved_def.secret,
+                                );
                             }
                         }
-                        None => resolver.declare_arg(name, None),
+                        None => resolver.declare_arg(name, None, false),
                     }
                 }
 
                 Instruction::Env(pairs) => {
                     for (key, value) in pairs {
-                        let (resolved_val, unresolved) = resolver.resolve_checked(value);
-                        if unresolved {
+                        let resolved_val = resolver.resolve_checked(value);
+                        if resolved_val.unresolved {
                             resolver.taint(key);
                             contract.env.retain(|(k, _)| k != key);
                             continue;
@@ -188,11 +206,11 @@ pub fn extract_contract(
                         // The resolver keeps the real value so later `$KEY` references
                         // still expand during static analysis; only the value stored in
                         // the contract is redacted when the key looks like a secret.
-                        resolver.set_var(key, &resolved_val);
+                        resolver.set_var(key, &resolved_val.value, resolved_val.secret);
                         let stored_val = if policy.is_secret_key(key) {
                             REDACTED_PLACEHOLDER.to_string()
                         } else {
-                            resolved_val
+                            resolved_val.value
                         };
                         match contract.env.iter_mut().find(|(k, _)| k == key) {
                             Some(entry) => entry.1 = stored_val,
@@ -621,7 +639,11 @@ fn resolve_dest_path(
     resolver: &crate::parser::VariableResolver,
     current_workdir: Option<&str>,
 ) -> DestPath {
-    let (resolved_dest, unresolved) = resolver.resolve_checked(dest);
+    let Resolution {
+        value: resolved_dest,
+        unresolved,
+        ..
+    } = resolver.resolve_checked(dest);
     if unresolved {
         return DestPath::UnresolvedVar;
     }

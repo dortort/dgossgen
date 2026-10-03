@@ -8,6 +8,16 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
+/// Outcome of resolving a string against the variables in scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub value: String,
+    /// An undefined, defaultless reference was left verbatim in `value`.
+    pub unresolved: bool,
+    /// A secret-derived variable was substituted into `value`.
+    pub secret: bool,
+}
+
 /// Resolve ARG/ENV variable references in a stage.
 /// Best-effort substitution: unknown variables remain as ${VAR} literals.
 #[derive(Default)]
@@ -17,6 +27,8 @@ pub struct VariableResolver {
     locked: HashSet<String>,
     /// Names set to an unknown value (e.g. `ENV DIR=$MISSING`); resolve unresolved, no defaults.
     tainted: HashSet<String>,
+    /// Names whose value came from a secret-named build-arg, directly or via another binding.
+    secret: HashSet<String>,
 }
 
 impl VariableResolver {
@@ -24,11 +36,14 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load CLI --build-arg values; these lock the name against a later ARG default.
-    pub fn load_build_args(&mut self, args: &[(String, String)]) {
+    /// Load CLI --build-arg values (locked against a later ARG default); `is_secret` keys are secret.
+    pub fn load_build_args(&mut self, args: &[(String, String)], is_secret: impl Fn(&str) -> bool) {
         for (k, v) in args {
             self.vars.insert(k.clone(), v.clone());
             self.locked.insert(k.clone());
+            if is_secret(k) {
+                self.secret.insert(k.clone());
+            }
         }
     }
 
@@ -39,23 +54,24 @@ impl VariableResolver {
                 continue;
             }
             if let Some(default) = &arg.default {
-                let (resolved, unresolved) = self.resolve_checked(default);
-                if unresolved {
+                let resolved = self.resolve_checked(default);
+                if resolved.unresolved {
                     self.vars.remove(&arg.name);
+                    self.secret.remove(&arg.name);
                 } else {
-                    self.vars.insert(arg.name.clone(), resolved);
+                    self.bind(&arg.name, resolved.value, resolved.secret);
                 }
             }
         }
     }
 
     /// Declare a stage ARG default; a locked value wins, else it overwrites any inherited default.
-    pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
+    pub fn declare_arg(&mut self, name: &str, default: Option<&str>, secret: bool) {
         if self.locked.contains(name) {
             return;
         }
         if let Some(val) = default {
-            self.vars.insert(name.to_string(), val.to_string());
+            self.bind(name, val.to_string(), secret);
         }
     }
 
@@ -65,35 +81,47 @@ impl VariableResolver {
     }
 
     /// Bind an ENV value, overwriting any prior binding and locking it against a later ARG.
-    pub fn set_var(&mut self, key: &str, value: &str) {
-        self.vars.insert(key.to_string(), value.to_string());
+    pub fn set_var(&mut self, key: &str, value: &str, secret: bool) {
+        self.bind(key, value.to_string(), secret);
         self.locked.insert(key.to_string());
         self.tainted.remove(key);
+    }
+
+    fn bind(&mut self, key: &str, value: String, secret: bool) {
+        self.vars.insert(key.to_string(), value);
+        if secret {
+            self.secret.insert(key.to_string());
+        } else {
+            self.secret.remove(key);
+        }
     }
 
     /// Remove a binding and its lock/taint; used when an ARG re-declaration was unresolved.
     pub fn unset(&mut self, key: &str) {
         self.locked.remove(key);
         self.tainted.remove(key);
+        self.secret.remove(key);
         self.vars.remove(key);
     }
 
     /// Mark a var set-but-unknown (unresolvable ENV); locks the name but resolves unresolved.
     pub fn taint(&mut self, key: &str) {
         self.vars.remove(key);
+        self.secret.remove(key);
         self.locked.insert(key.to_string());
         self.tainted.insert(key.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string.
     pub fn resolve(&self, input: &str) -> String {
-        self.resolve_checked(input).0
+        self.resolve_checked(input).value
     }
 
-    /// Like [`VariableResolver::resolve`], also flags an undefined, defaultless reference.
-    pub fn resolve_checked(&self, input: &str) -> (String, bool) {
+    /// Like [`VariableResolver::resolve`], also flagging unresolved and secret-derived references.
+    pub fn resolve_checked(&self, input: &str) -> Resolution {
         let mut result = String::with_capacity(input.len());
         let mut unresolved = false;
+        let mut secret = false;
         let mut iter = input.char_indices().peekable();
 
         while let Some((idx, ch)) = iter.next() {
@@ -136,15 +164,17 @@ impl VariableResolver {
 
                     if let Some(val) = self.vars.get(var_name) {
                         result.push_str(val);
+                        secret |= self.secret.contains(var_name);
                     } else if self.tainted.contains(var_name) {
                         // Tainted: its dash-default doesn't apply since the name is set.
                         result.push_str(&input[idx..end_idx + 1]);
                         unresolved = true;
                     } else if let Some(def) = default {
                         // Resolve the default recursively so nested `$OTHER` refs expand too.
-                        let (resolved_def, def_unresolved) = self.resolve_checked(def);
-                        result.push_str(&resolved_def);
-                        unresolved |= def_unresolved;
+                        let resolved_def = self.resolve_checked(def);
+                        result.push_str(&resolved_def.value);
+                        unresolved |= resolved_def.unresolved;
+                        secret |= resolved_def.secret;
                     } else {
                         result.push_str(&input[idx..end_idx + 1]);
                         unresolved = true;
@@ -175,6 +205,7 @@ impl VariableResolver {
                 let var_name = &input[name_start..name_end];
                 if let Some(val) = self.vars.get(var_name) {
                     result.push_str(val);
+                    secret |= self.secret.contains(var_name);
                 } else {
                     result.push_str(&input[idx..name_end]);
                     unresolved = true;
@@ -185,12 +216,16 @@ impl VariableResolver {
             result.push('$');
         }
 
-        (result, unresolved)
+        Resolution {
+            value: result,
+            unresolved,
+            secret,
+        }
     }
 
     /// Check if a string contains unresolved variables.
     pub fn has_unresolved(&self, input: &str) -> bool {
-        self.resolve_checked(input).1
+        self.resolve_checked(input).unresolved
     }
 
     /// Get current variable map.
@@ -264,27 +299,26 @@ mod tests {
         let mut resolver = VariableResolver::new();
         resolver.vars.insert("SUB".to_string(), "inner".to_string());
         // The default is resolved recursively, and the reference is satisfied.
-        assert_eq!(
-            resolver.resolve_checked("${MISSING:-/opt/$SUB}"),
-            ("/opt/inner".to_string(), false)
-        );
+        let resolved = resolver.resolve_checked("${MISSING:-/opt/$SUB}");
+        assert_eq!(resolved.value, "/opt/inner");
+        assert!(!resolved.unresolved);
     }
 
     #[test]
     fn test_resolve_checked_default_with_undefined_nested_var_is_unresolved() {
         let resolver = VariableResolver::new();
         // The default text's own unresolved reference flags the whole result unresolved.
-        let (value, unresolved) = resolver.resolve_checked("${MISSING:-/x$BAR}");
-        assert_eq!(value, "/x$BAR");
-        assert!(unresolved);
+        let resolved = resolver.resolve_checked("${MISSING:-/x$BAR}");
+        assert_eq!(resolved.value, "/x$BAR");
+        assert!(resolved.unresolved);
     }
 
     #[test]
     fn test_resolve_checked_unterminated_brace_is_unresolved() {
         let resolver = VariableResolver::new();
-        let (value, unresolved) = resolver.resolve_checked("/a/${UNTERM");
-        assert_eq!(value, "/a/${UNTERM");
-        assert!(unresolved);
+        let resolved = resolver.resolve_checked("/a/${UNTERM");
+        assert_eq!(resolved.value, "/a/${UNTERM");
+        assert!(resolved.unresolved);
     }
 
     #[test]
@@ -292,14 +326,64 @@ mod tests {
         let mut resolver = VariableResolver::new();
         resolver.taint("DIR");
         // A set-but-unknown var is unresolved for a bare ref and for both default forms.
-        assert!(resolver.resolve_checked("$DIR").1);
-        assert!(resolver.resolve_checked("/srv/${DIR-fallback}").1);
-        assert!(resolver.resolve_checked("/srv/${DIR:-fallback}").1);
+        assert!(resolver.resolve_checked("$DIR").unresolved);
+        assert!(resolver.resolve_checked("/srv/${DIR-fallback}").unresolved);
+        assert!(resolver.resolve_checked("/srv/${DIR:-fallback}").unresolved);
         // A later resolvable binding clears the taint.
-        resolver.set_var("DIR", "real");
-        assert_eq!(
-            resolver.resolve_checked("/srv/${DIR-fallback}"),
-            ("/srv/real".to_string(), false)
+        resolver.set_var("DIR", "real", false);
+        let resolved = resolver.resolve_checked("/srv/${DIR-fallback}");
+        assert_eq!(resolved.value, "/srv/real");
+        assert!(!resolved.unresolved);
+    }
+
+    fn resolver_with_secret_build_arg() -> VariableResolver {
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(
+            &[
+                ("DB_PASSWORD".to_string(), "s3cr3t".to_string()),
+                ("APP_PORT".to_string(), "8080".to_string()),
+            ],
+            |k| k.contains("PASSWORD"),
         );
+        resolver
+    }
+
+    #[test]
+    fn test_secret_build_arg_reference_is_flagged_secret() {
+        let resolver = resolver_with_secret_build_arg();
+        for input in [
+            "$DB_PASSWORD",
+            "/srv/${DB_PASSWORD}",
+            "${NOPE:-$DB_PASSWORD}",
+        ] {
+            let resolved = resolver.resolve_checked(input);
+            assert!(resolved.secret, "{input} should be secret-derived");
+            assert!(!resolved.unresolved);
+        }
+        assert!(!resolver.resolve_checked("$APP_PORT").secret);
+        assert!(!resolver.resolve_checked("/literal").secret);
+    }
+
+    #[test]
+    fn test_secret_taint_propagates_through_bindings_and_clears_on_literal_rebind() {
+        let mut resolver = resolver_with_secret_build_arg();
+        let dsn = resolver.resolve_checked("/srv/$DB_PASSWORD");
+        resolver.set_var("DSN", &dsn.value, dsn.secret);
+        let alias = resolver.resolve_checked("$DSN");
+        resolver.declare_arg("ALIAS", Some(&alias.value), alias.secret);
+        assert!(resolver.resolve_checked("$ALIAS").secret);
+
+        resolver.set_var("DB_PASSWORD", "/literal", false);
+        assert!(!resolver.resolve_checked("$DB_PASSWORD").secret);
+        assert!(resolver.resolve_checked("$DSN").secret);
+    }
+
+    #[test]
+    fn test_locked_secret_build_arg_keeps_taint_over_arg_default() {
+        let mut resolver = resolver_with_secret_build_arg();
+        resolver.declare_arg("DB_PASSWORD", Some("dockerfile-default"), false);
+        let resolved = resolver.resolve_checked("$DB_PASSWORD");
+        assert_eq!(resolved.value, "s3cr3t");
+        assert!(resolved.secret);
     }
 }
