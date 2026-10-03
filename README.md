@@ -208,7 +208,7 @@ file:
 
 port:
   # derived from EXPOSE 8080/tcp; confidence: medium
-  tcp:8080:
+  "tcp:8080":
     listening: true
 ```
 
@@ -286,7 +286,7 @@ CMD ["nginx", "-g", "daemon off;"]
 ```yaml
 port:
   # derived from EXPOSE 80/tcp; confidence: medium
-  tcp:80:
+  "tcp:80":
     listening: true
 command:
   # derived from HEALTHCHECK CMD curl -f http://localhost/ || exit 1; confidence: high
@@ -340,7 +340,7 @@ file:
 
 port:
   # derived from EXPOSE 8080/tcp; confidence: medium
-  tcp:8080:
+  "tcp:8080":
     listening: true
 
 process:

@@ -68,7 +68,7 @@ impl PolicyConfig {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         let config: PolicyConfig =
-            serde_yml::from_str(&content).with_context(|| "parsing config file")?;
+            serde_saphyr::from_str(&content).with_context(|| "parsing config file")?;
         Ok(config)
     }
 
@@ -266,7 +266,7 @@ mod tests {
         // misspelled key there would otherwise silently drop the assertion.
         let yaml = "service_patterns:\n  - name: nginx\n    proces: nginx\n";
         assert!(
-            serde_yml::from_str::<PolicyConfig>(yaml).is_err(),
+            serde_saphyr::from_str::<PolicyConfig>(yaml).is_err(),
             "a misspelled nested service_patterns key must be rejected"
         );
     }
@@ -318,7 +318,7 @@ secret_patterns:
   - SECRET
   - TOKEN
 "#;
-        let config: PolicyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: PolicyConfig = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(config.assert_ports, AssertionPolicy::Required);
         assert_eq!(config.assert_process, AssertionPolicy::Off);
         assert!(config.assert_file_modes);

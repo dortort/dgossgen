@@ -828,7 +828,7 @@ fn test_heredoc_end_to_end_output_has_no_phantom_user() {
         output.goss_yml
     );
 
-    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output.goss_yml);
+    let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output.goss_yml);
     assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");
 }
 
@@ -873,6 +873,6 @@ fn test_output_is_parseable_yaml() {
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
 
-    let parsed: Result<serde_yml::Value, _> = serde_yml::from_str(&output.goss_yml);
+    let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output.goss_yml);
     assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");
 }

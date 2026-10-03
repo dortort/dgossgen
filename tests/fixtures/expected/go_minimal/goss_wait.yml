@@ -1,6 +1,6 @@
 port:
   # derived from EXPOSE 8080/tcp; confidence: medium
-  tcp:8080:
+  "tcp:8080":
     listening: true
 process:
   # derived from ENTRYPOINT (wait gate); confidence: medium

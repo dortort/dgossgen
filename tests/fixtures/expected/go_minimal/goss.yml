@@ -12,5 +12,5 @@ command:
     exec: id -u
     exit-status: 0
     stdout:
-    - '65534'
+    - "65534"
     timeout: 10000
