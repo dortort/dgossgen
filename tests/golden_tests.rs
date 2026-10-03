@@ -731,8 +731,6 @@ fn test_secret_named_build_arg_port_is_dropped_with_warning() {
 
 #[test]
 fn test_custom_secret_patterns_feed_redaction_end_to_end() {
-    // The user-facing `secret_patterns` knob must actually drive enforcement:
-    // a custom pattern redacts a key the defaults would ignore.
     let content = r#"
 FROM alpine
 ENV INTERNAL_URL=https://svc.internal:9000

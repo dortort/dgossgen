@@ -211,10 +211,7 @@ type LoadedContract = (
 fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
     let profile = parse_profile(&common.profile)?;
     let build_args = parse_build_args(&common.build_args);
-    // Load the policy before extraction so secret redaction is applied as ENV
-    // values enter the contract, and validate it up front — a malformed
-    // .dgossgen.yml is a hard error, never a silent revert to defaults. The
-    // loaded policy is returned so callers reuse it rather than re-reading it.
+    // A malformed .dgossgen.yml is a hard error, never a silent revert to defaults.
     let policy = PolicyConfig::load_or_default(&common.context)?;
     let dockerfile = parser::parse_dockerfile(&common.dockerfile)
         .with_context(|| format!("parsing {}", common.dockerfile.display()))?;
@@ -405,8 +402,7 @@ fn cmd_probe(
     unsafe_run_arg: bool,
     allow_network: bool,
 ) -> Result<ExitCode> {
-    // load_contract validates the policy (a malformed .dgossgen.yml is a hard
-    // error) before any expensive, side-effecting container work.
+    // load_contract validates the policy before any side-effecting container work.
     let (profile, build_args, policy, mut contract) = load_contract(&common)?;
 
     let rt: ContainerRuntime = runtime

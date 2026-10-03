@@ -2026,8 +2026,6 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 
     #[test]
     fn test_secret_env_value_is_redacted_in_contract() {
-        // A key matching the default secret patterns must never keep its real
-        // value in the contract; a non-secret key is stored untouched.
         let content = "FROM alpine\nENV DB_PASSWORD=hunter2\nENV APP_PORT=3000\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
@@ -2045,9 +2043,6 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 
     #[test]
     fn test_custom_secret_pattern_drives_redaction() {
-        // The user-facing `secret_patterns` knob must feed enforcement: a custom
-        // pattern redacts a key the defaults would leave alone, and a default
-        // pattern absent from the custom list is no longer treated as secret.
         let policy = PolicyConfig {
             secret_patterns: vec!["INTERNAL".to_string()],
             ..PolicyConfig::default()
@@ -2061,15 +2056,12 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
             env_value(&contract, "INTERNAL_URL"),
             Some(REDACTED_PLACEHOLDER)
         );
-        // TOKEN is a default secret pattern but not in the custom list, so it
-        // is now stored as-is — proving the custom list, not the defaults, is used.
+        // A custom list replaces the defaults, so TOKEN is no longer secret.
         assert_eq!(env_value(&contract, "API_TOKEN"), Some("abc123"));
     }
 
     #[test]
     fn test_secret_value_still_resolves_for_dependent_variables() {
-        // Redaction only affects the stored value; the resolver keeps the real
-        // value so a later non-secret variable that references it resolves.
         let content = "FROM alpine\nENV SECRET_BASE=/opt/app\nENV WORKROOT=$SECRET_BASE/data\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
