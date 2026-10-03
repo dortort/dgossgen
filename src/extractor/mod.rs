@@ -819,6 +819,17 @@ CMD ["node", "server.js"]
     }
 
     #[test]
+    fn test_escaped_dollar_in_unresolved_arg_never_leaks_marker() {
+        let content = "FROM alpine\nENV T=$MISSING\nUSER ${T:-\\$x}\nVOLUME /data/${T:-\\$y}\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.user, Some("${T:-$x}".to_string()));
+        assert_eq!(contract.volumes, vec!["/data/${T:-$y}".to_string()]);
+        assert!(!format!("{contract:?}").contains(crate::parser::ESCAPED_DOLLAR));
+    }
+
+    #[test]
     fn test_extract_with_healthcheck() {
         let content = r#"
 FROM nginx:alpine
