@@ -17,6 +17,9 @@ pub struct VariableResolver {
     locked: HashSet<String>,
     /// Names set to an unknown value (e.g. `ENV DIR=$MISSING`); resolve unresolved, no defaults.
     tainted: HashSet<String>,
+    /// CLI `--build-arg` values awaiting their `ARG` declaration before they enter scope.
+    /// Docker only binds a build arg at its global or stage `ARG`, not up front.
+    supplied_build_args: HashMap<String, String>,
 }
 
 impl VariableResolver {
@@ -24,18 +27,32 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load CLI --build-arg values; these lock the name against a later ARG default.
+    /// Store CLI `--build-arg` values. They do not enter scope here: a build arg is
+    /// bound only when its matching global or stage `ARG` declaration is reached
+    /// (see [`VariableResolver::declare_arg`]), matching Docker's scoping. A value
+    /// with no corresponding `ARG` declaration is never in scope.
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
-            self.vars.insert(k.clone(), v.clone());
-            self.locked.insert(k.clone());
+            self.supplied_build_args.insert(k.clone(), v.clone());
         }
+    }
+
+    /// Whether a `--build-arg` value was supplied for `name` (whether or not it is yet in scope).
+    pub fn has_supplied_build_arg(&self, name: &str) -> bool {
+        self.supplied_build_args.contains_key(name)
     }
 
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
             if self.locked.contains(&arg.name) {
+                continue;
+            }
+            // A supplied build arg enters scope at its global ARG declaration and
+            // outranks the default (which Docker never evaluates in that case).
+            if let Some(val) = self.supplied_build_args.get(&arg.name).cloned() {
+                self.vars.insert(arg.name.clone(), val);
+                self.locked.insert(arg.name.clone());
                 continue;
             }
             if let Some(default) = &arg.default {
@@ -49,9 +66,18 @@ impl VariableResolver {
         }
     }
 
-    /// Declare a stage ARG default; a locked value wins, else it overwrites any inherited default.
+    /// Declare a stage ARG: a supplied build arg enters scope (and locks) here, else a
+    /// locked value wins, else the given default overwrites any inherited default.
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>) {
         if self.locked.contains(name) {
+            return;
+        }
+        // A supplied build arg comes into scope at its ARG declaration, overriding the
+        // default, and locks the name against any later ARG default.
+        if let Some(val) = self.supplied_build_args.get(name).cloned() {
+            self.vars.insert(name.to_string(), val);
+            self.locked.insert(name.to_string());
+            self.tainted.remove(name);
             return;
         }
         if let Some(val) = default {

@@ -153,19 +153,25 @@ pub fn extract_contract(
                 }
 
                 Instruction::Arg { name, default } => {
-                    match default.as_deref() {
-                        Some(def) => {
-                            let (resolved_def, unresolved) = resolver.resolve_checked(def);
-                            if unresolved {
-                                // Leave the name undefined so later uses drop with a warning.
-                                if !resolver.is_locked(name) {
-                                    resolver.unset(name);
+                    // A supplied --build-arg enters scope here and overrides the default
+                    // (which Docker never evaluates), so bind it before touching the default.
+                    if resolver.has_supplied_build_arg(name) {
+                        resolver.declare_arg(name, None);
+                    } else {
+                        match default.as_deref() {
+                            Some(def) => {
+                                let (resolved_def, unresolved) = resolver.resolve_checked(def);
+                                if unresolved {
+                                    // Leave the name undefined so later uses drop with a warning.
+                                    if !resolver.is_locked(name) {
+                                        resolver.unset(name);
+                                    }
+                                } else {
+                                    resolver.declare_arg(name, Some(&resolved_def));
                                 }
-                            } else {
-                                resolver.declare_arg(name, Some(&resolved_def));
                             }
+                            None => resolver.declare_arg(name, None),
                         }
-                        None => resolver.declare_arg(name, None),
                     }
                 }
 
