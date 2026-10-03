@@ -2,11 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Placeholder substituted for an environment variable value whose key the
-/// active policy classifies as a secret (see [`PolicyConfig::is_secret_key`]).
-/// Redaction happens at the data-entry points (extractor, probe) so no secret
-/// value is ever stored in a contract or evidence, and thus none can reach
-/// generated YAML or diagnostics.
+/// Stored in place of a value whose key [`PolicyConfig::is_secret_key`] matches.
 pub const REDACTED_PLACEHOLDER: &str = "***REDACTED***";
 
 /// Policy configuration loaded from .dgossgen.yml or defaults.
