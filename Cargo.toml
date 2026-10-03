@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "development-tools::testing"]
 clap = { version = "4", features = ["derive", "env"] }
 
 # Interactive prompts
-dialoguer = "0.11"
+dialoguer = "0.12"
 
 # Pretty output
 console = "0.16"
