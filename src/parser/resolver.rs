@@ -8,21 +8,11 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
-/// Build-arg names that are in scope *without* a corresponding `ARG` instruction,
-/// unlike an ordinary build arg. A supplied `--build-arg` value for one of these is
-/// bound immediately rather than deferred to an `ARG` declaration. Two groups:
-///
-/// - The predefined proxy args, usable without an `ARG` throughout the build.
-///   See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
-/// - BuildKit's automatic platform args, which live in the global scope (so a
-///   `FROM` can reference them without an `ARG`). Docker requires an `ARG`
-///   redeclaration only to use them in a stage body; dgossgen resolves variables
-///   in a single flat scope, so binding them up front matches the global `FROM`
-///   case — the stage-redeclaration distinction is the separate global-scope-leak
-///   concern, not this fix.
-///   See <https://docs.docker.com/reference/dockerfile/#automatic-platform-args-in-the-global-scope>.
-const PREDECLARED_BUILD_ARGS: &[&str] = &[
-    // Predefined proxy args.
+/// Docker's predefined proxy build args. A supplied `--build-arg` value for one of
+/// these is usable *without* a corresponding `ARG` instruction anywhere in the build
+/// (global `FROM` lines and stage bodies alike), so dgossgen binds it immediately.
+/// See <https://docs.docker.com/reference/dockerfile/#predefined-args>.
+const PROXY_BUILD_ARGS: &[&str] = &[
     "HTTP_PROXY",
     "http_proxy",
     "HTTPS_PROXY",
@@ -33,7 +23,15 @@ const PREDECLARED_BUILD_ARGS: &[&str] = &[
     "no_proxy",
     "ALL_PROXY",
     "all_proxy",
-    // BuildKit automatic platform args (global scope).
+];
+
+/// BuildKit's automatic platform build args. Unlike the proxy args, these live in the
+/// *global* scope only: a `FROM` may reference one without an `ARG`, but a stage body
+/// must redeclare it with `ARG` first. A supplied value is therefore available for
+/// `FROM`/global resolution but, like an ordinary build arg, stays deferred until a
+/// stage `ARG` brings it into the stage body.
+/// See <https://docs.docker.com/reference/dockerfile/#automatic-platform-args-in-the-global-scope>.
+const PLATFORM_BUILD_ARGS: &[&str] = &[
     "TARGETPLATFORM",
     "TARGETOS",
     "TARGETARCH",
@@ -66,13 +64,15 @@ impl VariableResolver {
     /// Store CLI `--build-arg` values. An ordinary build arg does not enter scope
     /// here: it is bound only when its matching global or stage `ARG` declaration is
     /// reached (see [`VariableResolver::declare_arg`]), matching Docker's scoping, and
-    /// a value with no corresponding `ARG` declaration is never in scope. The
-    /// predeclared build args (proxy and automatic platform variables) are the
-    /// exception — they are usable without an `ARG`, so a supplied value for one
-    /// enters scope immediately.
+    /// a value with no corresponding `ARG` declaration is never in scope.
+    ///
+    /// The predefined proxy args are the exception: usable without an `ARG` anywhere,
+    /// so a supplied value is bound immediately. Automatic platform args are deferred
+    /// like an ordinary build arg (a stage body must redeclare them with `ARG`), but
+    /// are additionally honored in global/`FROM` resolution via [`Self::resolve_image`].
     pub fn load_build_args(&mut self, args: &[(String, String)]) {
         for (k, v) in args {
-            if PREDECLARED_BUILD_ARGS.contains(&k.as_str()) {
+            if PROXY_BUILD_ARGS.contains(&k.as_str()) {
                 self.vars.insert(k.clone(), v.clone());
                 self.locked.insert(k.clone());
             } else {
@@ -84,6 +84,19 @@ impl VariableResolver {
     /// Whether a `--build-arg` value was supplied for `name` (whether or not it is yet in scope).
     pub fn has_supplied_build_arg(&self, name: &str) -> bool {
         self.supplied_build_args.contains_key(name)
+    }
+
+    /// Look up `name` for resolution. In global scope (`FROM` lines), a supplied
+    /// automatic platform arg resolves even without an `ARG`; in stage-body scope it
+    /// does not (it must be redeclared with `ARG`, which binds it into `vars`).
+    fn lookup(&self, name: &str, global_scope: bool) -> Option<&str> {
+        if let Some(val) = self.vars.get(name) {
+            return Some(val);
+        }
+        if global_scope && PLATFORM_BUILD_ARGS.contains(&name) {
+            return self.supplied_build_args.get(name).map(String::as_str);
+        }
+        None
     }
 
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
@@ -100,7 +113,9 @@ impl VariableResolver {
                 continue;
             }
             if let Some(default) = &arg.default {
-                let (resolved, unresolved) = self.resolve_checked(default);
+                // Global ARG defaults resolve in global scope, so one may reference an
+                // earlier global or an automatic platform arg.
+                let (resolved, unresolved) = self.resolve_checked_inner(default, true);
                 if unresolved {
                     self.vars.remove(&arg.name);
                 } else {
@@ -155,13 +170,26 @@ impl VariableResolver {
         self.tainted.insert(key.to_string());
     }
 
-    /// Resolve ${VAR} and $VAR references in a string.
+    /// Resolve ${VAR} and $VAR references in a string (stage-body scope).
     pub fn resolve(&self, input: &str) -> String {
         self.resolve_checked(input).0
     }
 
+    /// Resolve an image reference (`FROM`/base image) in global scope, where a supplied
+    /// automatic platform arg is in scope without an `ARG`.
+    pub fn resolve_image(&self, input: &str) -> String {
+        self.resolve_checked_inner(input, true).0
+    }
+
     /// Like [`VariableResolver::resolve`], also flags an undefined, defaultless reference.
+    /// Resolution uses stage-body scope.
     pub fn resolve_checked(&self, input: &str) -> (String, bool) {
+        self.resolve_checked_inner(input, false)
+    }
+
+    /// Resolve `${VAR}`/`$VAR` references. `global_scope` selects whether a supplied
+    /// automatic platform arg resolves without an `ARG` (see [`Self::lookup`]).
+    fn resolve_checked_inner(&self, input: &str, global_scope: bool) -> (String, bool) {
         let mut result = String::with_capacity(input.len());
         let mut unresolved = false;
         let mut iter = input.char_indices().peekable();
@@ -204,7 +232,7 @@ impl VariableResolver {
                         (var_expr, None)
                     };
 
-                    if let Some(val) = self.vars.get(var_name) {
+                    if let Some(val) = self.lookup(var_name, global_scope) {
                         result.push_str(val);
                     } else if self.tainted.contains(var_name) {
                         // Tainted: its dash-default doesn't apply since the name is set.
@@ -212,7 +240,8 @@ impl VariableResolver {
                         unresolved = true;
                     } else if let Some(def) = default {
                         // Resolve the default recursively so nested `$OTHER` refs expand too.
-                        let (resolved_def, def_unresolved) = self.resolve_checked(def);
+                        let (resolved_def, def_unresolved) =
+                            self.resolve_checked_inner(def, global_scope);
                         result.push_str(&resolved_def);
                         unresolved |= def_unresolved;
                     } else {
@@ -243,7 +272,7 @@ impl VariableResolver {
                 }
 
                 let var_name = &input[name_start..name_end];
-                if let Some(val) = self.vars.get(var_name) {
+                if let Some(val) = self.lookup(var_name, global_scope) {
                     result.push_str(val);
                 } else {
                     result.push_str(&input[idx..name_end]);
@@ -433,14 +462,29 @@ mod tests {
     }
 
     #[test]
-    fn test_automatic_platform_build_arg_in_scope_without_arg() {
-        // A supplied BuildKit automatic platform arg is in scope (global FROM case)
-        // without an ARG declaration.
+    fn test_automatic_platform_build_arg_in_global_scope_only() {
+        // A supplied automatic platform arg resolves for a FROM image (global scope)
+        // without an ARG, but NOT in stage-body scope, where it must be redeclared.
         let mut resolver = VariableResolver::new();
         resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
-        let (value, unresolved) = resolver.resolve_checked("alpine:$TARGETARCH");
-        assert_eq!(value, "alpine:arm64");
-        assert!(!unresolved);
+        // Global scope (FROM): resolves.
+        assert_eq!(resolver.resolve_image("alpine:$TARGETARCH"), "alpine:arm64");
+        // Stage-body scope: unresolved (not bound without an ARG).
+        let (value, unresolved) = resolver.resolve_checked("/opt/$TARGETARCH");
+        assert_eq!(value, "/opt/$TARGETARCH");
+        assert!(unresolved);
+        // Deferred, not locked, until a stage ARG brings it in.
+        assert!(!resolver.is_locked("TARGETARCH"));
+        assert!(resolver.has_supplied_build_arg("TARGETARCH"));
+    }
+
+    #[test]
+    fn test_automatic_platform_build_arg_enters_stage_scope_at_arg() {
+        // Redeclaring the platform arg with a stage ARG binds it into stage-body scope.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TARGETARCH".to_string(), "arm64".to_string())]);
+        resolver.declare_arg("TARGETARCH", None);
+        assert_eq!(resolver.resolve("/opt/$TARGETARCH"), "/opt/arm64");
         assert!(resolver.is_locked("TARGETARCH"));
     }
 
