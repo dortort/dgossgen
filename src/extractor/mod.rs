@@ -830,6 +830,50 @@ CMD ["node", "server.js"]
     }
 
     #[test]
+    fn test_workdir_backslash_edge_cases() {
+        let cases = [
+            ("/opt/cost\\$", "/opt/cost$"),
+            ("/opt/\\\\\\$APP", "/opt/\\$APP"),
+            ("/win\\app", "/win\\app"),
+            ("/win\\\\app", "/win\\app"),
+        ];
+        for (dir, expected) in cases {
+            let content = format!("FROM alpine\nENV APP=myapp\nWORKDIR {dir}\n");
+            let df = parse_dockerfile_content(&content).unwrap();
+            let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+            assert_eq!(contract.workdir.as_deref(), Some(expected), "WORKDIR {dir}");
+        }
+    }
+
+    #[test]
+    fn test_env_decoded_value_is_not_unescaped_again() {
+        let content = "FROM alpine\nENV UNC=\\\\\\\\srv LIT=\\$HOME\nWORKDIR /mnt/$UNC/$LIT\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/mnt/\\\\srv/$HOME".to_string()));
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
+    }
+
+    #[test]
+    fn test_escaped_secret_reference_is_literal_not_secret() {
+        let content = "FROM alpine\nARG DB_PASSWORD\nWORKDIR /opt/\\$DB_PASSWORD\nCOPY a /srv/\\\\$DB_PASSWORD/\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let args = vec![("DB_PASSWORD".to_string(), "hunter2".to_string())];
+        let contract = extract_contract(&df, None, &args, &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/$DB_PASSWORD".to_string()));
+        assert_eq!(
+            contract.warnings,
+            vec![
+                "COPY destination '/srv/\\\\$DB_PASSWORD/' uses a secret build arg; no file \
+                 assertion generated"
+            ]
+        );
+        assert!(!format!("{contract:?}").contains("hunter2"));
+    }
+
+    #[test]
     fn test_extract_with_healthcheck() {
         let content = r#"
 FROM nginx:alpine
