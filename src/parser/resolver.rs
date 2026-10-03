@@ -58,6 +58,15 @@ pub struct VariableResolver {
     tainted: HashSet<String>,
     /// Names whose value came from a secret-named build-arg, directly or via another binding.
     secret: HashSet<String>,
+    /// CLI `--build-arg` values awaiting their `ARG` declaration before they enter scope.
+    /// Docker only binds a build arg at its global or stage `ARG`, not up front.
+    supplied_build_args: HashMap<String, SuppliedBuildArg>,
+}
+
+/// A `--build-arg` value held until its `ARG` declaration, with its secret-name flag.
+struct SuppliedBuildArg {
+    value: String,
+    secret: bool,
 }
 
 impl VariableResolver {
@@ -65,21 +74,49 @@ impl VariableResolver {
         Self::default()
     }
 
-    /// Load CLI --build-arg values (locked against a later ARG default); `is_secret` keys are secret.
+    /// Store CLI `--build-arg` values. They do not enter scope here: a build arg is
+    /// bound only when its matching global or stage `ARG` declaration is reached
+    /// (see [`VariableResolver::declare_arg`]), matching Docker's scoping. A value
+    /// with no corresponding `ARG` declaration is never in scope. `is_secret` keys
+    /// stay secret once bound.
     pub fn load_build_args(&mut self, args: &[(String, String)], is_secret: impl Fn(&str) -> bool) {
         for (k, v) in args {
-            self.vars.insert(k.clone(), v.clone());
-            self.locked.insert(k.clone());
-            if is_secret(k) {
-                self.secret.insert(k.clone());
-            }
+            self.supplied_build_args.insert(
+                k.clone(),
+                SuppliedBuildArg {
+                    value: v.clone(),
+                    secret: is_secret(k),
+                },
+            );
         }
+    }
+
+    /// Whether a `--build-arg` value was supplied for `name` (whether or not it is yet in scope).
+    pub fn has_supplied_build_arg(&self, name: &str) -> bool {
+        self.supplied_build_args.contains_key(name)
+    }
+
+    /// Bind a supplied build arg into scope, locked and carrying its secret flag.
+    fn bind_supplied_build_arg(&mut self, name: &str) -> bool {
+        let Some(arg) = self.supplied_build_args.get(name) else {
+            return false;
+        };
+        let (value, secret) = (arg.value.clone(), arg.secret);
+        self.bind(name, value, secret);
+        self.locked.insert(name.to_string());
+        self.tainted.remove(name);
+        true
     }
 
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
             if self.locked.contains(&arg.name) {
+                continue;
+            }
+            // A supplied build arg enters scope at its global ARG declaration and
+            // outranks the default (which Docker never evaluates in that case).
+            if self.bind_supplied_build_arg(&arg.name) {
                 continue;
             }
             if let Some(default) = &arg.default {
@@ -94,9 +131,15 @@ impl VariableResolver {
         }
     }
 
-    /// Declare a stage ARG default; a locked value wins, else it overwrites any inherited default.
+    /// Declare a stage ARG: a supplied build arg enters scope (and locks) here, else a
+    /// locked value wins, else the given default overwrites any inherited default.
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>, secret: bool) {
         if self.locked.contains(name) {
+            return;
+        }
+        // A supplied build arg comes into scope at its ARG declaration, overriding the
+        // default, and locks the name against any later ARG default.
+        if self.bind_supplied_build_arg(name) {
             return;
         }
         if let Some(val) = default {
@@ -442,6 +485,8 @@ mod tests {
             ],
             |k| k.contains("PASSWORD"),
         );
+        resolver.declare_arg("DB_PASSWORD", None, false);
+        resolver.declare_arg("APP_PORT", None, false);
         resolver
     }
 
