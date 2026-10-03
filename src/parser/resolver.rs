@@ -462,6 +462,64 @@ mod tests {
     }
 
     #[test]
+    fn test_build_arg_not_in_scope_before_its_arg_declaration() {
+        // A supplied build arg must not resolve until its ARG declaration is reached.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())], |_| false);
+        let Resolution {
+            value, unresolved, ..
+        } = resolver.resolve_checked("/base/$DIR");
+        assert_eq!(value, "/base/$DIR");
+        assert!(unresolved);
+        assert!(resolver.has_supplied_build_arg("DIR"));
+    }
+
+    #[test]
+    fn test_build_arg_enters_scope_at_arg_declaration() {
+        // declare_arg brings the supplied build arg into scope and locks it.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())], |_| false);
+        resolver.declare_arg("DIR", None, false);
+        assert_eq!(resolver.resolve("/base/$DIR"), "/base/child");
+        assert!(resolver.is_locked("DIR"));
+    }
+
+    #[test]
+    fn test_build_arg_overrides_default_at_declaration() {
+        // The build arg outranks the ARG default, which Docker never evaluates.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DIR".to_string(), "child".to_string())], |_| false);
+        resolver.declare_arg("DIR", Some("/fallback"), false);
+        assert_eq!(resolver.resolve("$DIR"), "child");
+    }
+
+    #[test]
+    fn test_global_build_arg_enters_scope_at_global_arg() {
+        // A build arg matching a global ARG enters scope when the globals are loaded.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())], |_| false);
+        resolver.load_global_args(&[ArgInstruction {
+            name: "TAG".to_string(),
+            default: Some("latest".to_string()),
+        }]);
+        assert_eq!(resolver.resolve("alpine:$TAG"), "alpine:3.18");
+        assert!(resolver.is_locked("TAG"));
+    }
+
+    #[test]
+    fn test_build_arg_without_declaration_never_resolves() {
+        // With no global and no stage ARG, a supplied build arg stays out of scope.
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())], |_| false);
+        resolver.load_global_args(&[]);
+        let Resolution {
+            value, unresolved, ..
+        } = resolver.resolve_checked("alpine:$TAG");
+        assert_eq!(value, "alpine:$TAG");
+        assert!(unresolved);
+    }
+
+    #[test]
     fn test_tainted_var_reference_is_unresolved_ignoring_default() {
         let mut resolver = VariableResolver::new();
         resolver.taint("DIR");

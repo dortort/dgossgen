@@ -1579,6 +1579,136 @@ WORKDIR $DIR
     }
 
     #[test]
+    fn test_build_arg_not_in_scope_before_arg_declaration_single_stage() {
+        // A build arg used before its ARG declaration is out of scope; no assertion is emitted.
+        let content = r#"
+FROM alpine
+WORKDIR /x/$DIR
+ARG DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("DIR".to_string(), "child".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("child")
+            )),
+            "a build arg must not be in scope before its ARG declaration: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '/x/$DIR'")));
+    }
+
+    #[test]
+    fn test_build_arg_in_scope_after_arg_declaration() {
+        // Once the ARG declaration is reached, the build arg resolves for later instructions.
+        let content = r#"
+FROM alpine
+ARG DIR
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("DIR".to_string(), "child".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, Some("/x/child".to_string()));
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_in_earlier_stage() {
+        // The issue's example: a later stage's ARG must not retroactively scope the build
+        // arg into an earlier stage's WORKDIR.
+        let content = r#"
+FROM alpine AS base
+WORKDIR /base/$DIR
+FROM base
+ARG DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("DIR".to_string(), "child".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("child")
+            )),
+            "a later stage's ARG must not scope the build arg into an earlier WORKDIR: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_build_arg_not_in_scope_for_from_without_global_arg() {
+        // A build arg with no global ARG declaration must not resolve in a FROM image.
+        let content = r#"
+FROM alpine:$TAG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TAG".to_string(), "3.18".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.base_image, "alpine:$TAG");
+    }
+
+    #[test]
+    fn test_build_arg_in_scope_for_from_with_global_arg() {
+        // A build arg declared globally is in scope for the FROM image.
+        let content = r#"
+ARG TAG=latest
+FROM alpine:$TAG
+WORKDIR /app
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("TAG".to_string(), "3.18".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.base_image, "alpine:3.18");
+    }
+
+    #[test]
+    fn test_build_arg_overrides_unresolved_default_before_evaluating_it() {
+        // A build arg wins over the default even when the default would be unresolved;
+        // Docker never evaluates the default in that case.
+        let content = r#"
+FROM alpine
+ARG DIR=$UNDEF
+WORKDIR /x/$DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("DIR".to_string(), "child".to_string())],
+            &PolicyConfig::default(),
+        );
+        assert_eq!(contract.workdir, Some("/x/child".to_string()));
+    }
+
+    #[test]
     fn test_arg_redeclared_unresolved_clears_prior_default() {
         // Re-declaring an ARG with an unresolved default invalidates the prior one, not stale.
         let content = r#"
