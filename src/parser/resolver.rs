@@ -386,4 +386,32 @@ mod tests {
         assert_eq!(resolved.value, "s3cr3t");
         assert!(resolved.secret);
     }
+
+    #[test]
+    fn test_unset_clears_secret_taint() {
+        let mut resolver = resolver_with_secret_build_arg();
+        resolver.declare_arg("DERIVED", Some("/srv/s3cr3t"), true);
+        resolver.unset("DERIVED");
+        let resolved = resolver.resolve_checked("${DERIVED:-/fallback}");
+        assert_eq!(resolved.value, "/fallback");
+        assert!(!resolved.secret);
+    }
+
+    #[test]
+    fn test_global_arg_redeclared_unresolvable_clears_secret_taint() {
+        let mut resolver = resolver_with_secret_build_arg();
+        resolver.load_global_args(&[
+            ArgInstruction {
+                name: "G".to_string(),
+                default: Some("/srv/$DB_PASSWORD".to_string()),
+            },
+            ArgInstruction {
+                name: "G".to_string(),
+                default: Some("$UNDEFINED".to_string()),
+            },
+        ]);
+        let resolved = resolver.resolve_checked("${G:-/fallback}");
+        assert_eq!(resolved.value, "/fallback");
+        assert!(!resolved.secret);
+    }
 }
