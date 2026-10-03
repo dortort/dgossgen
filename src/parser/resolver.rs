@@ -647,6 +647,101 @@ mod tests {
         assert!(resolver.has_supplied_build_arg("TARGETARCH"));
     }
 
+    /// Independent copy of the proxy names, so dropping/misspelling an entry in the
+    /// production constant is caught by the equality assertion below (iterating the
+    /// constant itself could not detect a removed entry).
+    const EXPECTED_PROXY_ARGS: &[&str] = &[
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "FTP_PROXY",
+        "ftp_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    /// Independent copy of the automatic platform names; see [`EXPECTED_PROXY_ARGS`].
+    const EXPECTED_PLATFORM_ARGS: &[&str] = &[
+        "TARGETPLATFORM",
+        "TARGETOS",
+        "TARGETARCH",
+        "TARGETVARIANT",
+        "BUILDPLATFORM",
+        "BUILDOS",
+        "BUILDARCH",
+        "BUILDVARIANT",
+    ];
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn test_every_proxy_build_arg_resolves_immediately_anywhere() {
+        // The constant must match the expected set exactly (catches a dropped, added, or
+        // misspelled entry), and each proxy name must be usable without an ARG in
+        // stage-body scope.
+        assert_eq!(
+            sorted(PROXY_BUILD_ARGS),
+            sorted(EXPECTED_PROXY_ARGS),
+            "PROXY_BUILD_ARGS drifted from the expected set"
+        );
+        for name in EXPECTED_PROXY_ARGS {
+            let mut resolver = VariableResolver::new();
+            resolver.load_build_args(&[((*name).to_string(), "PVAL".to_string())], |_| false);
+            assert_eq!(
+                resolver.resolve(&format!("/p/${name}/x")),
+                "/p/PVAL/x",
+                "proxy arg {name} should resolve in stage-body scope"
+            );
+            assert!(
+                resolver.is_locked(name),
+                "proxy arg {name} should be locked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_platform_build_arg_is_global_scope_only() {
+        // The constant must match the expected set exactly, and each platform name must
+        // resolve for a FROM (global scope) but stay deferred in stage-body scope.
+        assert_eq!(
+            sorted(PLATFORM_BUILD_ARGS),
+            sorted(EXPECTED_PLATFORM_ARGS),
+            "PLATFORM_BUILD_ARGS drifted from the expected set"
+        );
+        for name in EXPECTED_PLATFORM_ARGS {
+            let mut resolver = VariableResolver::new();
+            resolver.load_build_args(&[((*name).to_string(), "VAL".to_string())], |_| false);
+            assert_eq!(
+                resolver.resolve_image(&format!("img:${name}")).value,
+                "img:VAL",
+                "platform arg {name} should resolve for a FROM image"
+            );
+            let Resolution {
+                value, unresolved, ..
+            } = resolver.resolve_checked(&format!("/p/${name}/x"));
+            assert_eq!(
+                value,
+                format!("/p/${name}/x"),
+                "platform arg {name} must not resolve in stage-body scope without an ARG"
+            );
+            assert!(
+                unresolved,
+                "platform arg {name} should be unresolved in stage-body scope"
+            );
+            assert!(
+                !resolver.is_locked(name),
+                "platform arg {name} should stay deferred (unlocked) without an ARG"
+            );
+        }
+    }
+
     #[test]
     fn test_automatic_platform_build_arg_enters_stage_scope_at_arg() {
         // Redeclaring the platform arg with a stage ARG binds it into stage-body scope.
