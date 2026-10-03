@@ -753,9 +753,7 @@ CMD ["node", "server.js"]
 
     #[test]
     fn test_workdir_escaped_dollar_is_literal_path() {
-        // `\$HOME` is a literal `$HOME` path segment, not an (undefined) reference.
-        // Regression for issue #46: it must yield a High-confidence assertion for
-        // the literal path, not be dropped with an "unresolved variable" warning.
+        // Regression for #46: an escaped `$` must not be read as an undefined reference.
         let content = "FROM alpine\nWORKDIR /opt/\\$HOME\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
@@ -801,8 +799,7 @@ CMD ["node", "server.js"]
 
     #[test]
     fn test_expose_escaped_dollar_flags_unresolved_not_a_reference() {
-        // `\$PORT` is a literal `$PORT`, which is not a valid port number; it must
-        // be reported as an invalid port, never expanded as an (undefined) variable.
+        // A literal `$PORT` is an invalid port, not an undefined variable.
         let content = "FROM alpine\nEXPOSE \\$PORT\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
