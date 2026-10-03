@@ -875,4 +875,28 @@ mod tests {
         assert_eq!(resolved.value, "/fallback");
         assert!(!resolved.secret);
     }
+
+    #[test]
+    fn test_secret_build_arg_stays_secret_when_bound_at_its_declaration() {
+        let secret_args = [
+            ("DB_PASSWORD".to_string(), "s3cr3t".to_string()),
+            ("TARGETARCH".to_string(), "arm64".to_string()),
+        ];
+        let is_secret = |k: &str| k == "DB_PASSWORD" || k == "TARGETARCH";
+
+        let mut stage = VariableResolver::new();
+        stage.load_build_args(&secret_args, is_secret);
+        stage.declare_arg("DB_PASSWORD", Some("/default"), false);
+        assert!(stage.resolve_checked("/srv/$DB_PASSWORD").secret);
+
+        let mut global = VariableResolver::new();
+        global.load_build_args(&secret_args, is_secret);
+        global.load_global_args(&[ArgInstruction {
+            name: "DB_PASSWORD".to_string(),
+            default: None,
+        }]);
+        global.declare_arg("DB_PASSWORD", None, false);
+        assert!(global.resolve_checked("$DB_PASSWORD").secret);
+        assert!(global.resolve_image("alpine:$TARGETARCH").secret);
+    }
 }
