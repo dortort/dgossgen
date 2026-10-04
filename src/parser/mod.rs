@@ -943,7 +943,9 @@ fn parse_from(args: &str, line_num: usize) -> Result<RawInstruction> {
 fn parse_arg(args: &str, line_num: usize) -> RawInstruction {
     let (name, default) = if let Some(eq_pos) = args.find('=') {
         let name = args[..eq_pos].trim().to_string();
-        let val = args[eq_pos + 1..].trim().trim_matches('"').to_string();
+        // Keep the default verbatim (quotes included); quote removal and variable
+        // resolution happen together later via the Docker-word processing pass.
+        let val = args[eq_pos + 1..].trim().to_string();
         (name, Some(val))
     } else {
         (args.trim().to_string(), None)
