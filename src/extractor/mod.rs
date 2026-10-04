@@ -6,7 +6,7 @@ pub use model::*;
 
 use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
 use crate::parser::{
-    escape_literal_dollars, CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage,
+    process_word, CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage,
     VariableResolver,
 };
 use crate::Confidence;
@@ -68,7 +68,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(&escape_literal_dollars(dir));
+                    } = resolver.resolve_checked(&process_word(dir));
                     // `None` means unknown (unresolved, secret, or unknown base); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
@@ -121,7 +121,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(&escape_literal_dollars(user));
+                    } = resolver.resolve_checked(&process_word(user));
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
                         resolved,
@@ -137,7 +137,7 @@ pub fn extract_contract(
                             value: resolved,
                             unresolved,
                             secret,
-                        } = resolver.resolve_checked(&escape_literal_dollars(raw_token));
+                        } = resolver.resolve_checked(&process_word(raw_token));
                         if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
@@ -184,7 +184,7 @@ pub fn extract_contract(
                             value: resolved,
                             secret,
                             ..
-                        } = resolver.resolve_checked(&escape_literal_dollars(vol));
+                        } = resolver.resolve_checked(&process_word(vol));
                         if secret {
                             contract.warnings.push(format!(
                                 "VOLUME '{vol}' uses a secret build arg; volume not recorded"
@@ -205,8 +205,7 @@ pub fn extract_contract(
                     } else {
                         match default.as_deref() {
                             Some(def) => {
-                                let resolved_def =
-                                    resolver.resolve_checked(&escape_literal_dollars(def));
+                                let resolved_def = resolver.resolve_checked(&process_word(def));
                                 if resolved_def.unresolved {
                                     // Leave the name undefined so later uses drop with a warning.
                                     if !resolver.is_locked(name) {
@@ -694,7 +693,7 @@ fn resolve_dest_path(
         value: resolved_dest,
         unresolved,
         secret,
-    } = resolver.resolve_checked(&escape_literal_dollars(dest));
+    } = resolver.resolve_checked(&process_word(dest));
     if unresolved {
         return DestPath::UnresolvedVar;
     }
@@ -833,10 +832,13 @@ CMD ["node", "server.js"]
 
     #[test]
     fn test_workdir_backslash_edge_cases() {
+        // With the default escape character `\`, an unquoted backslash escapes the
+        // next character (`\a` -> `a`), matching Docker. A Windows-style path that
+        // needs literal backslashes relies on the `# escape=` directive (#57).
         let cases = [
             ("/opt/cost\\$", "/opt/cost$"),
             ("/opt/\\\\\\$APP", "/opt/\\$APP"),
-            ("/win\\app", "/win\\app"),
+            ("/win\\app", "/winapp"),
             ("/win\\\\app", "/win\\app"),
         ];
         for (dir, expected) in cases {
