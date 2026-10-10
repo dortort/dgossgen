@@ -1,7 +1,49 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::Serialize;
+
+/// How serious a lint finding is. `Error` marks a file that could not be parsed
+/// at all (nothing else can be checked); `Warning` marks a likely-flaky but
+/// valid suite. Serialized lowercase so JSON consumers (CI annotators) can map
+/// it straight onto their own severity levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintIssue {
     pub file: String,
+    /// 1-based line of the offending key in the source, located by a
+    /// best-effort scan. `None` when the finding is file-wide or the key could
+    /// not be found verbatim, so a wrong line is never reported.
+    pub line: Option<usize>,
+    pub severity: Severity,
+    /// The diagnosis — what is wrong.
     pub message: String,
+    /// The remediation — how to fix it. Empty only when no concrete fix applies.
+    pub suggestion: String,
+}
+
+/// Best-effort 1-based line of a mapping key in the YAML source.
+///
+/// Scans for the first line whose first non-whitespace token is `key` followed
+/// immediately by a colon, matching the bare, single-quoted and double-quoted
+/// spellings that goss suites use. Returns `None` when no such line exists, so
+/// callers emit a null line rather than guessing.
+fn find_key_line(content: &str, key: &str) -> Option<usize> {
+    let quoted_double = format!("\"{key}\"");
+    let quoted_single = format!("'{key}'");
+    content.lines().enumerate().find_map(|(i, line)| {
+        let trimmed = line.trim_start();
+        let after_key = trimmed
+            .strip_prefix(key)
+            .or_else(|| trimmed.strip_prefix(&quoted_double))
+            .or_else(|| trimmed.strip_prefix(&quoted_single))?;
+        // Require the key to be immediately followed by `:` so `a` does not
+        // match `abc:`; the value (if any) after the colon is irrelevant.
+        after_key.strip_prefix(':').map(|_| i + 1)
+    })
 }
 
 pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
@@ -16,7 +58,10 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
     if parsed.is_err() {
         issues.push(LintIssue {
             file: filename.to_string(),
+            line: None,
+            severity: Severity::Error,
             message: "Invalid YAML syntax".to_string(),
+            suggestion: "fix the YAML syntax so the file can be parsed".to_string(),
         });
         return;
     }
@@ -35,10 +80,15 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
                     {
                         issues.push(LintIssue {
                             file: filename.to_string(),
+                            line: find_key_line(content, path),
+                            severity: Severity::Warning,
                             message: format!(
                                 "File assertion on ephemeral path '{}' may be flaky",
                                 path
                             ),
+                            suggestion: "remove this assertion or move readiness-sensitive \
+                                 checks to `goss_wait.yml`"
+                                .to_string(),
                         });
                     }
                 }
@@ -51,7 +101,12 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
                 if proc_map.len() > 3 {
                     issues.push(LintIssue {
                         file: filename.to_string(),
+                        line: find_key_line(content, "process"),
+                        severity: Severity::Warning,
                         message: "Many process assertions (>3) increase flake risk".to_string(),
+                        suggestion: "keep only the primary process, or regenerate with \
+                             `--profile minimal` to drop low-confidence process checks"
+                            .to_string(),
                     });
                 }
             }
@@ -67,7 +122,10 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
                         if timeout.is_none() || timeout == Some(0) {
                             issues.push(LintIssue {
                                 file: filename.to_string(),
+                                line: find_key_line(content, key),
+                                severity: Severity::Warning,
                                 message: format!("Command '{}' has no timeout (may hang)", key),
+                                suggestion: "add `timeout: 10000`".to_string(),
                             });
                         }
                     }
@@ -177,5 +235,84 @@ mod tests {
             lint("command:\n  a:\n    exec: x\n  a:\n    exec: y\n"),
             vec!["Invalid YAML syntax"]
         );
+    }
+
+    fn lint_issues(yaml: &str) -> Vec<LintIssue> {
+        let mut issues = Vec::new();
+        lint_goss_content(yaml, "goss.yml", &mut issues);
+        issues
+    }
+
+    #[test]
+    fn test_invalid_yaml_is_an_error_with_remediation() {
+        let issues = lint_issues("file: [");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Error);
+        assert!(!issues[0].suggestion.is_empty());
+        // A failed parse cannot be located, so no line is guessed.
+        assert_eq!(issues[0].line, None);
+    }
+
+    #[test]
+    fn test_ephemeral_path_issue_carries_remediation_severity_and_line() {
+        let yaml = "file:\n  /tmp/file:\n    exists: true\n";
+        let issues = lint_issues(yaml);
+        let issue = issues
+            .iter()
+            .find(|i| i.message.contains("ephemeral path"))
+            .expect("ephemeral-path issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(
+            issue.suggestion.contains("goss_wait.yml"),
+            "suggestion should name the remediation, got: {}",
+            issue.suggestion
+        );
+        // The offending key sits on the second physical line.
+        assert_eq!(issue.line, Some(2));
+    }
+
+    #[test]
+    fn test_missing_timeout_issue_suggests_a_concrete_timeout() {
+        let yaml = "command:\n  check:\n    exec: /bin/true\n";
+        let issues = lint_issues(yaml);
+        let issue = issues
+            .iter()
+            .find(|i| i.message.contains("no timeout"))
+            .expect("missing-timeout issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(
+            issue.suggestion.contains("timeout: 10000"),
+            "suggestion should give the one-line fix, got: {}",
+            issue.suggestion
+        );
+        assert_eq!(issue.line, Some(2));
+    }
+
+    #[test]
+    fn test_process_count_issue_suggests_minimal_profile() {
+        let mut yaml = String::from("process:\n");
+        for name in ["a", "b", "c", "d"] {
+            yaml.push_str(&format!("  {name}:\n    running: true\n"));
+        }
+        let issues = lint_issues(&yaml);
+        let issue = issues
+            .iter()
+            .find(|i| i.message.contains("process assertions"))
+            .expect("process-count issue");
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(issue.suggestion.contains("--profile minimal"));
+        // The file-wide finding anchors to the `process:` section header.
+        assert_eq!(issue.line, Some(1));
+    }
+
+    #[test]
+    fn test_find_key_line_matches_quoted_spellings_and_rejects_prefixes() {
+        // Bare, single- and double-quoted keys all resolve; a longer key that
+        // merely starts with the query must not match.
+        assert_eq!(find_key_line("a:\n", "a"), Some(1));
+        assert_eq!(find_key_line("  \"a\": x\n", "a"), Some(1));
+        assert_eq!(find_key_line("other: 1\n  'a': x\n", "a"), Some(2));
+        assert_eq!(find_key_line("abc: 1\n", "a"), None);
+        assert_eq!(find_key_line("value: a\n", "a"), None);
     }
 }
