@@ -310,6 +310,81 @@ fn test_probe_with_warnings_code_path() {
 }
 
 #[test]
+fn test_lint_json_format_emits_structured_findings() {
+    // A goss.yml with four process assertions and a timeout-less command yields
+    // exactly two findings. In JSON mode stdout must be a single parseable
+    // array, each element carrying file/line/severity/suggestion, and the exit
+    // code stays 2 so CI can still gate on it.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(
+        &goss,
+        "process:\n  a:\n    running: true\n  b:\n    running: true\n  c:\n    running: true\n  d:\n    running: true\ncommand:\n  check:\n    exec: /bin/true\n",
+    )
+    .unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["lint", goss.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .code(2);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("JSON mode stdout must parse as JSON");
+    let array = parsed.as_array().expect("findings are a JSON array");
+    assert_eq!(array.len(), 2, "expected two findings, got:\n{stdout}");
+
+    for finding in array {
+        for field in ["file", "line", "severity", "suggestion", "message"] {
+            assert!(
+                finding.get(field).is_some(),
+                "finding is missing `{field}`:\n{finding}"
+            );
+        }
+        assert_eq!(finding["severity"], "warning");
+    }
+
+    // The two rules are present with their concrete remediations.
+    assert!(
+        array.iter().any(|f| f["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("process assertions"))),
+        "missing the process-count finding:\n{stdout}"
+    );
+    let timeout_finding = array
+        .iter()
+        .find(|f| {
+            f["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no timeout"))
+        })
+        .expect("missing the timeout finding");
+    assert!(timeout_finding["suggestion"]
+        .as_str()
+        .is_some_and(|s| s.contains("timeout: 10000")));
+    // The command sits on line 11 of the fixture; the scan must locate it.
+    assert_eq!(timeout_finding["line"], 11);
+}
+
+#[test]
+fn test_lint_json_format_on_clean_file_is_empty_array() {
+    // A clean suite prints `[]` (not prose) and exits 0, so a CI step can parse
+    // the output unconditionally.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(&goss, "port: {}\n").unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["lint", goss.to_str().unwrap(), "--format", "json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be JSON");
+    assert_eq!(parsed.as_array().map(|a| a.len()), Some(0));
+}
+
+#[test]
 fn test_explain_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
