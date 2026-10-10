@@ -57,39 +57,65 @@ fn find_key_line(content: &str, key: &str) -> Option<usize> {
         .find_map(|(i, line)| key_on_line(line, key).then_some(i + 1))
 }
 
-/// Best-effort 1-based line of `key` as a child entry of the top-level
+/// Best-effort 1-based line of `key` as a *direct* child entry of the top-level
 /// `section` mapping.
 ///
 /// Unlike a global scan, this only matches lines that belong to `section` — from
-/// its column-0 header to the next column-0 key — so a key reused in another
-/// section (e.g. a `command` and a `file` entry sharing a name) resolves to the
-/// right occurrence. Returns `None` when the section or the key is not found.
+/// its column-0 header to the next column-0 key — and only at the section's
+/// direct-child indentation, so a key reused in another section (a `command`
+/// and a `file` entry sharing a name) or a command named after a nested
+/// property (`exec:`, `timeout:`) resolves to the right occurrence. Returns
+/// `None` when the section or the key is not found.
 fn find_entry_line(content: &str, section: &str, key: &str) -> Option<usize> {
     let mut in_section = false;
+    // The indentation of the section's direct children, learned from the first
+    // child line. Deeper lines are an entry's own properties, not entries.
+    let mut child_indent: Option<usize> = None;
     for (i, line) in content.lines().enumerate() {
         // Blank and comment lines never open or close a block.
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
+        let indent = indent_of(line);
         if !in_section {
-            if indent_of(line) == 0 && key_on_line(line, section) {
+            if indent == 0 && key_on_line(line, section) {
                 in_section = true;
             }
             continue;
         }
         // A return to column 0 ends the section (duplicate top-level keys are
         // rejected as invalid YAML earlier, so the section occurs once).
-        if indent_of(line) == 0 {
+        if indent == 0 {
             return None;
         }
-        if key_on_line(line, key) {
+        let depth = *child_indent.get_or_insert(indent);
+        if indent == depth && key_on_line(line, key) {
             return Some(i + 1);
         }
     }
     None
 }
 
-pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
+/// Which suite file is being linted.
+///
+/// The readiness gate (`Wait`) legitimately asserts on volatile paths — that is
+/// what its retry loop exists for — so the ephemeral-path flake rule, whose own
+/// remediation is "move readiness-sensitive checks to `goss_wait.yml`", does not
+/// apply there. All other rules apply to both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuiteKind {
+    /// The main `goss.yml`, run once.
+    Main,
+    /// The `goss_wait.yml` readiness gate, retried until ready or timeout.
+    Wait,
+}
+
+pub fn lint_goss_content(
+    content: &str,
+    filename: &str,
+    kind: SuiteKind,
+    issues: &mut Vec<LintIssue>,
+) {
     // Check YAML validity
     let options = serde_saphyr::options! {
         // Goss suites routinely reuse one anchor many times, which the ratio heuristic rejects.
@@ -113,8 +139,11 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
 
     // Check for common flake patterns
     if let Some(mapping) = doc.as_object() {
-        // Check for ephemeral paths
-        if let Some(files) = mapping.get("file") {
+        // Check for ephemeral paths. Skipped for the readiness gate, whose retry
+        // loop is exactly how a volatile-path assertion is meant to be made
+        // robust — flagging it there would contradict this rule's own advice to
+        // move such checks into goss_wait.yml.
+        if let (SuiteKind::Main, Some(files)) = (kind, mapping.get("file")) {
             if let Some(file_map) = files.as_object() {
                 for path in file_map.keys() {
                     if path.contains("/tmp/")
@@ -185,7 +214,7 @@ mod tests {
     #[test]
     fn test_lint_invalid_yaml() {
         let mut issues = Vec::new();
-        lint_goss_content("file: [", "goss.yml", &mut issues);
+        lint_goss_content("file: [", "goss.yml", SuiteKind::Main, &mut issues);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].message, "Invalid YAML syntax");
     }
@@ -194,13 +223,13 @@ mod tests {
     fn test_lint_ephemeral_path() {
         let yaml = "file:\n  /tmp/file:\n    exists: true\n";
         let mut issues = Vec::new();
-        lint_goss_content(yaml, "goss.yml", &mut issues);
+        lint_goss_content(yaml, "goss.yml", SuiteKind::Main, &mut issues);
         assert!(issues.iter().any(|i| i.message.contains("ephemeral path")));
     }
 
     fn lint(yaml: &str) -> Vec<String> {
         let mut issues = Vec::new();
-        lint_goss_content(yaml, "goss.yml", &mut issues);
+        lint_goss_content(yaml, "goss.yml", SuiteKind::Main, &mut issues);
         issues.into_iter().map(|i| i.message).collect()
     }
 
@@ -282,7 +311,7 @@ mod tests {
 
     fn lint_issues(yaml: &str) -> Vec<LintIssue> {
         let mut issues = Vec::new();
-        lint_goss_content(yaml, "goss.yml", &mut issues);
+        lint_goss_content(yaml, "goss.yml", SuiteKind::Main, &mut issues);
         issues
     }
 
@@ -376,6 +405,56 @@ command:
         assert_eq!(find_entry_line(yaml, "command", "dup"), Some(5));
         // A key that lives in another section is not borrowed across.
         assert_eq!(find_entry_line(yaml, "process", "dup"), None);
+    }
+
+    #[test]
+    fn test_find_entry_line_matches_only_direct_children() {
+        // A command named `exec` collides with another command's nested `exec:`
+        // property. The lookup must point at the command entry (indent 2), not
+        // the earlier property line (indent 4).
+        let yaml = "\
+command:
+  first:
+    exec: /bin/true
+  exec:
+    stdout: hi
+";
+        assert_eq!(find_entry_line(yaml, "command", "exec"), Some(4));
+
+        // A command named `timeout` after a sibling carrying a `timeout:`
+        // property must resolve to the command entry, not the property line.
+        let collide = "\
+command:
+  foo:
+    exec: x
+    timeout: 0
+  timeout:
+    exec: y
+";
+        assert_eq!(find_entry_line(collide, "command", "timeout"), Some(5));
+    }
+
+    #[test]
+    fn test_ephemeral_path_rule_is_skipped_for_the_readiness_gate() {
+        // The ephemeral-path remediation tells users to move readiness checks
+        // into goss_wait.yml; linting the wait file with the same rule would
+        // make that advice impossible to satisfy, so Wait suites skip it.
+        let yaml = "file:\n  /tmp/ready:\n    exists: true\n";
+        let mut main_issues = Vec::new();
+        lint_goss_content(yaml, "goss_wait.yml", SuiteKind::Main, &mut main_issues);
+        assert!(
+            main_issues
+                .iter()
+                .any(|i| i.message.contains("ephemeral path")),
+            "a Main suite must still flag the ephemeral path"
+        );
+
+        let mut wait_issues = Vec::new();
+        lint_goss_content(yaml, "goss_wait.yml", SuiteKind::Wait, &mut wait_issues);
+        assert!(
+            wait_issues.is_empty(),
+            "the readiness gate must not flag ephemeral paths, got: {wait_issues:?}"
+        );
     }
 
     #[test]

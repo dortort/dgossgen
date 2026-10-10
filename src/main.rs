@@ -515,7 +515,12 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>, format: LintFormat) -> Re
     let content =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
-    lint::lint_goss_content(&content, file.to_str().unwrap_or("goss.yml"), &mut issues);
+    lint::lint_goss_content(
+        &content,
+        file.to_str().unwrap_or("goss.yml"),
+        lint::SuiteKind::Main,
+        &mut issues,
+    );
 
     // Lint wait file if present
     if let Some(wait_path) = &wait_file {
@@ -526,6 +531,7 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>, format: LintFormat) -> Re
         lint::lint_goss_content(
             &wait_content,
             wait_path.to_str().unwrap_or("goss_wait.yml"),
+            lint::SuiteKind::Wait,
             &mut issues,
         );
     } else {
@@ -536,7 +542,15 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>, format: LintFormat) -> Re
             .join("goss_wait.yml");
         if wait_path.exists() {
             let wait_content = std::fs::read_to_string(&wait_path)?;
-            lint::lint_goss_content(&wait_content, "goss_wait.yml", &mut issues);
+            // Label findings with the real detected path (not a bare
+            // "goss_wait.yml"), so the JSON `file` field resolves for a CI
+            // annotator when the suite lives in a subdirectory.
+            lint::lint_goss_content(
+                &wait_content,
+                wait_path.to_str().unwrap_or("goss_wait.yml"),
+                lint::SuiteKind::Wait,
+                &mut issues,
+            );
         }
     }
 
