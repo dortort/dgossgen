@@ -75,7 +75,20 @@ enum Commands {
         /// Path to goss_wait.yml to lint (optional)
         #[arg(long)]
         wait_file: Option<PathBuf>,
+
+        /// Output format: human-readable text or machine-readable JSON
+        #[arg(long, value_enum, default_value_t = LintFormat::Human)]
+        format: LintFormat,
     },
+}
+
+/// Output format for `dgossgen lint`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LintFormat {
+    /// Human-readable, colored text (default).
+    Human,
+    /// A JSON array of findings on stdout, for CI annotation.
+    Json,
 }
 
 #[derive(Parser)]
@@ -174,7 +187,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             allow_network,
         } => cmd_probe(common, runtime, run_args, unsafe_run_arg, allow_network),
         Commands::Explain { common } => cmd_explain(common),
-        Commands::Lint { file, wait_file } => cmd_lint(file, wait_file),
+        Commands::Lint {
+            file,
+            wait_file,
+            format,
+        } => cmd_lint(file, wait_file, format),
     }
 }
 
@@ -491,9 +508,7 @@ fn cmd_explain(common: CommonArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
-    println!("{}", style("=== dgossgen lint ===").bold().cyan());
-
+fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>, format: LintFormat) -> Result<ExitCode> {
     let mut issues: Vec<lint::LintIssue> = Vec::new();
 
     // Lint main goss.yml
@@ -525,24 +540,48 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
         }
     }
 
-    if issues.is_empty() {
-        println!("{}", style("No issues found.").green());
-        Ok(ExitCode::SUCCESS)
+    // Exit code is independent of format: any finding yields 2 so CI can gate
+    // on it whether it reads the text or parses the JSON.
+    let exit_code = if issues.is_empty() {
+        ExitCode::SUCCESS
     } else {
-        for issue in &issues {
-            println!(
-                "{} [{}] {}",
-                style("warning:").yellow(),
-                issue.file,
-                issue.message
-            );
+        ExitCode::from(2)
+    };
+
+    match format {
+        // JSON mode keeps stdout to a single valid JSON array (nothing else),
+        // so CI can pipe it straight into an annotator. Empty input prints `[]`.
+        LintFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&issues)?);
         }
-        println!(
-            "\n{} issue(s) found.",
-            style(issues.len().to_string()).yellow().bold()
-        );
-        Ok(ExitCode::from(2))
+        LintFormat::Human => {
+            println!("{}", style("=== dgossgen lint ===").bold().cyan());
+            if issues.is_empty() {
+                println!("{}", style("No issues found.").green());
+            } else {
+                for issue in &issues {
+                    let location = match issue.line {
+                        Some(line) => format!("{}:{}", issue.file, line),
+                        None => issue.file.clone(),
+                    };
+                    let label = match issue.severity {
+                        lint::Severity::Error => style("error:").red(),
+                        lint::Severity::Warning => style("warning:").yellow(),
+                    };
+                    println!("{} [{}] {}", label, location, issue.message);
+                    if !issue.suggestion.is_empty() {
+                        println!("  {} {}", style("fix:").green(), issue.suggestion);
+                    }
+                }
+                println!(
+                    "\n{} issue(s) found.",
+                    style(issues.len().to_string()).yellow().bold()
+                );
+            }
+        }
     }
+
+    Ok(exit_code)
 }
 
 #[cfg(test)]
