@@ -25,25 +25,68 @@ pub struct LintIssue {
     pub suggestion: String,
 }
 
-/// Best-effort 1-based line of a mapping key in the YAML source.
+/// Whether `line`'s first non-whitespace token is `key` immediately followed by
+/// a colon, matching the bare, single-quoted and double-quoted spellings that
+/// goss suites use. Requiring the trailing colon stops `a` from matching `abc:`
+/// or the value half of `other: a`.
+fn key_on_line(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    let after_key = trimmed
+        .strip_prefix(key)
+        .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")))
+        .or_else(|| trimmed.strip_prefix(&format!("'{key}'")));
+    matches!(after_key, Some(rest) if rest.starts_with(':'))
+}
+
+/// Leading-whitespace width of `line`, used as its block indentation. Goss
+/// suites indent with spaces (YAML forbids tabs for indentation), so a byte
+/// count is the column.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Best-effort 1-based line of a top-level mapping key in the YAML source.
 ///
 /// Scans for the first line whose first non-whitespace token is `key` followed
-/// immediately by a colon, matching the bare, single-quoted and double-quoted
-/// spellings that goss suites use. Returns `None` when no such line exists, so
-/// callers emit a null line rather than guessing.
+/// immediately by a colon. Returns `None` when no such line exists, so callers
+/// emit a null line rather than guessing.
 fn find_key_line(content: &str, key: &str) -> Option<usize> {
-    let quoted_double = format!("\"{key}\"");
-    let quoted_single = format!("'{key}'");
-    content.lines().enumerate().find_map(|(i, line)| {
-        let trimmed = line.trim_start();
-        let after_key = trimmed
-            .strip_prefix(key)
-            .or_else(|| trimmed.strip_prefix(&quoted_double))
-            .or_else(|| trimmed.strip_prefix(&quoted_single))?;
-        // Require the key to be immediately followed by `:` so `a` does not
-        // match `abc:`; the value (if any) after the colon is irrelevant.
-        after_key.strip_prefix(':').map(|_| i + 1)
-    })
+    content
+        .lines()
+        .enumerate()
+        .find_map(|(i, line)| key_on_line(line, key).then_some(i + 1))
+}
+
+/// Best-effort 1-based line of `key` as a child entry of the top-level
+/// `section` mapping.
+///
+/// Unlike a global scan, this only matches lines that belong to `section` — from
+/// its column-0 header to the next column-0 key — so a key reused in another
+/// section (e.g. a `command` and a `file` entry sharing a name) resolves to the
+/// right occurrence. Returns `None` when the section or the key is not found.
+fn find_entry_line(content: &str, section: &str, key: &str) -> Option<usize> {
+    let mut in_section = false;
+    for (i, line) in content.lines().enumerate() {
+        // Blank and comment lines never open or close a block.
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !in_section {
+            if indent_of(line) == 0 && key_on_line(line, section) {
+                in_section = true;
+            }
+            continue;
+        }
+        // A return to column 0 ends the section (duplicate top-level keys are
+        // rejected as invalid YAML earlier, so the section occurs once).
+        if indent_of(line) == 0 {
+            return None;
+        }
+        if key_on_line(line, key) {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIssue>) {
@@ -80,7 +123,7 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
                     {
                         issues.push(LintIssue {
                             file: filename.to_string(),
-                            line: find_key_line(content, path),
+                            line: find_entry_line(content, "file", path),
                             severity: Severity::Warning,
                             message: format!(
                                 "File assertion on ephemeral path '{}' may be flaky",
@@ -122,7 +165,7 @@ pub fn lint_goss_content(content: &str, filename: &str, issues: &mut Vec<LintIss
                         if timeout.is_none() || timeout == Some(0) {
                             issues.push(LintIssue {
                                 file: filename.to_string(),
-                                line: find_key_line(content, key),
+                                line: find_entry_line(content, "command", key),
                                 severity: Severity::Warning,
                                 message: format!("Command '{}' has no timeout (may hang)", key),
                                 suggestion: "add `timeout: 10000`".to_string(),
@@ -314,5 +357,47 @@ mod tests {
         assert_eq!(find_key_line("other: 1\n  'a': x\n", "a"), Some(2));
         assert_eq!(find_key_line("abc: 1\n", "a"), None);
         assert_eq!(find_key_line("value: a\n", "a"), None);
+    }
+
+    #[test]
+    fn test_find_entry_line_is_scoped_to_its_section() {
+        // The same key `dup` appears under two sections. Each lookup must
+        // resolve within its own section rather than returning the first global
+        // match.
+        let yaml = "\
+file:
+  dup:
+    exists: true
+command:
+  dup:
+    exec: x
+";
+        assert_eq!(find_entry_line(yaml, "file", "dup"), Some(2));
+        assert_eq!(find_entry_line(yaml, "command", "dup"), Some(5));
+        // A key that lives in another section is not borrowed across.
+        assert_eq!(find_entry_line(yaml, "process", "dup"), None);
+    }
+
+    #[test]
+    fn test_timeout_finding_line_points_into_the_command_section() {
+        // Regression guard: a command key that collides with an earlier `file`
+        // entry must locate the command, not the file entry.
+        let yaml = "\
+file:
+  shared:
+    exists: true
+command:
+  shared:
+    exec: /bin/true
+";
+        let issue = lint_issues(yaml)
+            .into_iter()
+            .find(|i| i.message.contains("no timeout"))
+            .expect("missing-timeout issue");
+        assert_eq!(
+            issue.line,
+            Some(5),
+            "the timeout finding must point at the command entry, not the file key"
+        );
     }
 }
