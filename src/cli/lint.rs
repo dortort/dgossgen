@@ -45,16 +45,19 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Best-effort 1-based line of a top-level mapping key in the YAML source.
+/// Best-effort 1-based line of a *top-level* (column-zero) mapping key in the
+/// YAML source.
 ///
-/// Scans for the first line whose first non-whitespace token is `key` followed
-/// immediately by a colon. Returns `None` when no such line exists, so callers
-/// emit a null line rather than guessing.
+/// Scans for the first column-zero line whose first token is `key` followed
+/// immediately by a colon. Requiring column zero stops an indented entry of the
+/// same name (e.g. a command named `process`) from shadowing a top-level
+/// section header. Returns `None` when no such line exists, so callers emit a
+/// null line rather than guessing.
 fn find_key_line(content: &str, key: &str) -> Option<usize> {
     content
         .lines()
         .enumerate()
-        .find_map(|(i, line)| key_on_line(line, key).then_some(i + 1))
+        .find_map(|(i, line)| (indent_of(line) == 0 && key_on_line(line, key)).then_some(i + 1))
 }
 
 /// Best-effort 1-based line of `key` as a *direct* child entry of the top-level
@@ -378,14 +381,43 @@ mod tests {
     }
 
     #[test]
-    fn test_find_key_line_matches_quoted_spellings_and_rejects_prefixes() {
-        // Bare, single- and double-quoted keys all resolve; a longer key that
-        // merely starts with the query must not match.
+    fn test_find_key_line_matches_top_level_quoted_spellings_and_rejects_prefixes() {
+        // Bare, single- and double-quoted column-zero keys all resolve; a longer
+        // key that merely starts with the query must not match, and an indented
+        // key of the same name is not a top-level match.
         assert_eq!(find_key_line("a:\n", "a"), Some(1));
-        assert_eq!(find_key_line("  \"a\": x\n", "a"), Some(1));
-        assert_eq!(find_key_line("other: 1\n  'a': x\n", "a"), Some(2));
+        assert_eq!(find_key_line("\"a\": x\n", "a"), Some(1));
+        assert_eq!(find_key_line("b: 1\n'a': x\n", "a"), Some(2));
         assert_eq!(find_key_line("abc: 1\n", "a"), None);
         assert_eq!(find_key_line("value: a\n", "a"), None);
+        // An indented entry named `a` must not shadow a (missing) top-level one.
+        assert_eq!(find_key_line("other:\n  a: x\n", "a"), None);
+    }
+
+    #[test]
+    fn test_process_count_line_is_the_top_level_header_not_a_colliding_command() {
+        // A command named `process` precedes the real top-level process section.
+        // The process-count finding must anchor to the section header (line 4),
+        // not the nested command key (line 2).
+        let yaml = "\
+command:
+  process:
+    exec: x
+process:
+  a:
+    running: true
+  b:
+    running: true
+  c:
+    running: true
+  d:
+    running: true
+";
+        let issue = lint_issues(yaml)
+            .into_iter()
+            .find(|i| i.message.contains("process assertions"))
+            .expect("process-count issue");
+        assert_eq!(issue.line, Some(4));
     }
 
     #[test]
