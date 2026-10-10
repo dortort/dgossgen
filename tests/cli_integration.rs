@@ -385,6 +385,98 @@ fn test_lint_json_format_on_clean_file_is_empty_array() {
 }
 
 #[test]
+fn test_lint_human_invalid_yaml_renders_error_without_a_line() {
+    // The Severity::Error branch and the line=None location: an unparseable
+    // file prints an "error:" label and the file name with NO ":<line>" suffix.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(&goss, "process:\n  a: [unterminated\n").unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["lint", goss.to_str().unwrap()])
+        .assert()
+        .code(2);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("error:"),
+        "expected an error label, got:\n{stdout}"
+    );
+    assert!(stdout.contains("Invalid YAML syntax"), "got:\n{stdout}");
+    assert!(
+        !predicates::str::is_match(r"goss\.yml:\d")
+            .unwrap()
+            .eval(stdout.as_str()),
+        "a file-wide finding must not carry a line suffix, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_lint_human_flaky_file_renders_location_and_fix() {
+    // The warning branch: file:line location plus a "fix:" remediation line.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(&goss, "command:\n  check:\n    exec: /bin/true\n").unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["lint", goss.to_str().unwrap()])
+        .assert()
+        .code(2);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    assert!(stdout.contains("warning:"), "got:\n{stdout}");
+    // The command sits on line 2, so the location carries the line number.
+    assert!(
+        predicates::str::is_match(r"goss\.yml:2\b")
+            .unwrap()
+            .eval(stdout.as_str()),
+        "expected a file:line location, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("fix:") && stdout.contains("timeout: 10000"),
+        "expected a rendered remediation, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_lint_json_auto_detected_wait_file_keeps_its_real_path() {
+    // When the main file lives in a subdirectory, findings from the
+    // auto-detected goss_wait.yml must carry the real (subdir-qualified) path so
+    // a CI annotator can resolve them — not a bare "goss_wait.yml".
+    let temp = tempdir().unwrap();
+    let sub = temp.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("goss.yml"), "port: {}\n").unwrap();
+    fs::write(
+        sub.join("goss_wait.yml"),
+        "command:\n  wait-check:\n    exec: /bin/true\n",
+    )
+    .unwrap();
+
+    let assert = Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args(["lint", "sub/goss.yml", "--format", "json"])
+        .assert()
+        .code(2);
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be JSON");
+    let array = parsed.as_array().expect("array");
+    let wait_finding = array
+        .iter()
+        .find(|f| {
+            f["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no timeout"))
+        })
+        .expect("the wait file's timeout finding");
+    assert_eq!(
+        wait_finding["file"], "sub/goss_wait.yml",
+        "the finding must carry the real detected path, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn test_explain_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
