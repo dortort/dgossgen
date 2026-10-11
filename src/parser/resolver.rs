@@ -86,6 +86,12 @@ pub struct VariableResolver {
     secret: HashSet<String>,
     /// `--build-arg` values that enter scope only at their global or stage `ARG` declaration.
     supplied_build_args: HashMap<String, SuppliedBuildArg>,
+    /// Values of ARGs declared before the first `FROM`. Docker keeps these out of
+    /// every stage body: they resolve only for `FROM` lines (and other global
+    /// ARG defaults) unless a stage redeclares the name with a bare `ARG NAME`.
+    global_vars: HashMap<String, String>,
+    /// Names in [`VariableResolver::global_vars`] whose value is secret-derived.
+    global_secret: HashSet<String>,
 }
 
 /// A `--build-arg` value held until its `ARG` declaration, with its secret-name flag.
@@ -123,18 +129,52 @@ impl VariableResolver {
         self.supplied_build_args.contains_key(name)
     }
 
-    /// Look up `name` and its secret flag; in global scope a supplied platform arg needs no `ARG`.
+    /// Look up `name` and its secret flag.
+    ///
+    /// Stage-body scope (`global_scope == false`) sees only the stage's own
+    /// bindings in `vars`. Global scope (a `FROM` line or a global ARG default)
+    /// additionally sees the global ARGs and, for a supplied platform arg, the
+    /// held build-arg value — neither of which is visible in a stage body without
+    /// an `ARG` redeclaration.
     fn lookup(&self, name: &str, global_scope: bool) -> Option<(&str, bool)> {
+        if !global_scope {
+            return self
+                .vars
+                .get(name)
+                .map(|val| (val.as_str(), self.secret.contains(name)));
+        }
+        if let Some(val) = self.global_vars.get(name) {
+            return Some((val, self.global_secret.contains(name)));
+        }
+        // Proxy args are bound (and locked) into `vars` at load time and resolve
+        // everywhere, so a `FROM` line still sees them.
         if let Some(val) = self.vars.get(name) {
             return Some((val, self.secret.contains(name)));
         }
-        if global_scope && PLATFORM_BUILD_ARGS.contains(&name) {
+        if PLATFORM_BUILD_ARGS.contains(&name) {
             return self
                 .supplied_build_args
                 .get(name)
                 .map(|arg| (arg.value.as_str(), arg.secret));
         }
         None
+    }
+
+    /// Look up a global ARG value and its secret flag (owned, for rebinding into a stage).
+    fn global_lookup(&self, name: &str) -> Option<(String, bool)> {
+        self.global_vars
+            .get(name)
+            .map(|val| (val.clone(), self.global_secret.contains(name)))
+    }
+
+    /// Bind a value into the global scope, overwriting any prior global value.
+    fn global_bind(&mut self, name: &str, value: String, secret: bool) {
+        self.global_vars.insert(name.to_string(), value);
+        if secret {
+            self.global_secret.insert(name.to_string());
+        } else {
+            self.global_secret.remove(name);
+        }
     }
 
     /// Bind a supplied build arg into scope, locked and carrying its secret flag.
@@ -150,27 +190,41 @@ impl VariableResolver {
     }
 
     /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
+    ///
+    /// Global ARGs are bound into the global scope only. They resolve for `FROM`
+    /// lines and for later global ARG defaults, but stay out of every stage body
+    /// until a stage redeclares the name (see [`VariableResolver::declare_arg`]).
     pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
         for arg in args {
-            if self.locked.contains(&arg.name) {
+            // A `--build-arg` value enters global scope (and overrides the default)
+            // the moment the name is declared globally; it is still held in
+            // `supplied_build_args` so a later stage redeclaration can bind it too.
+            if let Some(supplied) = self.supplied_build_args.get(&arg.name) {
+                let (value, secret) = (supplied.value.clone(), supplied.secret);
+                self.global_bind(&arg.name, value, secret);
                 continue;
             }
-            if self.bind_supplied_build_arg(&arg.name) {
+            // A proxy arg is already bound+locked in `vars` and resolves for `FROM`
+            // via the stage-independent fallback in `lookup`, so leave it there.
+            if self.locked.contains(&arg.name) {
                 continue;
             }
             if let Some(default) = &arg.default {
                 let resolved = self.resolve_checked_inner(&escape_literal_dollars(default), true);
                 if resolved.unresolved {
-                    self.vars.remove(&arg.name);
-                    self.secret.remove(&arg.name);
+                    self.global_vars.remove(&arg.name);
+                    self.global_secret.remove(&arg.name);
                 } else {
-                    self.bind(&arg.name, resolved.value, resolved.secret);
+                    self.global_bind(&arg.name, resolved.value, resolved.secret);
                 }
             }
         }
     }
 
-    /// Declare a stage ARG: a locked value wins, then a supplied build arg, then the default.
+    /// Declare a stage ARG: an ENV lock wins, then a supplied build arg, then the
+    /// stage default. A bare `ARG NAME` (no default) brings the global ARG value
+    /// into stage scope, overriding any value inherited from a parent stage
+    /// (matching BuildKit's global-over-parent precedence).
     pub fn declare_arg(&mut self, name: &str, default: Option<&str>, secret: bool) {
         if self.locked.contains(name) {
             return;
@@ -178,8 +232,13 @@ impl VariableResolver {
         if self.bind_supplied_build_arg(name) {
             return;
         }
-        if let Some(val) = default {
-            self.bind(name, val.to_string(), secret);
+        match default {
+            Some(val) => self.bind(name, val.to_string(), secret),
+            None => {
+                if let Some((value, global_secret)) = self.global_lookup(name) {
+                    self.bind(name, value, global_secret);
+                }
+            }
         }
     }
 
@@ -544,8 +603,93 @@ mod tests {
             name: "TAG".to_string(),
             default: Some("latest".to_string()),
         }]);
-        assert_eq!(resolver.resolve("alpine:$TAG"), "alpine:3.18");
-        assert!(resolver.is_locked("TAG"));
+        // A global ARG resolves for a FROM line (global scope)...
+        assert_eq!(resolver.resolve_image("alpine:$TAG").value, "alpine:3.18");
+        // ...but not inside a stage body without a redeclaration.
+        let stage = resolver.resolve_checked("alpine:$TAG");
+        assert_eq!(stage.value, "alpine:$TAG");
+        assert!(stage.unresolved);
+    }
+
+    #[test]
+    fn test_global_arg_not_visible_in_stage_body_without_redeclaration() {
+        let mut resolver = VariableResolver::new();
+        resolver.load_global_args(&[ArgInstruction {
+            name: "APP_DIR".to_string(),
+            default: Some("/srv/app".to_string()),
+        }]);
+        // FROM scope sees it; stage-body scope does not.
+        assert_eq!(resolver.resolve_image("$APP_DIR").value, "/srv/app");
+        let stage = resolver.resolve_checked("$APP_DIR");
+        assert_eq!(stage.value, "$APP_DIR");
+        assert!(stage.unresolved);
+    }
+
+    #[test]
+    fn test_bare_stage_arg_pulls_global_value_into_stage_scope() {
+        let mut resolver = VariableResolver::new();
+        resolver.load_global_args(&[ArgInstruction {
+            name: "APP_DIR".to_string(),
+            default: Some("/srv/app".to_string()),
+        }]);
+        resolver.declare_arg("APP_DIR", None, false);
+        assert_eq!(resolver.resolve("$APP_DIR"), "/srv/app");
+    }
+
+    #[test]
+    fn test_bare_stage_arg_prefers_global_over_parent_inherited() {
+        // BuildKit: a bare `ARG NAME` takes the global value over a parent's.
+        let mut resolver = VariableResolver::new();
+        resolver.load_global_args(&[ArgInstruction {
+            name: "V".to_string(),
+            default: Some("global".to_string()),
+        }]);
+        // A parent stage bound its own value for V (inherited down the chain).
+        resolver.declare_arg("V", Some("parent"), false);
+        assert_eq!(resolver.resolve("$V"), "parent");
+        // The child's bare redeclaration must override it with the global value.
+        resolver.declare_arg("V", None, false);
+        assert_eq!(resolver.resolve("$V"), "global");
+    }
+
+    #[test]
+    fn test_bare_stage_arg_without_global_leaves_name_undefined() {
+        // No global value and no supplied build arg: a bare `ARG NAME` binds nothing.
+        let mut resolver = VariableResolver::new();
+        resolver.declare_arg("NOPE", None, false);
+        assert!(resolver.resolve_checked("$NOPE").unresolved);
+    }
+
+    #[test]
+    fn test_defaulted_stage_arg_ignores_global_value() {
+        // A stage `ARG NAME=default` uses its own default, not the global value.
+        let mut resolver = VariableResolver::new();
+        resolver.load_global_args(&[ArgInstruction {
+            name: "V".to_string(),
+            default: Some("global".to_string()),
+        }]);
+        resolver.declare_arg("V", Some("stage"), false);
+        assert_eq!(resolver.resolve("$V"), "stage");
+    }
+
+    #[test]
+    fn test_bare_stage_arg_carries_global_secret_flag() {
+        let mut resolver = VariableResolver::new();
+        resolver.load_build_args(&[("DB_PASSWORD".to_string(), "s3cr3t".to_string())], |k| {
+            k.contains("PASSWORD")
+        });
+        resolver.load_global_args(&[ArgInstruction {
+            name: "DB_PASSWORD".to_string(),
+            default: None,
+        }]);
+        // Not yet visible in a stage body.
+        assert!(resolver.resolve_checked("$DB_PASSWORD").unresolved);
+        // A bare redeclaration pulls the global value in, keeping its secret taint.
+        resolver.declare_arg("DB_PASSWORD", None, false);
+        let resolved = resolver.resolve_checked("$DB_PASSWORD");
+        assert_eq!(resolved.value, "s3cr3t");
+        assert!(resolved.secret);
+        assert!(!resolved.unresolved);
     }
 
     #[test]
