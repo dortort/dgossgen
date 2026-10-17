@@ -770,6 +770,33 @@ CMD ["node", "server.js"]
     }
 
     #[test]
+    fn test_extractor_threads_backtick_escape_into_resolution() {
+        // Guards that the active escape char reaches the extractor's
+        // escape_literal_dollars call sites (#57). Under a backtick escape a
+        // backslash is a literal character, so `\$DIR` keeps the backslash and
+        // still expands `$DIR`. If a call site regressed to a hardcoded `\`,
+        // `\$` would be read as a literal `$` and the variable would stop
+        // expanding, so this fails if the threading is reverted.
+        let content =
+            "# escape=`\nFROM alpine\nARG DIR=app\nWORKDIR /opt/\\$DIR\nVOLUME /data/\\$DIR\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert_eq!(df.escape, '`');
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/\\app".to_string()));
+        assert!(
+            contract.volumes.contains(&"/data/\\app".to_string()),
+            "volumes: {:?}",
+            contract.volumes
+        );
+        assert!(
+            contract.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
     fn test_workdir_escaped_dollar_is_literal_path() {
         // Regression for #46: an escaped `$` must not be read as an undefined reference.
         let content = "FROM alpine\nWORKDIR /opt/\\$HOME\n";
