@@ -61,11 +61,14 @@ pub(crate) const DEFAULT_ESCAPE: char = '\\';
 fn parse_escape_directive(content: &str) -> char {
     let mut escape = DEFAULT_ESCAPE;
     for line in content.lines() {
-        let trimmed = line.trim();
-        // A non-comment line (instruction or blank) ends the directive block.
-        let Some(body) = trimmed.strip_prefix('#') else {
+        // The comment marker must be at column 0: BuildKit tests for `#` on the
+        // raw line without trimming, so a line indented by leading whitespace
+        // (or any non-comment line) is not a directive and ends the block.
+        // Whitespace is permitted only after the `#`.
+        let Some(body) = line.strip_prefix('#') else {
             break;
         };
+        let body = body.trim();
         // A directive is `name=value`; a comment without `=` ends the block.
         let Some((name, value)) = body.split_once('=') else {
             break;
@@ -3084,6 +3087,15 @@ USER root
     fn test_escape_directive_stops_at_instruction() {
         let content = "FROM alpine\n# escape=`\n";
         assert_eq!(parse_escape_directive(content), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_requires_hash_at_column_zero() {
+        // BuildKit tests for `#` on the untrimmed line, so an indented
+        // directive is a non-directive that ends the block and the default
+        // escape is kept. Whitespace is allowed only after the `#`.
+        assert_eq!(parse_escape_directive("   # escape=`\nFROM alpine\n"), '\\');
+        assert_eq!(parse_escape_directive("\t# escape=`\nFROM alpine\n"), '\\');
     }
 
     #[test]
