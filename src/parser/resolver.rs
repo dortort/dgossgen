@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::iter::Peekable;
+use std::str::Chars;
 
 use super::ast::ArgInstruction;
 
@@ -8,33 +10,80 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
-/// Mark `\$` as a literal dollar and collapse `\\`; never apply to already-decoded ENV values.
-pub(crate) fn escape_literal_dollars(input: &str) -> String {
-    if !input.contains('\\') {
-        return input.to_string();
-    }
-
+/// Process a Dockerfile instruction argument as a shell-like *word*, the way
+/// BuildKit's lexer (`frontend/dockerfile/shell/lex.go`) does for the arguments
+/// of `WORKDIR`, `USER`, `EXPOSE`, `VOLUME`, `COPY`/`ADD` destinations and `ARG`
+/// defaults: surrounding quotes are removed, a single-quoted span is fully
+/// literal (no expansion, no escapes), and double-quoted and unquoted spans
+/// honour backslash escapes.
+///
+/// Variable references are left in place for
+/// [`VariableResolver::resolve_checked`] to expand afterwards; a `$` that must
+/// stay literal — single-quoted, or an escaped `\$` — is emitted as the
+/// [`ESCAPED_DOLLAR`] marker so resolution does not expand it. This replaces the
+/// earlier quote-unaware escaping pass, so it must run on the raw argument before
+/// resolution, never on an already-decoded value.
+pub(crate) fn process_word(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.peek() {
-            Some('$') => {
-                out.push(ESCAPED_DOLLAR);
-                chars.next();
-            }
-            Some('\\') => {
-                out.push('\\');
-                chars.next();
-            }
-            // Keep a backslash before any other char so paths like `/a\b` survive.
-            _ => out.push('\\'),
+        match ch {
+            '\'' => process_single_quote(&mut chars, &mut out),
+            '"' => process_double_quote(&mut chars, &mut out),
+            // Outside quotes a backslash escapes the next character: an escaped
+            // `$` stays literal, any other char simply loses its backslash, and a
+            // trailing backslash is dropped.
+            '\\' => match chars.next() {
+                Some('$') => out.push(ESCAPED_DOLLAR),
+                Some(other) => out.push(other),
+                None => {}
+            },
+            // A live `$` reference and every other character pass through for the
+            // resolver. Raw Dockerfile text never contains the marker itself.
+            _ => out.push(ch),
         }
     }
     out
+}
+
+/// Copy a single-quoted span verbatim up to the closing `'`. Nothing is special
+/// inside single quotes, so a literal `$` is emitted as the marker to keep it
+/// from expanding. An unterminated span keeps whatever was read.
+fn process_single_quote(chars: &mut Peekable<Chars<'_>>, out: &mut String) {
+    for c in chars.by_ref() {
+        if c == '\'' {
+            return;
+        }
+        out.push(if c == '$' { ESCAPED_DOLLAR } else { c });
+    }
+}
+
+/// Copy a double-quoted span up to the closing `"`. BuildKit honours a backslash
+/// here only before `$`, `"` and `\`; before any other character the backslash
+/// is literal. A `$` stays live for the resolver. An unterminated span keeps
+/// whatever was read.
+fn process_double_quote(chars: &mut Peekable<Chars<'_>>, out: &mut String) {
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return,
+            '\\' => match chars.peek().copied() {
+                Some('$') => {
+                    out.push(ESCAPED_DOLLAR);
+                    chars.next();
+                }
+                Some('"') => {
+                    out.push('"');
+                    chars.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
 }
 
 /// Outcome of resolving a string against the variables in scope.
@@ -159,7 +208,7 @@ impl VariableResolver {
                 continue;
             }
             if let Some(default) = &arg.default {
-                let resolved = self.resolve_checked_inner(&escape_literal_dollars(default), true);
+                let resolved = self.resolve_checked_inner(&process_word(default), true);
                 if resolved.unresolved {
                     self.vars.remove(&arg.name);
                     self.secret.remove(&arg.name);
@@ -445,44 +494,81 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_literal_dollars_marks_escaped_dollar() {
+    fn test_process_word_strips_surrounding_quotes() {
+        // Docker removes quotes around a word argument before using it.
+        assert_eq!(process_word("\"/opt/x\""), "/opt/x");
+        assert_eq!(process_word("'/opt/x'"), "/opt/x");
+        // Mixed and adjacent quoted spans concatenate into a single word.
+        assert_eq!(process_word("/opt\"/a\"'/b'"), "/opt/a/b");
+    }
+
+    #[test]
+    fn test_process_word_single_quotes_are_fully_literal() {
+        // Inside single quotes nothing expands and no escape is processed, so a
+        // `$` and a `\$` both survive verbatim after resolution.
         let mut resolver = VariableResolver::new();
         resolver
             .vars
             .insert("HOME".to_string(), "/root".to_string());
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\$HOME")),
+            resolver.resolve(&process_word("'/opt/$HOME'")),
             "/opt/$HOME"
         );
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\${HOME}")),
+            resolver.resolve(&process_word("'/opt/\\$HOME'")),
+            "/opt/\\$HOME"
+        );
+        assert_eq!(
+            resolver.resolve(&process_word("'/opt/${HOME}'")),
             "/opt/${HOME}"
         );
     }
 
     #[test]
-    fn test_escape_literal_dollars_double_backslash_keeps_reference_live() {
-        // `\\$VAR` is a literal backslash followed by a *live* reference.
+    fn test_process_word_double_quotes_expand_and_honour_escapes() {
+        let mut resolver = VariableResolver::new();
+        resolver
+            .vars
+            .insert("HOME".to_string(), "/root".to_string());
+        // A live reference inside double quotes expands.
+        assert_eq!(
+            resolver.resolve(&process_word("\"/opt/$HOME\"")),
+            "/opt//root"
+        );
+        // `\$`, `\"` and `\\` are the only honoured escapes inside double quotes.
+        assert_eq!(
+            resolver.resolve(&process_word("\"/opt/\\$HOME\"")),
+            "/opt/$HOME"
+        );
+        assert_eq!(process_word("\"a\\\"b\""), "a\"b");
+        assert_eq!(process_word("\"a\\\\b\""), "a\\b");
+        // Before any other character the backslash stays literal.
+        assert_eq!(process_word("\"a\\db\""), "a\\db");
+    }
+
+    #[test]
+    fn test_process_word_unquoted_backslash_escapes_next_char() {
         let mut resolver = VariableResolver::new();
         resolver.vars.insert("VAR".to_string(), "value".to_string());
+        // `\$` stays literal; any other escaped char simply loses the backslash.
+        assert_eq!(resolver.resolve(&process_word("/opt/\\$VAR")), "/opt/$VAR");
+        assert_eq!(process_word("/a\\db"), "/adb");
+        // `\\` is a literal backslash, so the reference after it stays live.
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\\\$VAR")),
+            resolver.resolve(&process_word("/opt/\\\\$VAR")),
             "/opt/\\value"
         );
+        // A trailing backslash with nothing to escape is dropped.
+        assert_eq!(process_word("trailing\\"), "trailing");
     }
 
     #[test]
-    fn test_escape_literal_dollars_preserves_non_escape_backslash() {
-        assert_eq!(escape_literal_dollars("/a\\b"), "/a\\b");
-        assert_eq!(escape_literal_dollars("trailing\\"), "trailing\\");
-        assert_eq!(escape_literal_dollars("/plain/path"), "/plain/path");
-    }
-
-    #[test]
-    fn test_escape_literal_dollars_escaped_dollar_flags_resolved() {
+    fn test_process_word_escaped_dollar_flags_resolved() {
         let resolver = VariableResolver::new();
+        // An escaped `$` is a literal, so a name that follows is not a reference
+        // and the result is fully resolved.
         assert_eq!(
-            resolver.resolve_checked(&escape_literal_dollars("/opt/\\$MISSING")),
+            resolver.resolve_checked(&process_word("/opt/\\$MISSING")),
             Resolution {
                 value: "/opt/$MISSING".to_string(),
                 unresolved: false,
@@ -492,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_escaped_dollar_marker_never_leaks_from_verbatim_unresolved_text() {
+    fn test_process_word_marker_never_leaks_from_verbatim_unresolved_text() {
         let mut resolver = VariableResolver::new();
         resolver.taint("T");
         let cases = [
@@ -501,7 +587,7 @@ mod tests {
             ("/a/${UNTERM\\$x", "/a/${UNTERM$x"),
         ];
         for (input, expected) in cases {
-            let resolved = resolver.resolve_checked(&escape_literal_dollars(input));
+            let resolved = resolver.resolve_checked(&process_word(input));
             assert!(resolved.unresolved, "{input}");
             assert_eq!(resolved.value, expected);
         }
