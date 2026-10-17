@@ -69,11 +69,19 @@ fn parse_escape_directive(content: &str) -> char {
             break;
         };
         let body = body.trim();
-        // A directive is `name=value`; a comment without `=` ends the block.
+        // A directive matches BuildKit's grammar
+        // `^([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$`: a `name=value` whose value
+        // capture requires at least one non-whitespace character. A line that
+        // does not match — no `=`, or an empty value like `# escape=` — is not a
+        // directive and ends the block.
         let Some((name, value)) = body.split_once('=') else {
             break;
         };
         let name = name.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            break;
+        }
         // BuildKit recognizes only these parser directives. The first line
         // whose directive name is not one of them ends the directive block:
         // an unknown (but well-formed) `name=value`, like `# foo=bar`, is an
@@ -87,7 +95,6 @@ fn parse_escape_directive(content: &str) -> char {
         }
         if name.eq_ignore_ascii_case("escape") {
             // Docker accepts only a single `\` or `` ` `` as the escape value.
-            let value = value.trim();
             match value {
                 "`" => escape = '`',
                 "\\" => escape = '\\',
@@ -3096,6 +3103,22 @@ USER root
         // escape is kept. Whitespace is allowed only after the `#`.
         assert_eq!(parse_escape_directive("   # escape=`\nFROM alpine\n"), '\\');
         assert_eq!(parse_escape_directive("\t# escape=`\nFROM alpine\n"), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_empty_value_ends_block() {
+        // BuildKit's value capture requires a non-empty value, so `# escape=`
+        // is not a directive and ends the block; a following `# escape=`` ` is
+        // then an ordinary comment and the default escape is kept.
+        assert_eq!(
+            parse_escape_directive("# escape=\n# escape=`\nFROM alpine\n"),
+            '\\'
+        );
+        // An empty recognized directive before a real one likewise ends the block.
+        assert_eq!(
+            parse_escape_directive("# syntax=\n# escape=`\nFROM alpine\n"),
+            '\\'
+        );
     }
 
     #[test]
