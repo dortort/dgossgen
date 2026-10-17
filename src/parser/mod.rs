@@ -38,17 +38,67 @@ pub fn parse_dockerfile(path: &Path) -> Result<Dockerfile> {
 
 /// Parse Dockerfile content string into a structured Dockerfile.
 pub fn parse_dockerfile_content(content: &str) -> Result<Dockerfile> {
-    let raw_instructions = parse_raw_instructions(content)?;
+    let escape = parse_escape_directive(content);
+    let raw_instructions = parse_raw_instructions(content, escape)?;
     let (global_args, stages) = build_stages(raw_instructions)?;
     Ok(Dockerfile {
         global_args,
         stages,
+        escape,
     })
+}
+
+/// The default escape character when no `# escape=` directive is present.
+pub(crate) const DEFAULT_ESCAPE: char = '\\';
+
+/// Determine the active escape character from the leading parser-directive
+/// block. Directives are comment-shaped lines (`# name=value`) that must appear
+/// before any instruction, blank line, or ordinary comment; the first line that
+/// is not a well-formed directive ends the block. Only `\` and `` ` `` are valid
+/// escape values — any other value (or the absence of the directive) leaves the
+/// default `\` in force. See
+/// <https://docs.docker.com/reference/dockerfile/#escape>.
+fn parse_escape_directive(content: &str) -> char {
+    let mut escape = DEFAULT_ESCAPE;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // A non-comment line (instruction or blank) ends the directive block.
+        let Some(body) = trimmed.strip_prefix('#') else {
+            break;
+        };
+        // A directive is `name=value`; a comment without `=` ends the block.
+        let Some((name, value)) = body.split_once('=') else {
+            break;
+        };
+        let name = name.trim();
+        // The name must be a bare identifier; anything else is prose, not a
+        // directive, and ends the block.
+        if name.is_empty()
+            || !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            || !name.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            break;
+        }
+        if name.eq_ignore_ascii_case("escape") {
+            // Docker accepts only a single `\` or `` ` `` as the escape value.
+            let value = value.trim();
+            match value {
+                "`" => escape = '`',
+                "\\" => escape = '\\',
+                // An invalid value keeps the default rather than aborting the
+                // whole parse — this is a generator, not a builder.
+                _ => {}
+            }
+        }
+        // Other directives (`syntax=`, `check=`) are irrelevant here; keep
+        // scanning the block for a later `escape=`.
+    }
+    escape
 }
 
 /// Merge continuation lines (trailing backslash) into single logical lines,
 /// tracking the original source line number for each instruction.
-fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
+fn merge_continuation_lines(content: &str, escape: char) -> Vec<(usize, String)> {
     // Indexed over physical lines so that once a logical line is finalized we can
     // look ahead and consume any BuildKit heredoc body it opens.
     let lines: Vec<&str> = content.lines().collect();
@@ -80,8 +130,8 @@ fn merge_continuation_lines(content: &str) -> Vec<(usize, String)> {
             current_line.clear();
         }
 
-        if let Some(without_backslash) = trimmed.strip_suffix('\\') {
-            // Remove the backslash and accumulate
+        if let Some(without_backslash) = trimmed.strip_suffix(escape) {
+            // Remove the escape character and accumulate
             if in_continuation {
                 current_line.push(' ');
                 current_line.push_str(without_backslash.trim());
@@ -840,8 +890,8 @@ fn body_has_non_shell_shebang(body: &[&str]) -> bool {
 }
 
 /// Parse raw instructions from merged lines.
-fn parse_raw_instructions(content: &str) -> Result<Vec<RawInstruction>> {
-    let merged = merge_continuation_lines(content);
+fn parse_raw_instructions(content: &str, escape: char) -> Result<Vec<RawInstruction>> {
+    let merged = merge_continuation_lines(content, escape);
     let mut instructions = Vec::new();
 
     for (line_num, line) in merged {
@@ -859,7 +909,7 @@ fn parse_raw_instructions(content: &str) -> Result<Vec<RawInstruction>> {
         let instruction = match keyword.as_str() {
             "FROM" => parse_from(&args, line_num)?,
             "ARG" => parse_arg(&args, line_num),
-            "ENV" => parse_env(&args, line_num),
+            "ENV" => parse_env(&args, line_num, escape),
             "WORKDIR" => RawInstruction {
                 line_number: line_num,
                 instruction: Instruction::Workdir(args.clone()),
@@ -956,7 +1006,7 @@ fn parse_arg(args: &str, line_num: usize) -> RawInstruction {
     }
 }
 
-fn parse_env(args: &str, line_num: usize) -> RawInstruction {
+fn parse_env(args: &str, line_num: usize, escape: char) -> RawInstruction {
     let mut pairs = Vec::new();
 
     // ENV supports two forms:
@@ -982,7 +1032,7 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
             };
             let key = remaining[..eq_pos].trim().to_string();
             let after_eq = &remaining[eq_pos + 1..];
-            let (value, rest) = parse_env_value(after_eq);
+            let (value, rest) = parse_env_value(after_eq, escape);
             pairs.push((key, value));
             remaining = rest;
         }
@@ -1012,16 +1062,19 @@ fn parse_env(args: &str, line_num: usize) -> RawInstruction {
 ///   - single-quoted, taken literally (`'a b'` → `a b`)
 ///   - unquoted, where `\` escapes the next char and an unescaped whitespace
 ///     ends the value (`Rex\ The\ Dog` → `Rex The Dog`)
-fn parse_env_value(after_eq: &str) -> (String, &str) {
+///
+/// `escape` is the active escape character (`\` by default, `` ` `` under a
+/// `# escape=` directive); a non-escape backslash is then a literal character.
+fn parse_env_value(after_eq: &str, escape: char) -> (String, &str) {
     if let Some(stripped) = after_eq.strip_prefix('"') {
         let mut val = String::new();
         let mut chars = stripped.char_indices();
         while let Some((i, c)) = chars.next() {
             match c {
-                '\\' => {
-                    // Inside double quotes, a backslash escapes only `"`, `\`
-                    // and `$` (matching Docker/BuildKit); before any other
-                    // character it is a literal backslash, so a value such as
+                c if c == escape => {
+                    // Inside double quotes, the escape character escapes only
+                    // `"`, itself, and `$` (matching Docker/BuildKit); before
+                    // any other character it is a literal, so a value such as
                     // `"\d+\w"` is preserved rather than mangled to `d+w`.
                     // An escaped `$` becomes a marker so later variable
                     // resolution keeps it literal instead of expanding it.
@@ -1030,11 +1083,11 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
                             val.push(ESCAPED_DOLLAR);
                             chars.next();
                         }
-                        Some((_, next)) if matches!(next, '"' | '\\') => {
+                        Some((_, next)) if next == '"' || next == escape => {
                             val.push(next);
                             chars.next();
                         }
-                        _ => val.push('\\'),
+                        _ => val.push(escape),
                     }
                 }
                 '"' => return (val, &stripped[i + 1..]),
@@ -1049,19 +1102,19 @@ fn parse_env_value(after_eq: &str) -> (String, &str) {
             None => (stripped.to_string(), ""),
         }
     } else {
-        // Unquoted: a backslash escapes the following character (so the
+        // Unquoted: the escape character escapes the following character (so the
         // documented `ENV MY_DOG=Rex\ The\ Dog` idiom keeps its spaces); the
         // value ends at the first *unescaped* whitespace.
         let mut val = String::new();
         let mut chars = after_eq.char_indices();
         while let Some((i, c)) = chars.next() {
-            if c == '\\' {
+            if c == escape {
                 if let Some((_, next)) = chars.next() {
                     // An escaped `$` becomes a marker so later variable
                     // resolution keeps it literal instead of expanding it.
                     val.push(if next == '$' { ESCAPED_DOLLAR } else { next });
                 }
-                // A trailing backslash with nothing after it is dropped.
+                // A trailing escape character with nothing after it is dropped.
             } else if c.is_whitespace() {
                 return (val, &after_eq[i..]);
             } else {
@@ -2963,5 +3016,171 @@ USER root
         let runs = run_commands(content);
         assert_eq!(runs.len(), 1);
         assert!(runs[0].contains("apk add --no-cache nginx"));
+    }
+
+    // ---- `# escape=` parser directive ------------------------------------
+
+    #[test]
+    fn test_escape_directive_absent_defaults_to_backslash() {
+        assert_eq!(parse_escape_directive("FROM alpine\n"), '\\');
+        assert_eq!(parse_escape_directive(""), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_backtick_recognized() {
+        assert_eq!(parse_escape_directive("# escape=`\nFROM alpine\n"), '`');
+    }
+
+    #[test]
+    fn test_escape_directive_backslash_recognized() {
+        assert_eq!(parse_escape_directive("# escape=\\\nFROM alpine\n"), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_case_insensitive_and_spaced() {
+        // The directive name is case-insensitive and surrounding whitespace is
+        // trimmed (`#   ESCAPE = ` ` `).
+        assert_eq!(
+            parse_escape_directive("#   ESCAPE =  `  \nFROM alpine\n"),
+            '`'
+        );
+    }
+
+    #[test]
+    fn test_escape_directive_after_syntax_directive() {
+        // An unrelated directive (`syntax=`) does not end the block, so a later
+        // `escape=` is still honored.
+        let content = "# syntax=docker/dockerfile:1\n# escape=`\nFROM alpine\n";
+        assert_eq!(parse_escape_directive(content), '`');
+    }
+
+    #[test]
+    fn test_escape_directive_invalid_value_keeps_default() {
+        // Docker accepts only `\` or `` ` ``; any other value is ignored.
+        assert_eq!(parse_escape_directive("# escape=x\nFROM alpine\n"), '\\');
+        assert_eq!(parse_escape_directive("# escape=\\\\\nFROM alpine\n"), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_stops_at_prose_comment() {
+        // A comment that is not a well-formed `name=value` directive ends the
+        // directive block, so a following `escape=` is a plain comment.
+        let content = "# a normal comment\n# escape=`\nFROM alpine\n";
+        assert_eq!(parse_escape_directive(content), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_stops_at_blank_line() {
+        // A blank line before the directive ends the block (directives must be
+        // at the very top).
+        let content = "\n# escape=`\nFROM alpine\n";
+        assert_eq!(parse_escape_directive(content), '\\');
+    }
+
+    #[test]
+    fn test_escape_directive_stops_at_instruction() {
+        let content = "FROM alpine\n# escape=`\n";
+        assert_eq!(parse_escape_directive(content), '\\');
+    }
+
+    #[test]
+    fn test_parsed_dockerfile_carries_escape_char() {
+        let df = parse_dockerfile_content("# escape=`\nFROM alpine\n").unwrap();
+        assert_eq!(df.escape, '`');
+        let df = parse_dockerfile_content("FROM alpine\n").unwrap();
+        assert_eq!(df.escape, '\\');
+    }
+
+    // ---- line continuation under the active escape char ------------------
+
+    #[test]
+    fn test_backtick_escape_trailing_backslash_is_not_continuation() {
+        // Regression for #57: under a backtick escape, a path ending in `\`
+        // (`WORKDIR C:\app\`) must not continue onto the next line and swallow
+        // the following instruction.
+        let content = "# escape=`\nFROM mcr.microsoft.com/windows\nWORKDIR C:\\app\\\nEXPOSE 80\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let insts = &df.stages[0].instructions;
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(&i.instruction, Instruction::Workdir(d) if d == "C:\\app\\")),
+            "WORKDIR value was mangled: {insts:?}"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(&i.instruction, Instruction::Expose(_))),
+            "EXPOSE was swallowed by a phantom line continuation: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn test_backtick_escape_continues_lines_on_backtick() {
+        // A line ending in the active escape char (`` ` ``) continues onto the
+        // next, merging into a single RUN rather than leaking `world`.
+        let content = "# escape=`\nFROM alpine\nRUN echo hello `\n    world\n";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1, "continuation did not merge: {runs:?}");
+        assert!(runs[0].contains("echo hello") && runs[0].contains("world"));
+    }
+
+    #[test]
+    fn test_default_escape_does_not_continue_on_backtick() {
+        // Without the directive the escape char is `\`, so a trailing backtick
+        // is literal and does not join the next line.
+        let content = "FROM alpine\nRUN echo hello `\nWORKDIR /app\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert!(
+            df.stages[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(&i.instruction, Instruction::Workdir(d) if d == "/app")),
+            "a literal trailing backtick wrongly continued the line"
+        );
+    }
+
+    #[test]
+    fn test_default_escape_continues_lines_on_backslash() {
+        // The default backslash continuation behavior is unchanged.
+        let content = "FROM alpine\nRUN echo hello \\\n    world\n";
+        let runs = run_commands(content);
+        assert_eq!(runs.len(), 1, "continuation did not merge: {runs:?}");
+        assert!(runs[0].contains("echo hello") && runs[0].contains("world"));
+    }
+
+    // ---- ENV value decoding under the active escape char -----------------
+
+    #[test]
+    fn test_backtick_escape_env_backslash_is_literal() {
+        // Under a backtick escape, a backslash in an unquoted ENV value is a
+        // literal character, so a Windows path survives intact.
+        let envs = env_pairs("# escape=`\nFROM alpine\nENV WINDIR=C:\\Windows\n");
+        assert_eq!(
+            envs,
+            vec![vec![("WINDIR".to_string(), "C:\\Windows".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_default_escape_env_backslash_escapes_next_char() {
+        // Default escape: `\W` drops the backslash (documented escape behavior),
+        // unchanged by this work.
+        let envs = env_pairs("FROM alpine\nENV WINDIR=C:\\Windows\n");
+        assert_eq!(
+            envs,
+            vec![vec![("WINDIR".to_string(), "C:Windows".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_backtick_escape_env_double_quoted_escapes() {
+        // Inside double quotes under a backtick escape, `` `" `` is an escaped
+        // quote and a backslash is literal.
+        let envs = env_pairs("# escape=`\nFROM alpine\nENV MSG=\"say `\"hi`\" in C:\\x\"\n");
+        assert_eq!(
+            envs,
+            vec![vec![("MSG".to_string(), "say \"hi\" in C:\\x".to_string())]]
+        );
     }
 }
