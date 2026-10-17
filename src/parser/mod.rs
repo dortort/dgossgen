@@ -71,12 +71,15 @@ fn parse_escape_directive(content: &str) -> char {
             break;
         };
         let name = name.trim();
-        // The name must be a bare identifier; anything else is prose, not a
-        // directive, and ends the block.
-        if name.is_empty()
-            || !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            || !name.chars().all(|c| c.is_ascii_alphanumeric())
-        {
+        // BuildKit recognizes only these parser directives. The first line
+        // whose directive name is not one of them ends the directive block:
+        // an unknown (but well-formed) `name=value`, like `# foo=bar`, is an
+        // ordinary comment, and so is everything after it — including a later
+        // `# escape=`. Matches BuildKit's `validDirectives` set.
+        if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "syntax" | "escape" | "check"
+        ) {
             break;
         }
         if name.eq_ignore_ascii_case("escape") {
@@ -90,8 +93,8 @@ fn parse_escape_directive(content: &str) -> char {
                 _ => {}
             }
         }
-        // Other directives (`syntax=`, `check=`) are irrelevant here; keep
-        // scanning the block for a later `escape=`.
+        // A recognized but irrelevant directive (`syntax=`, `check=`) does not
+        // end the block, so keep scanning for a later `escape=`.
     }
     escape
 }
@@ -3084,6 +3087,15 @@ USER root
     }
 
     #[test]
+    fn test_escape_directive_stops_at_unknown_directive() {
+        // BuildKit recognizes only `syntax`/`escape`/`check`. An unknown but
+        // well-formed `name=value` directive ends the block, so a following
+        // `# escape=` is an ordinary comment and the default is kept.
+        let content = "# foo=bar\n# escape=`\nFROM alpine\n";
+        assert_eq!(parse_escape_directive(content), '\\');
+    }
+
+    #[test]
     fn test_parsed_dockerfile_carries_escape_char() {
         let df = parse_dockerfile_content("# escape=`\nFROM alpine\n").unwrap();
         assert_eq!(df.escape, '`');
@@ -3181,6 +3193,17 @@ USER root
         assert_eq!(
             envs,
             vec![vec![("MSG".to_string(), "say \"hi\" in C:\\x".to_string())]]
+        );
+    }
+
+    #[test]
+    fn test_backtick_escape_env_escaped_dollar_stays_literal() {
+        // Under a backtick escape, `` `$ `` marks a literal dollar (kept verbatim
+        // by later resolution) while a backslash is an ordinary character.
+        let envs = env_pairs("# escape=`\nFROM alpine\nENV P=\"a\\b`$c\"\n");
+        assert_eq!(
+            envs,
+            vec![vec![("P".to_string(), format!("a\\b{ESCAPED_DOLLAR}c"))]]
         );
     }
 }
