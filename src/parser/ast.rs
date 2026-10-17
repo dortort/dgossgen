@@ -3,6 +3,10 @@
 pub struct Dockerfile {
     pub global_args: Vec<ArgInstruction>,
     pub stages: Vec<Stage>,
+    /// The active escape character, set by the `# escape=` parser directive
+    /// (`\` by default, or `` ` `` for Windows-style Dockerfiles). It governs
+    /// line continuation, ENV value decoding, and literal-`$` escaping.
+    pub escape: char,
 }
 
 impl Dockerfile {

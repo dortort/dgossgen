@@ -8,16 +8,18 @@ use super::ast::ArgInstruction;
 /// real Dockerfile text.
 pub(crate) const ESCAPED_DOLLAR: char = '\u{FDD0}';
 
-/// Mark `\$` as a literal dollar and collapse `\\`; never apply to already-decoded ENV values.
-pub(crate) fn escape_literal_dollars(input: &str) -> String {
-    if !input.contains('\\') {
+/// Mark an escaped `$` as a literal dollar and collapse a doubled escape
+/// character; never apply to already-decoded ENV values. `escape` is the active
+/// escape character (`\` by default, `` ` `` under a `# escape=` directive).
+pub(crate) fn escape_literal_dollars(input: &str, escape: char) -> String {
+    if !input.contains(escape) {
         return input.to_string();
     }
 
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch != '\\' {
+        if ch != escape {
             out.push(ch);
             continue;
         }
@@ -26,12 +28,13 @@ pub(crate) fn escape_literal_dollars(input: &str) -> String {
                 out.push(ESCAPED_DOLLAR);
                 chars.next();
             }
-            Some('\\') => {
-                out.push('\\');
+            Some(&c) if c == escape => {
+                out.push(escape);
                 chars.next();
             }
-            // Keep a backslash before any other char so paths like `/a\b` survive.
-            _ => out.push('\\'),
+            // Keep a lone escape char before any other char so paths like
+            // `/a\b` (default escape) survive.
+            _ => out.push(escape),
         }
     }
     out
@@ -149,8 +152,9 @@ impl VariableResolver {
         true
     }
 
-    /// Load pre-FROM ARG defaults in order, so one default may reference an earlier global.
-    pub fn load_global_args(&mut self, args: &[ArgInstruction]) {
+    /// Load pre-FROM ARG defaults in order, so one default may reference an
+    /// earlier global. `escape` is the Dockerfile's active escape character.
+    pub fn load_global_args(&mut self, args: &[ArgInstruction], escape: char) {
         for arg in args {
             if self.locked.contains(&arg.name) {
                 continue;
@@ -159,7 +163,8 @@ impl VariableResolver {
                 continue;
             }
             if let Some(default) = &arg.default {
-                let resolved = self.resolve_checked_inner(&escape_literal_dollars(default), true);
+                let resolved =
+                    self.resolve_checked_inner(&escape_literal_dollars(default, escape), true);
                 if resolved.unresolved {
                     self.vars.remove(&arg.name);
                     self.secret.remove(&arg.name);
@@ -451,11 +456,11 @@ mod tests {
             .vars
             .insert("HOME".to_string(), "/root".to_string());
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\$HOME")),
+            resolver.resolve(&escape_literal_dollars("/opt/\\$HOME", '\\')),
             "/opt/$HOME"
         );
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\${HOME}")),
+            resolver.resolve(&escape_literal_dollars("/opt/\\${HOME}", '\\')),
             "/opt/${HOME}"
         );
     }
@@ -466,23 +471,46 @@ mod tests {
         let mut resolver = VariableResolver::new();
         resolver.vars.insert("VAR".to_string(), "value".to_string());
         assert_eq!(
-            resolver.resolve(&escape_literal_dollars("/opt/\\\\$VAR")),
+            resolver.resolve(&escape_literal_dollars("/opt/\\\\$VAR", '\\')),
             "/opt/\\value"
         );
     }
 
     #[test]
     fn test_escape_literal_dollars_preserves_non_escape_backslash() {
-        assert_eq!(escape_literal_dollars("/a\\b"), "/a\\b");
-        assert_eq!(escape_literal_dollars("trailing\\"), "trailing\\");
-        assert_eq!(escape_literal_dollars("/plain/path"), "/plain/path");
+        assert_eq!(escape_literal_dollars("/a\\b", '\\'), "/a\\b");
+        assert_eq!(escape_literal_dollars("trailing\\", '\\'), "trailing\\");
+        assert_eq!(escape_literal_dollars("/plain/path", '\\'), "/plain/path");
+    }
+
+    #[test]
+    fn test_escape_literal_dollars_backtick_escape() {
+        let mut resolver = VariableResolver::new();
+        resolver
+            .vars
+            .insert("HOME".to_string(), "/root".to_string());
+        // Under a backtick escape, `` `$ `` is a literal dollar, a doubled
+        // backtick collapses to one, and a backslash is an ordinary character
+        // that leaves the following `$VAR` reference live.
+        assert_eq!(
+            resolver.resolve(&escape_literal_dollars("/opt/`$HOME", '`')),
+            "/opt/$HOME"
+        );
+        assert_eq!(
+            resolver.resolve(&escape_literal_dollars("/opt/``$HOME", '`')),
+            "/opt/`/root"
+        );
+        assert_eq!(
+            resolver.resolve(&escape_literal_dollars("C:\\$HOME", '`')),
+            "C:\\/root"
+        );
     }
 
     #[test]
     fn test_escape_literal_dollars_escaped_dollar_flags_resolved() {
         let resolver = VariableResolver::new();
         assert_eq!(
-            resolver.resolve_checked(&escape_literal_dollars("/opt/\\$MISSING")),
+            resolver.resolve_checked(&escape_literal_dollars("/opt/\\$MISSING", '\\')),
             Resolution {
                 value: "/opt/$MISSING".to_string(),
                 unresolved: false,
@@ -501,7 +529,7 @@ mod tests {
             ("/a/${UNTERM\\$x", "/a/${UNTERM$x"),
         ];
         for (input, expected) in cases {
-            let resolved = resolver.resolve_checked(&escape_literal_dollars(input));
+            let resolved = resolver.resolve_checked(&escape_literal_dollars(input, '\\'));
             assert!(resolved.unresolved, "{input}");
             assert_eq!(resolved.value, expected);
         }
@@ -540,10 +568,13 @@ mod tests {
     fn test_global_build_arg_enters_scope_at_global_arg() {
         let mut resolver = VariableResolver::new();
         resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())], |_| false);
-        resolver.load_global_args(&[ArgInstruction {
-            name: "TAG".to_string(),
-            default: Some("latest".to_string()),
-        }]);
+        resolver.load_global_args(
+            &[ArgInstruction {
+                name: "TAG".to_string(),
+                default: Some("latest".to_string()),
+            }],
+            '\\',
+        );
         assert_eq!(resolver.resolve("alpine:$TAG"), "alpine:3.18");
         assert!(resolver.is_locked("TAG"));
     }
@@ -552,7 +583,7 @@ mod tests {
     fn test_build_arg_without_declaration_never_resolves() {
         let mut resolver = VariableResolver::new();
         resolver.load_build_args(&[("TAG".to_string(), "3.18".to_string())], |_| false);
-        resolver.load_global_args(&[]);
+        resolver.load_global_args(&[], '\\');
         let Resolution {
             value, unresolved, ..
         } = resolver.resolve_checked("alpine:$TAG");
@@ -805,16 +836,19 @@ mod tests {
     #[test]
     fn test_global_arg_redeclared_unresolvable_clears_secret_taint() {
         let mut resolver = resolver_with_secret_build_arg();
-        resolver.load_global_args(&[
-            ArgInstruction {
-                name: "G".to_string(),
-                default: Some("/srv/$DB_PASSWORD".to_string()),
-            },
-            ArgInstruction {
-                name: "G".to_string(),
-                default: Some("$UNDEFINED".to_string()),
-            },
-        ]);
+        resolver.load_global_args(
+            &[
+                ArgInstruction {
+                    name: "G".to_string(),
+                    default: Some("/srv/$DB_PASSWORD".to_string()),
+                },
+                ArgInstruction {
+                    name: "G".to_string(),
+                    default: Some("$UNDEFINED".to_string()),
+                },
+            ],
+            '\\',
+        );
         let resolved = resolver.resolve_checked("${G:-/fallback}");
         assert_eq!(resolved.value, "/fallback");
         assert!(!resolved.secret);
@@ -835,10 +869,13 @@ mod tests {
 
         let mut global = VariableResolver::new();
         global.load_build_args(&secret_args, is_secret);
-        global.load_global_args(&[ArgInstruction {
-            name: "DB_PASSWORD".to_string(),
-            default: None,
-        }]);
+        global.load_global_args(
+            &[ArgInstruction {
+                name: "DB_PASSWORD".to_string(),
+                default: None,
+            }],
+            '\\',
+        );
         global.declare_arg("DB_PASSWORD", None, false);
         assert!(global.resolve_checked("$DB_PASSWORD").secret);
         assert!(global.resolve_image("alpine:$TARGETARCH").secret);
