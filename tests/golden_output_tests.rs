@@ -81,6 +81,14 @@ const CASES: &[Case] = &[
         fixture: "internal_base_stage.Dockerfile",
         profile: Profile::Standard,
     },
+    // windows_backtick: a `# escape=` ` Dockerfile where a trailing backslash is
+    // a literal path char, not a continuation (#57). Pins that EXPOSE after
+    // `WORKDIR C:\app\` is not swallowed into a phantom continuation.
+    Case {
+        name: "windows_backtick",
+        fixture: "windows_backtick.Dockerfile",
+        profile: Profile::Standard,
+    },
 ];
 
 fn generate_case(case: &Case) -> generator::GeneratorOutput {
