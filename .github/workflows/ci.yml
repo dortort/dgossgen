@@ -36,6 +36,26 @@ jobs:
       # no-op (no doctests exist) but keeps future doctests from being skipped.
       - run: cargo test --doc
 
+  # Aggregate the per-OS test matrix into one stable check named exactly
+  # "Test". The matrix jobs above emit "Test (ubuntu-latest)" and
+  # "Test (macos-latest)", so this gate is what satisfies the branch
+  # ruleset's required "Test" context. `needs.test.result` is "success" only
+  # when every matrix leg passed (fail-fast is off, so all legs run); the
+  # `if: always()` keeps this job from being skipped when a leg fails, so a
+  # macOS-only failure still reports "Test" as failed and blocks the merge.
+  test-result:
+    name: Test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all Test matrix legs to pass
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test matrix did not succeed (result: ${{ needs.test.result }})"
+            exit 1
+          fi
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
