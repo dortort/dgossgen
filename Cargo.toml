@@ -37,3 +37,11 @@ env_logger = "0.11"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+
+# Release binaries are published to GitHub Releases and the Homebrew tap, so
+# trim them: drop debug symbols, apply thin LTO, and use a single codegen unit
+# for better cross-module optimization at the cost of some compile time.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
