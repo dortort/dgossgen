@@ -21,13 +21,20 @@ jobs:
       - run: cargo check --all-targets
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      # --all-targets excludes doctests, so run them explicitly. Currently a
+      # no-op (no doctests exist) but keeps future doctests from being skipped.
+      - run: cargo test --doc
 
   fmt:
     name: Format
