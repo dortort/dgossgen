@@ -50,6 +50,56 @@ fn test_init_wait_only_contract_exits_zero() {
 }
 
 #[test]
+fn test_init_missing_dockerfile_exits_one_with_path() {
+    // A Dockerfile that does not exist is a hard error surfaced by the
+    // top-level handler: exit 1, and the offending path named on stderr so
+    // the user knows which file was not found.
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("nope.Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            missing.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error:"))
+        .stderr(predicates::str::contains("nope.Dockerfile"));
+
+    // No output is produced when the input never parsed.
+    assert!(!output_dir.join("goss.yml").exists());
+}
+
+#[test]
+fn test_init_unknown_profile_exits_one_with_diagnostic() {
+    // An unknown --profile value is rejected with exit 1 and a diagnostic
+    // naming the bad value, rather than silently falling back to a default.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE 8080\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "--profile",
+            "bogus",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("unknown profile"))
+        .stderr(predicates::str::contains("bogus"));
+}
+
+#[test]
 fn test_init_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
