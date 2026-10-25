@@ -74,8 +74,25 @@ mod tests {
     use super::*;
     use crate::extractor::PackageManager;
 
-    /// Every variant of the contract's assertion kinds, so a new kind added to
-    /// `AssertionKind` without a matching `explain` arm fails to compile here.
+    /// Compile-time guard: a wildcard-free match over every `AssertionKind`
+    /// variant. Adding a new variant breaks compilation of this test module
+    /// until it is listed here (and in [`one_of_each`] and the `explain` arms).
+    fn assert_every_variant_is_covered(kind: &AssertionKind) {
+        match kind {
+            AssertionKind::FileExists { .. }
+            | AssertionKind::PortListening { .. }
+            | AssertionKind::ProcessRunning { .. }
+            | AssertionKind::CommandExit { .. }
+            | AssertionKind::CommandOutput { .. }
+            | AssertionKind::UserExists { .. }
+            | AssertionKind::HealthcheckPasses { .. }
+            | AssertionKind::HttpStatus { .. }
+            | AssertionKind::PackageInstalled { .. } => {}
+        }
+    }
+
+    /// One value of every `AssertionKind` variant, in declaration order, used to
+    /// pin the type names and descriptions below.
     fn one_of_each() -> Vec<AssertionKind> {
         vec![
             AssertionKind::FileExists {
@@ -119,7 +136,9 @@ mod tests {
 
     #[test]
     fn test_assertion_type_name_for_every_kind() {
-        let names: Vec<&str> = one_of_each().iter().map(assertion_type_name).collect();
+        let kinds = one_of_each();
+        kinds.iter().for_each(assert_every_variant_is_covered);
+        let names: Vec<&str> = kinds.iter().map(assertion_type_name).collect();
         assert_eq!(
             names,
             vec![
