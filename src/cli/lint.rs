@@ -178,4 +178,21 @@ mod tests {
             vec!["Invalid YAML syntax"]
         );
     }
+
+    #[test]
+    fn test_lint_many_processes_flagged_over_three() {
+        // More than three process assertions raises the flake-risk finding.
+        let yaml = "process:\n  a: {}\n  b: {}\n  c: {}\n  d: {}\n";
+        assert_eq!(
+            lint(yaml),
+            vec!["Many process assertions (>3) increase flake risk"]
+        );
+    }
+
+    #[test]
+    fn test_lint_three_processes_not_flagged() {
+        // Exactly three is the boundary: at or below the threshold, no finding.
+        let yaml = "process:\n  a: {}\n  b: {}\n  c: {}\n";
+        assert!(lint(yaml).is_empty());
+    }
 }

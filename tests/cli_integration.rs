@@ -50,6 +50,56 @@ fn test_init_wait_only_contract_exits_zero() {
 }
 
 #[test]
+fn test_init_missing_dockerfile_exits_one_with_path() {
+    // A Dockerfile that does not exist is a hard error surfaced by the
+    // top-level handler: exit 1, and the offending path named on stderr so
+    // the user knows which file was not found.
+    let temp = tempdir().unwrap();
+    let missing = temp.path().join("nope.Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            missing.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error:"))
+        .stderr(predicates::str::contains("nope.Dockerfile"));
+
+    // No output is produced when the input never parsed.
+    assert!(!output_dir.join("goss.yml").exists());
+}
+
+#[test]
+fn test_init_unknown_profile_exits_one_with_diagnostic() {
+    // An unknown --profile value is rejected with exit 1 and a diagnostic
+    // naming the bad value, rather than silently falling back to a default.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE 8080\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "--profile",
+            "bogus",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("unknown profile"))
+        .stderr(predicates::str::contains("bogus"));
+}
+
+#[test]
 fn test_init_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
@@ -95,6 +145,79 @@ fn test_lint_missing_explicit_wait_file_fails_loudly() {
         .code(1)
         .stderr(predicates::str::contains(
             missing_wait.file_name().unwrap().to_str().unwrap(),
+        ));
+}
+
+#[test]
+fn test_lint_flaky_file_exits_two_with_all_findings() {
+    // A file with more than three process assertions and a timeout-less
+    // command trips two flake rules. Lint reports both on stdout and exits 2.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(
+        &goss,
+        "process:\n  a: {}\n  b: {}\n  c: {}\n  d: {}\ncommand:\n  check:\n    exec: curl localhost\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains(
+            "Many process assertions (>3) increase flake risk",
+        ))
+        .stdout(predicates::str::contains(
+            "Command 'check' has no timeout (may hang)",
+        ))
+        // The leading count is colour-styled, so assert only the unstyled tail;
+        // the count itself is pinned by the two findings above plus .code(2).
+        .stdout(predicates::str::contains("issue(s) found."));
+}
+
+#[test]
+fn test_lint_clean_file_exits_zero() {
+    // A file with no flake triggers passes: exit 0 and the clean message.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(
+        &goss,
+        "command:\n  check:\n    exec: curl localhost\n    timeout: 10000\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No issues found."));
+}
+
+#[test]
+fn test_lint_auto_detects_adjacent_wait_file() {
+    // With no --wait-file, lint auto-detects a goss_wait.yml sitting next to
+    // the main file and lints it too. A clean main plus a flaky wait file must
+    // surface the wait-file finding (labelled goss_wait.yml) and exit 2.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    let wait = temp.path().join("goss_wait.yml");
+    fs::write(
+        &goss,
+        "command:\n  ready:\n    exec: true\n    timeout: 5000\n",
+    )
+    .unwrap();
+    fs::write(&wait, "command:\n  wait:\n    exec: curl localhost\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains("[goss_wait.yml]"))
+        .stdout(predicates::str::contains(
+            "Command 'wait' has no timeout (may hang)",
         ));
 }
 
@@ -369,4 +492,27 @@ fn test_init_secret_build_arg_from_custom_pattern_never_reaches_output() {
     assert!(fs::read_to_string(output_dir.join("goss_wait.yml"))
         .unwrap()
         .contains("8080"));
+}
+
+#[test]
+fn test_explain_prints_derivation_report_for_nginx_fixture() {
+    // The explain subcommand had no end-to-end coverage. Run it on the checked-in
+    // nginx fixture and pin the stable derivation lines: the base image and the
+    // type/description for the EXPOSE ports, the CMD process, and the HEALTHCHECK.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nginx.Dockerfile"
+    );
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["explain", "-f", fixture])
+        .assert()
+        .success()
+        // "Base image:" is colour-styled; the image value itself is unstyled,
+        // so match that to stay robust when colour output is forced.
+        .stdout(predicates::str::contains("nginx:alpine"))
+        .stdout(predicates::str::contains("Port 80/tcp is listening"))
+        .stdout(predicates::str::contains("Port 443/tcp is listening"))
+        .stdout(predicates::str::contains("Process 'nginx' is running"))
+        .stdout(predicates::str::contains("Healthcheck"));
 }
