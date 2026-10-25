@@ -491,3 +491,24 @@ fn test_init_secret_build_arg_from_custom_pattern_never_reaches_output() {
         .unwrap()
         .contains("8080"));
 }
+
+#[test]
+fn test_explain_prints_derivation_report_for_nginx_fixture() {
+    // The explain subcommand had no end-to-end coverage. Run it on the checked-in
+    // nginx fixture and pin the stable derivation lines: the base image and the
+    // type/description for the EXPOSE ports, the CMD process, and the HEALTHCHECK.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nginx.Dockerfile"
+    );
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .args(["explain", "-f", fixture])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Base image: nginx:alpine"))
+        .stdout(predicates::str::contains("Port 80/tcp is listening"))
+        .stdout(predicates::str::contains("Port 443/tcp is listening"))
+        .stdout(predicates::str::contains("Process 'nginx' is running"))
+        .stdout(predicates::str::contains("Healthcheck"));
+}
