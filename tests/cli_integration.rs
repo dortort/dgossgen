@@ -149,6 +149,77 @@ fn test_lint_missing_explicit_wait_file_fails_loudly() {
 }
 
 #[test]
+fn test_lint_flaky_file_exits_two_with_all_findings() {
+    // A file with more than three process assertions and a timeout-less
+    // command trips two flake rules. Lint reports both on stdout and exits 2.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(
+        &goss,
+        "process:\n  a: {}\n  b: {}\n  c: {}\n  d: {}\ncommand:\n  check:\n    exec: curl localhost\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains(
+            "Many process assertions (>3) increase flake risk",
+        ))
+        .stdout(predicates::str::contains(
+            "Command 'check' has no timeout (may hang)",
+        ))
+        .stdout(predicates::str::contains("2 issue(s) found."));
+}
+
+#[test]
+fn test_lint_clean_file_exits_zero() {
+    // A file with no flake triggers passes: exit 0 and the clean message.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    fs::write(
+        &goss,
+        "command:\n  check:\n    exec: curl localhost\n    timeout: 10000\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No issues found."));
+}
+
+#[test]
+fn test_lint_auto_detects_adjacent_wait_file() {
+    // With no --wait-file, lint auto-detects a goss_wait.yml sitting next to
+    // the main file and lints it too. A clean main plus a flaky wait file must
+    // surface the wait-file finding (labelled goss_wait.yml) and exit 2.
+    let temp = tempdir().unwrap();
+    let goss = temp.path().join("goss.yml");
+    let wait = temp.path().join("goss_wait.yml");
+    fs::write(
+        &goss,
+        "command:\n  ready:\n    exec: true\n    timeout: 5000\n",
+    )
+    .unwrap();
+    fs::write(&wait, "command:\n  wait:\n    exec: curl localhost\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .arg("lint")
+        .arg(goss.to_str().unwrap())
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains("[goss_wait.yml]"))
+        .stdout(predicates::str::contains(
+            "Command 'wait' has no timeout (may hang)",
+        ));
+}
+
+#[test]
 fn test_init_confidence_skips_are_notes_exit_zero() {
     // Under the default `standard` profile, package installs are filtered by
     // confidence. That is routine, so the run must exit 0 with the skips
