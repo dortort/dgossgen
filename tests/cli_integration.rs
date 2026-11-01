@@ -50,6 +50,44 @@ fn test_init_wait_only_contract_exits_zero() {
 }
 
 #[test]
+fn test_init_primary_port_selects_wait_gate() {
+    // A Dockerfile exposing two ports normally gates readiness on both. Passing
+    // --primary-port must narrow the goss_wait.yml gate to that one service
+    // port (regression guard for #21: the flag previously fed only the health
+    // URL and never the wait gate).
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(&dockerfile, "FROM alpine\nEXPOSE 8080\nEXPOSE 9090\n").unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+            "--primary-port",
+            "9090",
+        ])
+        .assert()
+        .success();
+
+    let wait = fs::read_to_string(output_dir.join("goss_wait.yml"))
+        .expect("the port signal should produce a readiness gate");
+    assert!(
+        wait.contains("tcp:9090"),
+        "the wait gate must be on the primary port 9090: {wait}"
+    );
+    assert!(
+        !wait.contains("8080"),
+        "the non-primary port must not gate readiness: {wait}"
+    );
+}
+
+#[test]
 fn test_init_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
