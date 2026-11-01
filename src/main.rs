@@ -117,7 +117,8 @@ struct CommonArgs {
     #[arg(long)]
     strict_warnings: bool,
 
-    /// Override primary service port
+    /// Override the primary service port. Selects the port the readiness gate
+    /// (goss_wait.yml) waits on, and the port used for the health-check URL.
     #[arg(long)]
     primary_port: Option<u16>,
 
@@ -355,8 +356,15 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             );
         }
 
-        // Generate
-        let output = generator::generate(&contract, profile, &policy, force_wait);
+        // Generate. The primary port (explicit flag, else the interactive
+        // selection) narrows the readiness gate to that service port.
+        let output = generator::generate(
+            &contract,
+            profile,
+            &policy,
+            force_wait,
+            common.primary_port.or(session.primary_port),
+        );
 
         // Preview and confirm
         match interactive::preview_and_confirm(&output)? {
@@ -383,7 +391,8 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         apply_cli_health_path(&mut contract, &common);
 
         // Non-interactive generation
-        let output = generator::generate(&contract, profile, &policy, force_wait);
+        let output =
+            generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
         emit_output(&common.output_dir, &output, common.strict_warnings)?
     };
 
@@ -449,7 +458,7 @@ fn cmd_probe(
     // Generate
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
-    let output = generator::generate(&contract, profile, &policy, force_wait);
+    let output = generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
     emit_output(&common.output_dir, &output, common.strict_warnings)
 }
 

@@ -39,7 +39,13 @@ fn test_nginx_contract_extraction() {
 fn test_nginx_generates_wait_file() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     assert!(
         output.goss_wait_yml.is_some(),
@@ -60,7 +66,13 @@ fn test_nginx_generates_wait_file() {
 fn test_nginx_goss_yml_content() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     let yml = &output.goss_yml;
     assert!(yml.contains("file:"), "should have file assertions");
@@ -107,7 +119,13 @@ fn test_node_multistage_user_assertion() {
 fn test_node_generates_wait_for_single_port() {
     let df = parser::parse_dockerfile(&fixture_path("node_multistage.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     // With exactly one exposed port, should auto-generate wait
     assert!(
@@ -242,7 +260,13 @@ fn test_healthcheck_unknown_flag_not_in_wait_file() {
     let df =
         parser::parse_dockerfile(&fixture_path("healthcheck_start_interval.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     let wait = output
         .goss_wait_yml
@@ -281,10 +305,20 @@ fn test_minimal_profile_skips_low_confidence() {
     let df = parser::parse_dockerfile(&fixture_path("complex_healthcheck.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
 
-    let output_strict =
-        generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
-    let output_minimal =
-        generator::generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
+    let output_strict = generator::generate(
+        &contract,
+        Profile::Strict,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
+    let output_minimal = generator::generate(
+        &contract,
+        Profile::Minimal,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     // Strict profile should include more assertions (or equal) than minimal
     let strict_lines = output_strict.goss_yml.lines().count();
@@ -305,8 +339,8 @@ fn test_generation_is_idempotent() {
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let policy = PolicyConfig::default();
 
-    let output1 = generator::generate(&contract, Profile::Standard, &policy, None);
-    let output2 = generator::generate(&contract, Profile::Standard, &policy, None);
+    let output1 = generator::generate(&contract, Profile::Standard, &policy, None, None);
+    let output2 = generator::generate(&contract, Profile::Standard, &policy, None, None);
 
     assert_eq!(
         output1.goss_yml, output2.goss_yml,
@@ -326,7 +360,7 @@ fn test_output_has_stable_ordering() {
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
     let policy = PolicyConfig::default();
 
-    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None, None);
     let yml = &output.goss_yml;
 
     // Port assertions are partitioned into the wait file, so the main goss.yml
@@ -374,6 +408,7 @@ fn test_no_wait_flag() {
         Profile::Standard,
         &PolicyConfig::default(),
         Some(false),
+        None,
     );
 
     assert!(
@@ -391,6 +426,7 @@ fn test_force_wait_flag() {
         Profile::Standard,
         &PolicyConfig::default(),
         Some(true),
+        None,
     );
 
     assert!(
@@ -459,7 +495,13 @@ fn test_php_composer_apt_packages_detected() {
 fn test_php_composer_goss_output() {
     let df = parser::parse_dockerfile(&fixture_path("php_composer.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Strict,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     let yml = &output.goss_yml;
     assert!(
@@ -518,7 +560,13 @@ RUN apt-get update && \\\n\
     apt-get install -y jq\n";
     let df = parser::parse_dockerfile_content(content).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Strict,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     let yml = &output.goss_yml;
     assert!(
@@ -555,7 +603,13 @@ fn test_cmd_before_entrypoint_process_names_entrypoint_binary() {
     );
 
     // Rendered output: the process section names `server`, never `--port`.
-    let output = generator::generate(&contract, Profile::Strict, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Strict,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
     let yml = &output.goss_yml;
     assert!(
         yml.contains("process:") && yml.contains("server"),
@@ -593,7 +647,13 @@ fn test_variable_port_contract_resolves_exposed_port() {
 fn test_variable_port_generates_single_port_wait_file() {
     let df = parser::parse_dockerfile(&fixture_path("variable_port.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     // The single-port wait-file auto-generation heuristic must still fire once the
     // variable EXPOSE resolves to exactly one port.
@@ -656,7 +716,7 @@ EXPOSE 8080
         ("API_TOKEN".to_string(), "4242".to_string()),
     ];
     let contract = extractor::extract_contract(&df, None, &build_args, &policy);
-    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None, None);
 
     let haystack = generated_text(&contract, &output);
     for secret in ["s3cr3tvalue", "4242"] {
@@ -699,7 +759,7 @@ EXPOSE $AUTH_PORT
     let df = parser::parse_dockerfile_content(content).unwrap();
     let policy = PolicyConfig::default();
     let contract = extractor::extract_contract(&df, None, &[], &policy);
-    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None, None);
 
     assert!(
         output.goss_yml.contains("/opt/keycloak"),
@@ -720,7 +780,7 @@ fn test_secret_named_build_arg_port_is_dropped_with_warning() {
     let policy = PolicyConfig::default();
     let build_args = vec![("AUTH_PORT".to_string(), "8080".to_string())];
     let contract = extractor::extract_contract(&df, None, &build_args, &policy);
-    let output = generator::generate(&contract, Profile::Standard, &policy, None);
+    let output = generator::generate(&contract, Profile::Standard, &policy, None, None);
 
     assert!(!generated_text(&contract, &output).contains("8080"));
     assert!(output
@@ -814,7 +874,13 @@ fn test_heredoc_copy_body_does_not_fabricate_assertions() {
 fn test_heredoc_end_to_end_output_has_no_phantom_user() {
     let df = parser::parse_dockerfile(&fixture_path("heredoc.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     // Real evidence survives to the generated file...
     assert!(
@@ -871,7 +937,13 @@ EXPOSE 80
 fn test_output_is_parseable_yaml() {
     let df = parser::parse_dockerfile(&fixture_path("nginx.Dockerfile")).unwrap();
     let contract = extractor::extract_contract(&df, None, &[], &PolicyConfig::default());
-    let output = generator::generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+    let output = generator::generate(
+        &contract,
+        Profile::Standard,
+        &PolicyConfig::default(),
+        None,
+        None,
+    );
 
     let parsed: Result<serde_json::Value, _> = serde_saphyr::from_str(&output.goss_yml);
     assert!(parsed.is_ok(), "generated goss.yml should be valid YAML");

@@ -29,6 +29,7 @@ pub fn generate(
     profile: Profile,
     policy: &PolicyConfig,
     force_wait: Option<bool>,
+    primary_port: Option<u16>,
 ) -> GeneratorOutput {
     let min_confidence = match profile {
         Profile::Minimal => Confidence::High,
@@ -46,6 +47,30 @@ pub fn generate(
         .assertions
         .iter()
         .partition(|a| is_wait_assertion(a));
+
+    // When the user names a primary service port with `--primary-port`, the
+    // readiness gate should wait on *that* port rather than every exposed port.
+    // Narrow the `PortListening` wait assertions to the primary port, but only
+    // when that port is actually among them: a port the Dockerfile never
+    // exposes has no readiness signal, so we honor nothing silently rather than
+    // inventing a gate. Non-port wait assertions (healthcheck, process) are
+    // always kept.
+    let wait_assertions: Vec<&ContractAssertion> = match primary_port {
+        Some(p)
+            if wait_assertions.iter().any(
+                |a| matches!(a.kind, AssertionKind::PortListening { port, .. } if port == p),
+            ) =>
+        {
+            wait_assertions
+                .into_iter()
+                .filter(|a| match a.kind {
+                    AssertionKind::PortListening { port, .. } => port == p,
+                    _ => true,
+                })
+                .collect()
+        }
+        _ => wait_assertions,
+    };
 
     // Determine if we should generate goss_wait.yml
     let should_generate_wait = match force_wait {
@@ -69,8 +94,14 @@ pub fn generate(
             &mut notes,
         );
         if wait_resources.is_empty() {
-            // Generate minimal viable wait from port check
-            if let Some(port) = contract.exposed_ports.first() {
+            // Generate minimal viable wait from a port check. Prefer the primary
+            // port when the user named one and it is exposed, so the gate matches
+            // the service the user cares about; otherwise fall back to the first
+            // exposed port.
+            let gate_port = primary_port
+                .and_then(|p| contract.exposed_ports.iter().find(|ep| ep.port == p))
+                .or_else(|| contract.exposed_ports.first());
+            if let Some(port) = gate_port {
                 let minimal_wait = render_goss_wait_minimal(port.port, &port.protocol);
                 Some(minimal_wait)
             } else {
@@ -581,7 +612,13 @@ CMD ["node", "server.js"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(!output.goss_yml.is_empty());
         assert!(output.goss_yml.contains("file:"));
@@ -597,7 +634,13 @@ HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost/ || exit 1
 "#;
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(output.goss_wait_yml.is_some());
         let wait = output.goss_wait_yml.unwrap();
@@ -617,9 +660,109 @@ EXPOSE 80
             Profile::Standard,
             &PolicyConfig::default(),
             Some(false),
+            None,
         );
 
         assert!(output.goss_wait_yml.is_none());
+    }
+
+    #[test]
+    fn test_primary_port_narrows_wait_gate_to_named_port() {
+        // A Dockerfile exposing two ports yields a readiness gate on both. When
+        // the user names one with --primary-port, the gate must narrow to that
+        // port so dgoss waits on the service the user cares about.
+        let content = "FROM alpine\nEXPOSE 8080\nEXPOSE 9090\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        // Baseline: without a primary port, both ports gate.
+        let both = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
+        let both_wait = both.goss_wait_yml.expect("a wait file is generated");
+        assert!(
+            both_wait.contains("tcp:8080"),
+            "baseline gates 8080: {both_wait}"
+        );
+        assert!(
+            both_wait.contains("tcp:9090"),
+            "baseline gates 9090: {both_wait}"
+        );
+
+        // With --primary-port 9090, only 9090 gates.
+        let narrowed = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            Some(9090),
+        );
+        let wait = narrowed.goss_wait_yml.expect("a wait file is generated");
+        assert!(wait.contains("tcp:9090"), "gate must be on 9090: {wait}");
+        assert!(
+            !wait.contains("8080"),
+            "the non-primary port must not gate: {wait}"
+        );
+    }
+
+    #[test]
+    fn test_primary_port_selects_minimal_wait_gate_port() {
+        // Under the minimal profile the Medium-confidence EXPOSE assertions are
+        // filtered out, so the gate falls back to a minimal port check. The
+        // primary port must drive that fallback too, not the first exposed port.
+        let content = "FROM alpine\nEXPOSE 8080\nEXPOSE 9090\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let output = generate(
+            &contract,
+            Profile::Minimal,
+            &PolicyConfig::default(),
+            None,
+            Some(9090),
+        );
+        let wait = output
+            .goss_wait_yml
+            .expect("a minimal wait file is generated");
+        assert!(
+            wait.contains("tcp:9090"),
+            "minimal gate must be on 9090: {wait}"
+        );
+        assert!(
+            !wait.contains("8080"),
+            "the first exposed port must not win over the primary: {wait}"
+        );
+    }
+
+    #[test]
+    fn test_primary_port_not_exposed_leaves_gate_unchanged() {
+        // A primary port the Dockerfile never exposes has no readiness signal:
+        // honor nothing silently rather than inventing a gate, so the existing
+        // exposed port still gates.
+        let content = "FROM alpine\nEXPOSE 8080\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            Some(9090),
+        );
+        let wait = output.goss_wait_yml.expect("a wait file is generated");
+        assert!(
+            wait.contains("tcp:8080"),
+            "the exposed port still gates when the primary is absent: {wait}"
+        );
+        assert!(
+            !wait.contains("9090"),
+            "an unexposed primary port must not be invented: {wait}"
+        );
     }
 
     #[test]
@@ -647,7 +790,13 @@ RUN apt-get install -y nginx curl git
 "#;
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(
             !output.notes.is_empty(),
@@ -675,7 +824,13 @@ RUN apt-get install -y nginx curl git
         let content = "FROM alpine:3.19\nRUN echo hello\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert_eq!(output.warnings.len(), 1, "expected one anomaly warning");
         let w = &output.warnings[0];
@@ -695,7 +850,13 @@ RUN apt-get install -y nginx curl git
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
         // Minimal profile => High cutoff => the Low-confidence package is filtered.
-        let output = generate(&contract, Profile::Minimal, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Minimal,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert_eq!(output.warnings.len(), 1, "expected one anomaly warning");
         let w = &output.warnings[0];
@@ -713,7 +874,13 @@ RUN apt-get install -y nginx curl git
         let content = "FROM nginx\nEXPOSE 80\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(
             output.goss_wait_yml.is_some(),
@@ -734,7 +901,13 @@ RUN apt-get install -y nginx curl git
             "FROM alpine\nHEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(output.goss_wait_yml.is_some());
         assert!(
@@ -771,6 +944,7 @@ RUN apt-get install -y nginx curl git
             Profile::Standard,
             &PolicyConfig::default(),
             Some(false),
+            None,
         );
 
         assert_eq!(output.warnings.len(), 1, "policy-emptied run should warn");
@@ -809,6 +983,7 @@ RUN apt-get install -y nginx curl git
             Profile::Standard,
             &PolicyConfig::default(),
             Some(false),
+            None,
         );
 
         assert!(
@@ -837,7 +1012,13 @@ CMD ["nginx", "-g", "daemon off;"]
 "#;
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
-        let output = generate(&contract, Profile::Standard, &PolicyConfig::default(), None);
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            None,
+        );
 
         assert!(
             output.warnings.is_empty(),
