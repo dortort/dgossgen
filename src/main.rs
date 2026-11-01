@@ -356,15 +356,14 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             );
         }
 
-        // Generate. The primary port (explicit flag, else the interactive
-        // selection) narrows the readiness gate to that service port.
-        let output = generator::generate(
-            &contract,
-            profile,
-            &policy,
-            force_wait,
-            common.primary_port.or(session.primary_port),
-        );
+        // Generate. Only the explicit `--primary-port` flag narrows the
+        // readiness gate: its gate is user intent that overrides confidence and
+        // the ports policy. `session.primary_port` is an interactive inference
+        // (auto-set for a single EXPOSE without a prompt), so it must not be
+        // treated as an explicit override here — it still drives the health URL
+        // above. This keeps the interactive and non-interactive paths identical.
+        let output =
+            generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
 
         // Preview and confirm
         match interactive::preview_and_confirm(&output)? {
