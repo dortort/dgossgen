@@ -70,22 +70,6 @@ pub fn generate(
             .map(|protocol| (p, protocol))
     });
 
-    // Narrow the port readiness gate to that single service port. Non-port wait
-    // assertions (healthcheck, process) are always kept.
-    let wait_assertions: Vec<&ContractAssertion> = match &primary_gate {
-        Some((port, protocol)) => wait_assertions
-            .into_iter()
-            .filter(|a| match &a.kind {
-                AssertionKind::PortListening {
-                    protocol: p,
-                    port: n,
-                } => n == port && p == protocol,
-                _ => true,
-            })
-            .collect(),
-        None => wait_assertions,
-    };
-
     // Determine if we should generate goss_wait.yml
     let should_generate_wait = match force_wait {
         Some(true) => true,
@@ -100,33 +84,53 @@ pub fn generate(
 
     // Build goss_wait.yml
     let goss_wait_yml = if should_generate_wait {
-        let wait_resources = build_wait_resources(
-            &wait_assertions,
-            contract,
-            min_confidence,
-            policy,
-            &mut notes,
-        );
+        let wait_resources = if let Some((port, protocol)) = &primary_gate {
+            // Narrow the port readiness gate to the single named service port:
+            // drop every `PortListening` signal from the confidence-filtered
+            // build (other ports should not gate), then add the primary port
+            // back explicitly. An explicit `--primary-port` is user intent, so
+            // its gate is unconditional — it bypasses confidence filtering and
+            // the ports policy (mirroring how `--health-path` overrides the
+            // http-checks policy) and is added independently of any other
+            // readiness resource, so a HEALTHCHECK command or an ENTRYPOINT
+            // process check can never mask it. Non-port wait assertions are kept.
+            let build_assertions: Vec<&ContractAssertion> = wait_assertions
+                .iter()
+                .copied()
+                .filter(|a| !matches!(a.kind, AssertionKind::PortListening { .. }))
+                .collect();
+            let mut resources = build_wait_resources(
+                &build_assertions,
+                contract,
+                min_confidence,
+                policy,
+                &mut notes,
+            );
+            resources.push(GossResource::Port {
+                address: format!("{protocol}:{port}"),
+                listening: true,
+                provenance: "CLI: --primary-port".to_string(),
+                confidence: Confidence::High,
+            });
+            resources
+        } else {
+            build_wait_resources(
+                &wait_assertions,
+                contract,
+                min_confidence,
+                policy,
+                &mut notes,
+            )
+        };
         if wait_resources.is_empty() {
-            // Generate a minimal viable wait from a single port check. Prefer the
-            // resolved primary gate (same port and protocol the resource path
-            // uses, so the two paths never disagree), otherwise fall back to the
-            // first exposed port, preserving pre-flag behavior.
-            let gate = primary_gate
-                .as_ref()
-                .map(|(port, protocol)| (*port, protocol.as_str()))
-                .or_else(|| {
-                    contract
-                        .exposed_ports
-                        .first()
-                        .map(|ep| (ep.port, ep.protocol.as_str()))
-                });
-            if let Some((port, protocol)) = gate {
-                let minimal_wait = render_goss_wait_minimal(port, protocol);
-                Some(minimal_wait)
-            } else {
-                None
-            }
+            // Generate a minimal viable wait from the first exposed port. Only
+            // reached without a primary gate (an explicit primary port always
+            // produces a non-empty resource set above), preserving pre-flag
+            // behavior.
+            contract
+                .exposed_ports
+                .first()
+                .map(|ep| render_goss_wait_minimal(ep.port, &ep.protocol))
         } else {
             Some(render_goss_wait(&wait_resources))
         }
@@ -816,6 +820,62 @@ EXPOSE 80
         assert!(
             !wait.contains("tcp:8080"),
             "the first exposed port must not win over the primary: {wait}"
+        );
+    }
+
+    #[test]
+    fn test_primary_port_survives_when_a_process_check_fills_the_wait_file() {
+        // Minimal profile filters the Medium-confidence EXPOSE ports out of the
+        // wait resources, and a non-shell ENTRYPOINT then supplies a process
+        // readiness check — so the wait file is non-empty without any port. An
+        // explicit --primary-port must still gate on its port, or readiness
+        // could pass before the service listens (regression guard for a Codex
+        // review finding on #70).
+        let content = "FROM alpine\nEXPOSE 8080\nEXPOSE 9090\nENTRYPOINT [\"server\"]\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let output = generate(
+            &contract,
+            Profile::Minimal,
+            &PolicyConfig::default(),
+            None,
+            Some(9090),
+        );
+        let wait = output.goss_wait_yml.expect("a wait file is generated");
+        assert!(
+            wait.contains("process:") && wait.contains("server"),
+            "the process readiness check is still present: {wait}"
+        );
+        assert!(
+            wait.contains("tcp:9090"),
+            "the explicit primary port must gate even when a process check exists: {wait}"
+        );
+        assert!(
+            !wait.contains("tcp:8080"),
+            "the non-primary port must not gate: {wait}"
+        );
+    }
+
+    #[test]
+    fn test_primary_port_gate_bypasses_disabled_ports_policy() {
+        // An explicit --primary-port is user intent and overrides a policy that
+        // disables port assertions, just as --health-path overrides http_checks.
+        let content = "FROM alpine\nEXPOSE 9090\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+        let policy = PolicyConfig {
+            assert_ports: crate::config::AssertionPolicy::Off,
+            ..PolicyConfig::default()
+        };
+
+        let output = generate(&contract, Profile::Standard, &policy, None, Some(9090));
+        let wait = output
+            .goss_wait_yml
+            .expect("an explicit primary port still produces a gate");
+        assert!(
+            wait.contains("tcp:9090"),
+            "the explicit primary port gates despite assert_ports=false: {wait}"
         );
     }
 
