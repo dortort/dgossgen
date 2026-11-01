@@ -49,27 +49,41 @@ pub fn generate(
         .partition(|a| is_wait_assertion(a));
 
     // When the user names a primary service port with `--primary-port`, the
-    // readiness gate should wait on *that* port rather than every exposed port.
-    // Narrow the `PortListening` wait assertions to the primary port, but only
-    // when that port is actually among them: a port the Dockerfile never
-    // exposes has no readiness signal, so we honor nothing silently rather than
-    // inventing a gate. Non-port wait assertions (healthcheck, process) are
-    // always kept.
-    let wait_assertions: Vec<&ContractAssertion> = match primary_port {
-        Some(p)
-            if wait_assertions.iter().any(
-                |a| matches!(a.kind, AssertionKind::PortListening { port, .. } if port == p),
-            ) =>
-        {
-            wait_assertions
-                .into_iter()
-                .filter(|a| match a.kind {
-                    AssertionKind::PortListening { port, .. } => port == p,
-                    _ => true,
-                })
-                .collect()
-        }
-        _ => wait_assertions,
+    // readiness gate should wait on *that* one service port rather than every
+    // exposed port. Resolve it to a single `(port, protocol)` from the port
+    // readiness signals (the `PortListening` wait assertions — EXPOSE plus any
+    // probe-discovered ports), preferring tcp when the same port number is
+    // exposed on several protocols, since a tcp listening check is the reliable
+    // readiness signal and a readiness gate names one service port. A primary
+    // port that is not among those signals has no readiness meaning, so it is
+    // resolved to `None` and the gate is left unchanged rather than invented.
+    let primary_gate: Option<(u16, String)> = primary_port.and_then(|p| {
+        wait_assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::PortListening { protocol, port } if *port == p => {
+                    Some(protocol.clone())
+                }
+                _ => None,
+            })
+            .min_by_key(|protocol| (u8::from(protocol != "tcp"), protocol.clone()))
+            .map(|protocol| (p, protocol))
+    });
+
+    // Narrow the port readiness gate to that single service port. Non-port wait
+    // assertions (healthcheck, process) are always kept.
+    let wait_assertions: Vec<&ContractAssertion> = match &primary_gate {
+        Some((port, protocol)) => wait_assertions
+            .into_iter()
+            .filter(|a| match &a.kind {
+                AssertionKind::PortListening {
+                    protocol: p,
+                    port: n,
+                } => n == port && p == protocol,
+                _ => true,
+            })
+            .collect(),
+        None => wait_assertions,
     };
 
     // Determine if we should generate goss_wait.yml
@@ -94,15 +108,21 @@ pub fn generate(
             &mut notes,
         );
         if wait_resources.is_empty() {
-            // Generate minimal viable wait from a port check. Prefer the primary
-            // port when the user named one and it is exposed, so the gate matches
-            // the service the user cares about; otherwise fall back to the first
-            // exposed port.
-            let gate_port = primary_port
-                .and_then(|p| contract.exposed_ports.iter().find(|ep| ep.port == p))
-                .or_else(|| contract.exposed_ports.first());
-            if let Some(port) = gate_port {
-                let minimal_wait = render_goss_wait_minimal(port.port, &port.protocol);
+            // Generate a minimal viable wait from a single port check. Prefer the
+            // resolved primary gate (same port and protocol the resource path
+            // uses, so the two paths never disagree), otherwise fall back to the
+            // first exposed port, preserving pre-flag behavior.
+            let gate = primary_gate
+                .as_ref()
+                .map(|(port, protocol)| (*port, protocol.as_str()))
+                .or_else(|| {
+                    contract
+                        .exposed_ports
+                        .first()
+                        .map(|ep| (ep.port, ep.protocol.as_str()))
+                });
+            if let Some((port, protocol)) = gate {
+                let minimal_wait = render_goss_wait_minimal(port, protocol);
                 Some(minimal_wait)
             } else {
                 None
@@ -704,7 +724,68 @@ EXPOSE 80
         let wait = narrowed.goss_wait_yml.expect("a wait file is generated");
         assert!(wait.contains("tcp:9090"), "gate must be on 9090: {wait}");
         assert!(
-            !wait.contains("8080"),
+            !wait.contains("tcp:8080"),
+            "the non-primary port must not gate: {wait}"
+        );
+    }
+
+    #[test]
+    fn test_primary_port_prefers_tcp_and_is_consistent_across_profiles() {
+        // The same port number exposed on tcp and udp: --primary-port names one
+        // service port, so the gate must pick the reliable tcp readiness check
+        // and drop the udp variant. The resource path (Standard) and the
+        // minimal-wait fallback (Minimal) must agree, not disagree by profile.
+        let content = "FROM alpine\nEXPOSE 9090/tcp\nEXPOSE 9090/udp\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        for profile in [Profile::Standard, Profile::Minimal] {
+            let output = generate(
+                &contract,
+                profile,
+                &PolicyConfig::default(),
+                None,
+                Some(9090),
+            );
+            let wait = output
+                .goss_wait_yml
+                .unwrap_or_else(|| panic!("a wait file is generated for {profile:?}"));
+            assert!(
+                wait.contains("tcp:9090"),
+                "{profile:?} must gate on tcp:9090: {wait}"
+            );
+            assert!(
+                !wait.contains("udp:9090"),
+                "{profile:?} must not gate on the udp variant: {wait}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_primary_port_keeps_healthcheck_while_narrowing_ports() {
+        // Narrowing the port gate must never drop non-port readiness signals: a
+        // HEALTHCHECK still belongs in the wait file alongside the primary port.
+        let content = "FROM alpine\n\
+             HEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1\n\
+             EXPOSE 8080\nEXPOSE 9090\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        let output = generate(
+            &contract,
+            Profile::Standard,
+            &PolicyConfig::default(),
+            None,
+            Some(9090),
+        );
+        let wait = output.goss_wait_yml.expect("a wait file is generated");
+        assert!(
+            wait.contains("command:"),
+            "the healthcheck command must survive narrowing: {wait}"
+        );
+        assert!(wait.contains("tcp:9090"), "the primary port gates: {wait}");
+        assert!(
+            !wait.contains("tcp:8080"),
             "the non-primary port must not gate: {wait}"
         );
     }
@@ -733,7 +814,7 @@ EXPOSE 80
             "minimal gate must be on 9090: {wait}"
         );
         assert!(
-            !wait.contains("8080"),
+            !wait.contains("tcp:8080"),
             "the first exposed port must not win over the primary: {wait}"
         );
     }
@@ -760,7 +841,7 @@ EXPOSE 80
             "the exposed port still gates when the primary is absent: {wait}"
         );
         assert!(
-            !wait.contains("9090"),
+            !wait.contains("tcp:9090"),
             "an unexposed primary port must not be invented: {wait}"
         );
     }

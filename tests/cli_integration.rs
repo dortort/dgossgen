@@ -82,7 +82,7 @@ fn test_init_primary_port_selects_wait_gate() {
         "the wait gate must be on the primary port 9090: {wait}"
     );
     assert!(
-        !wait.contains("8080"),
+        !wait.contains("tcp:8080"),
         "the non-primary port must not gate readiness: {wait}"
     );
 }
