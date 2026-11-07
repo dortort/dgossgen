@@ -182,32 +182,49 @@ static BUILTIN_RULES: LazyLock<Vec<ServiceRule>> = LazyLock::new(|| {
 /// Merge user-configured `service_patterns` over the built-in rules to form the
 /// effective rule set for one extraction.
 ///
-/// A user row whose `name` matches a built-in **replaces** that service's
-/// generated assertions (reusing the built-in detection regex); a new name is
-/// appended and detected by its own name as a whole word. User-configured
-/// services are deliberate, trusted configuration, so they carry Medium
-/// confidence and thus survive the default `standard` profile's filter — a
-/// configured pattern that produced only filtered-out Low assertions would be
-/// the very silent no-op this wiring exists to remove.
+/// A user row whose `name` matches a built-in (compared case-insensitively on
+/// the trimmed name, since built-in names and the scanned command are both
+/// lowercased) **replaces** that service's generated assertions, reusing the
+/// built-in detection regex; a new name is appended and detected by its own
+/// name as a whole token. User-configured services are deliberate, trusted
+/// configuration, so they carry Medium confidence and thus survive the default
+/// `standard` profile's filter — a configured pattern that produced only
+/// filtered-out Low assertions would be the very silent no-op this wiring
+/// exists to remove.
+///
+/// Two kinds of unusable rows are dropped rather than turned into rules: a
+/// blank name (whose regex would match every command) and a row carrying no
+/// `process`/`config_path`/`version_cmd` (which would detect a component yet
+/// assert nothing — itself a silent no-op). Dropping an empty-payload override
+/// also leaves the matching built-in intact rather than wiping it.
 pub fn effective_service_rules(user_patterns: &[ServicePattern]) -> Vec<ServiceRule> {
     let mut rules: Vec<ServiceRule> = BUILTIN_RULES.clone();
     for pattern in user_patterns {
-        // A nameless pattern cannot be matched (its `\b\b` regex would match
-        // everything); skip it rather than taint every RUN line.
-        if pattern.name.trim().is_empty() {
+        let name = pattern.name.trim();
+        if name.is_empty() {
             continue;
         }
-        if let Some(existing) = rules.iter_mut().find(|r| r.name == pattern.name) {
+        // A row that asserts nothing would only add a detectable-but-silent
+        // component; skip it (and thus never wipe a built-in via an empty
+        // override).
+        if pattern.process.is_none()
+            && pattern.config_path.is_none()
+            && pattern.version_cmd.is_none()
+        {
+            continue;
+        }
+
+        if let Some(existing) = rules.iter_mut().find(|r| r.name.eq_ignore_ascii_case(name)) {
             existing.config_path = pattern.config_path.clone();
             existing.version_cmd = pattern.version_cmd.clone();
             existing.process = pattern.process.clone();
             existing.confidence = Confidence::Medium;
             if existing.detect.is_none() {
-                existing.detect = Some(word_boundary_regex(&pattern.name));
+                existing.detect = Some(word_boundary_regex(name));
             }
         } else {
-            let mut rule = ServiceRule::new(&pattern.name, None, ComponentKind::Package);
-            rule.detect = Some(word_boundary_regex(&pattern.name));
+            let mut rule = ServiceRule::new(name, None, ComponentKind::Package);
+            rule.detect = Some(word_boundary_regex(name));
             rule.config_path = pattern.config_path.clone();
             rule.version_cmd = pattern.version_cmd.clone();
             rule.process = pattern.process.clone();
@@ -1148,5 +1165,184 @@ mod tests {
         assert!(!detect_components_with(&miss, &rules)
             .iter()
             .any(|c| c.name == "c++"));
+    }
+
+    #[test]
+    fn test_user_pattern_overrides_builtin_case_insensitively() {
+        // A differently-cased or whitespace-padded name must still be recognized
+        // as the built-in it targets and REPLACE it, not add a second rule that
+        // double-fires alongside the built-in.
+        for raw_name in ["Nginx", "  nginx  ", "NGINX"] {
+            let patterns = vec![ServicePattern {
+                name: raw_name.to_string(),
+                process: None,
+                config_path: Some("/custom/nginx.conf".to_string()),
+                version_cmd: None,
+            }];
+            let rules = effective_service_rules(&patterns);
+
+            let cmd = CommandForm::Shell("apt-get install -y nginx".to_string());
+            let components = detect_components_with(&cmd, &rules);
+            let assertions = service_assertions_with(&components, &rules);
+
+            let config_paths: Vec<&str> = assertions
+                .iter()
+                .filter_map(|a| match &a.kind {
+                    AssertionKind::FileExists { path, .. } => Some(path.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                config_paths,
+                vec!["/custom/nginx.conf"],
+                "name '{raw_name}' should override the built-in nginx, not duplicate it"
+            );
+            // The built-in default config and version command are gone.
+            assert!(!assertions
+                .iter()
+                .any(|a| matches!(&a.kind, AssertionKind::CommandExit { .. })));
+        }
+    }
+
+    #[test]
+    fn test_user_pattern_without_payload_is_skipped() {
+        // A row with a name but no process/config/version asserts nothing; it
+        // must not create a detectable-but-silent component, and an empty
+        // override must leave the built-in intact rather than wipe it.
+        let patterns = vec![
+            ServicePattern {
+                name: "ghostsvc".to_string(),
+                process: None,
+                config_path: None,
+                version_cmd: None,
+            },
+            ServicePattern {
+                name: "nginx".to_string(),
+                process: None,
+                config_path: None,
+                version_cmd: None,
+            },
+        ];
+        let rules = effective_service_rules(&patterns);
+
+        // The empty new service never becomes a detectable rule.
+        let cmd = CommandForm::Shell("apt-get install -y ghostsvc nginx".to_string());
+        let components = detect_components_with(&cmd, &rules);
+        assert!(
+            !components.iter().any(|c| c.name == "ghostsvc"),
+            "an empty-payload service must not be detected"
+        );
+
+        // The empty nginx override left the built-in assertions untouched.
+        let assertions = service_assertions_with(&components, &rules);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path == "/etc/nginx/nginx.conf"
+        )));
+    }
+
+    #[test]
+    fn test_builtin_services_assertions_are_preserved_exactly() {
+        // Pins the exact (kind, command, confidence, provenance) output of the
+        // seven services that worked before the table refactor, so a future
+        // change to confidence_for/provenance for any of them cannot silently
+        // alter long-standing output.
+        struct Expect {
+            name: &'static str,
+            kind: ComponentKind,
+            command: &'static str,
+            confidence: Confidence,
+            provenance: &'static str,
+        }
+        let cases = [
+            Expect {
+                name: "apache2",
+                kind: ComponentKind::WebServer,
+                command: "apache2 -v",
+                confidence: Confidence::Medium,
+                provenance: "apache2 service pattern",
+            },
+            Expect {
+                name: "httpd",
+                kind: ComponentKind::WebServer,
+                command: "httpd -v",
+                confidence: Confidence::Medium,
+                provenance: "httpd service pattern",
+            },
+            Expect {
+                name: "python",
+                kind: ComponentKind::Runtime,
+                command: "python3 --version",
+                confidence: Confidence::Low,
+                provenance: "python runtime pattern",
+            },
+            Expect {
+                name: "node",
+                kind: ComponentKind::Runtime,
+                command: "node --version",
+                confidence: Confidence::Low,
+                provenance: "node runtime pattern",
+            },
+            Expect {
+                name: "java",
+                kind: ComponentKind::Runtime,
+                command: "java -version",
+                confidence: Confidence::Low,
+                provenance: "java runtime pattern",
+            },
+            Expect {
+                name: "redis",
+                kind: ComponentKind::Database,
+                command: "redis-cli --version",
+                confidence: Confidence::Medium,
+                provenance: "redis service pattern",
+            },
+        ];
+        for exp in cases {
+            let assertions = builtin_assertions_for(exp.name, exp.kind.clone());
+            assert_eq!(
+                assertions.len(),
+                1,
+                "{} should emit exactly one assertion",
+                exp.name
+            );
+            let a = &assertions[0];
+            assert!(
+                matches!(&a.kind, AssertionKind::CommandExit { command, exit_status: 0 } if command == exp.command),
+                "{} command drifted: {:?}",
+                exp.name,
+                a.kind
+            );
+            assert_eq!(
+                a.confidence, exp.confidence,
+                "{} confidence drifted",
+                exp.name
+            );
+            assert_eq!(
+                a.provenance, exp.provenance,
+                "{} provenance drifted",
+                exp.name
+            );
+        }
+
+        // nginx is the one service with two assertions (config + version), in
+        // that fixed order, both Medium with the service provenance.
+        let nginx = builtin_assertions_for("nginx", ComponentKind::WebServer);
+        assert_eq!(nginx.len(), 2);
+        assert!(matches!(
+            &nginx[0].kind,
+            AssertionKind::FileExists { path, filetype, .. }
+                if path == "/etc/nginx/nginx.conf" && filetype.as_deref() == Some("file")
+        ));
+        assert!(matches!(
+            &nginx[1].kind,
+            AssertionKind::CommandExit { command, exit_status: 0 } if command == "nginx -v"
+        ));
+        assert!(
+            nginx
+                .iter()
+                .all(|a| a.confidence == Confidence::Medium
+                    && a.provenance == "nginx service pattern")
+        );
     }
 }
