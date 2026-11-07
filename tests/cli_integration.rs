@@ -387,7 +387,7 @@ fn test_init_detects_postgres_service_assertion() {
 
     let goss = fs::read_to_string(output_dir.join("goss.yml")).expect("goss.yml should be written");
     assert!(
-        goss.contains("postgres --version"),
+        goss.contains("psql --version"),
         "a detected postgres component must emit a version check, got:\n{goss}"
     );
 }

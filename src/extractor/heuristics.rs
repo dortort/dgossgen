@@ -146,12 +146,17 @@ static BUILTIN_RULES: LazyLock<Vec<ServiceRule>> = LazyLock::new(|| {
         ServiceRule::new("redis", Some(r"\bredis\b"), ComponentKind::Database)
             .version("redis-cli --version")
             .packages(&["redis", "redis-server"]),
+        // Use the client tool `psql`, not the `postgres` server binary: the
+        // detection regex also matches `postgresql-client` (which ships no
+        // `postgres` binary), and even a plain `postgresql` server install
+        // usually does not put `postgres` on PATH, while `psql` is present for
+        // both — mirroring redis's use of its `redis-cli` client.
         ServiceRule::new(
             "postgres",
             Some(r"\bpostgres(ql)?\b"),
             ComponentKind::Database,
         )
-        .version("postgres --version")
+        .version("psql --version")
         .packages(&["postgres", "postgresql"]),
         ServiceRule::new("mysql", Some(r"\bmysql\b"), ComponentKind::Database)
             .version("mysql --version")
@@ -954,7 +959,7 @@ mod tests {
         // but historically fell through to zero assertions. Each must now emit
         // its version-command check.
         let cases = [
-            ("postgres", ComponentKind::Database, "postgres --version"),
+            ("postgres", ComponentKind::Database, "psql --version"),
             ("mysql", ComponentKind::Database, "mysql --version"),
             ("php", ComponentKind::Runtime, "php --version"),
             ("ruby", ComponentKind::Runtime, "ruby --version"),
@@ -979,7 +984,7 @@ mod tests {
         // End-to-end through detection: a RUN that installs these services now
         // yields their service assertions, where before it yielded none.
         for (pkg, expected_cmd) in [
-            ("postgresql", "postgres --version"),
+            ("postgresql", "psql --version"),
             ("mysql-server", "mysql --version"),
             ("php", "php --version"),
         ] {
@@ -997,10 +1002,36 @@ mod tests {
     }
 
     #[test]
-    fn test_known_version_cmd_mapping_is_preserved() {
-        // `known_version_cmd` now derives from the unified table; its output must
-        // remain byte-for-byte what the hand-written match returned, including
-        // the package aliases and the deliberate gaps (apache/go/bare-mysql).
+    fn test_postgres_client_only_install_asserts_client_not_server_binary() {
+        // A client-only install (`postgresql-client`) is still detected as the
+        // postgres component, but the asserted command must be one the client
+        // package actually provides: `psql`, never the `postgres` server binary
+        // (which the client package does not ship).
+        let cmd = CommandForm::Shell("apt-get install -y postgresql-client".to_string());
+        let components = detect_installed_components(&cmd);
+        assert!(components.iter().any(|c| c.name == "postgres"));
+        let assertions = generate_service_assertions(&components);
+        assert!(assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::CommandExit { command, .. } if command == "psql --version"
+        )));
+        assert!(
+            !assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::CommandExit { command, .. } if command == "postgres --version"
+            )),
+            "must not assert the server binary for a client-only install"
+        );
+    }
+
+    #[test]
+    fn test_known_version_cmd_mapping() {
+        // `known_version_cmd` now derives from the unified table. Every entry is
+        // byte-for-byte what the hand-written match returned, including the
+        // package aliases and the deliberate gaps (apache/go/bare-mysql). The
+        // sole intentional change is postgres/postgresql, corrected from the
+        // `postgres` server binary to the `psql` client, which is present for
+        // both client and server installs.
         let expected: &[(&str, Option<&str>)] = &[
             ("nginx", Some("nginx -v")),
             ("curl", Some("curl --version")),
@@ -1017,8 +1048,8 @@ mod tests {
             ("php", Some("php --version")),
             ("redis", Some("redis-cli --version")),
             ("redis-server", Some("redis-cli --version")),
-            ("postgres", Some("postgres --version")),
-            ("postgresql", Some("postgres --version")),
+            ("postgres", Some("psql --version")),
+            ("postgresql", Some("psql --version")),
             ("mysql-server", Some("mysql --version")),
             ("vim", Some("vim --version")),
             ("nano", Some("nano --version")),
