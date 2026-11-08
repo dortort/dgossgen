@@ -112,10 +112,10 @@ pub fn extract_contract(
                     current_workdir = new_workdir.clone();
                     contract.workdir = new_workdir.clone();
                     if let Some(path) = new_workdir {
-                        if path == "/" {
+                        if path_is_root(&path) {
                             // Asserting the root directory exists is trivially true and
                             // carries no signal (it often results from an empty expansion
-                            // such as `WORKDIR /$VAR`); skip it.
+                            // such as `WORKDIR /$VAR` or `/$VAR/`); skip it.
                             contract.warnings.push(format!(
                                 "WORKDIR '{dir}' resolves to the root directory; no directory \
                                  assertion generated"
@@ -361,9 +361,9 @@ pub fn extract_contract(
                             }
                         };
 
-                    if full_dest == "/" {
+                    if path_is_root(&full_dest) {
                         // A root destination (often from an empty expansion like
-                        // `COPY x /$VAR`) yields only a trivially-true root assertion.
+                        // `COPY x /$VAR` or `/$VAR/`) yields only a trivially-true assertion.
                         contract.warnings.push(format!(
                             "COPY destination '{dest}' resolves to the root directory; no file \
                              assertion generated"
@@ -455,7 +455,7 @@ pub fn extract_contract(
                             }
                         };
 
-                    if full_dest == "/" {
+                    if path_is_root(&full_dest) {
                         contract.warnings.push(format!(
                             "ADD destination '{dest}' resolves to the root directory; no file \
                              assertion generated"
@@ -780,6 +780,13 @@ fn resolve_dest_path(
 fn is_entrypoint_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.contains("entrypoint") || lower.contains("docker-entrypoint")
+}
+
+/// Whether a path refers to the root directory in any slash-redundant spelling
+/// (`/`, `//`, `///`, …). Such a path, usually the product of an empty variable
+/// expansion like `WORKDIR /$EMPTY/`, yields only a trivially-true assertion.
+fn path_is_root(path: &str) -> bool {
+    !path.is_empty() && path.bytes().all(|b| b == b'/')
 }
 
 #[cfg(test)]
@@ -1616,28 +1623,68 @@ WORKDIR /app/$DIR
 
     #[test]
     fn test_root_only_expansion_is_not_asserted() {
-        // An expansion that leaves only the root path (`/$EMPTY` -> `/`) would be a
-        // trivially-true assertion; WORKDIR and COPY must skip it with a warning.
-        let content = "FROM alpine\nENV DIR=\nWORKDIR /$DIR\nCOPY app /$DIR\n";
+        // An expansion that leaves only the root path — in any slash-redundant
+        // spelling (`/$EMPTY` -> `/`, `/$EMPTY/` -> `//`) — would be a trivially-true
+        // assertion; WORKDIR, COPY and ADD must all skip it with a warning.
+        let content = "FROM alpine\nENV DIR=\nWORKDIR /$DIR/\nCOPY app /$DIR\nADD app.tar /$DIR/\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert!(
             !contract.assertions.iter().any(|a| matches!(
                 &a.kind,
-                AssertionKind::FileExists { path, .. } if path == "/"
+                AssertionKind::FileExists { path, .. } if path_is_root(path)
             )),
             "the root directory must not be asserted: {:?}",
             contract.assertions
         );
+        for needle in [
+            "WORKDIR '/$DIR/'",
+            "COPY destination '/$DIR'",
+            "ADD destination '/$DIR/'",
+        ] {
+            assert!(
+                contract
+                    .warnings
+                    .iter()
+                    .any(|w| w.starts_with(needle) && w.contains("root directory")),
+                "expected a root-directory warning starting {needle:?}, got: {:?}",
+                contract.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_workdir_leaves_working_directory_unchanged() {
+        // A WORKDIR argument that expands to nothing (a known-empty var) leaves the
+        // working directory unchanged (Docker semantics): the prior workdir and its
+        // assertion stand, a following relative COPY resolves against it, and no
+        // bogus `/app/` directory assertion is emitted.
+        let content = "FROM alpine\nWORKDIR /app\nENV DIR=\nWORKDIR $DIR\nCOPY rel.txt there.txt\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+        let paths: Vec<&str> = contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::FileExists { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths.contains(&"/app") && paths.contains(&"/app/there.txt"),
+            "expected /app and /app/there.txt, got: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/app/"),
+            "an empty WORKDIR must not emit a bogus /app/ assertion: {paths:?}"
+        );
         assert!(contract
             .warnings
             .iter()
-            .any(|w| w.starts_with("WORKDIR '/$DIR'") && w.contains("root directory")));
-        assert!(contract
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("COPY destination '/$DIR'") && w.contains("root directory")));
+            .any(|w| w.starts_with("WORKDIR '$DIR'") && w.contains("working directory unchanged")));
     }
 
     #[test]
