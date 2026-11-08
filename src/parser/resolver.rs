@@ -80,8 +80,6 @@ pub struct VariableResolver {
     vars: HashMap<String, String>,
     /// Names locked by a build-arg or ENV, outranking an ARG default (a re-declared one may win).
     locked: HashSet<String>,
-    /// Names set to an unknown value (e.g. `ENV DIR=$MISSING`); resolve unresolved, no defaults.
-    tainted: HashSet<String>,
     /// Names whose value came from a secret-named build-arg, directly or via another binding.
     secret: HashSet<String>,
     /// `--build-arg` values that enter scope only at their global or stage `ARG` declaration.
@@ -145,7 +143,6 @@ impl VariableResolver {
         let (value, secret) = (arg.value.clone(), arg.secret);
         self.bind(name, value, secret);
         self.locked.insert(name.to_string());
-        self.tainted.remove(name);
         true
     }
 
@@ -192,7 +189,6 @@ impl VariableResolver {
     pub fn set_var(&mut self, key: &str, value: &str, secret: bool) {
         self.bind(key, value.to_string(), secret);
         self.locked.insert(key.to_string());
-        self.tainted.remove(key);
     }
 
     fn bind(&mut self, key: &str, value: String, secret: bool) {
@@ -207,17 +203,21 @@ impl VariableResolver {
     /// Remove a binding and its lock/taint; used when an ARG re-declaration was unresolved.
     pub fn unset(&mut self, key: &str) {
         self.locked.remove(key);
-        self.tainted.remove(key);
         self.secret.remove(key);
         self.vars.remove(key);
     }
 
-    /// Mark a var set-but-unknown (unresolvable ENV); locks the name but resolves unresolved.
+    /// Record an ENV whose value could not be resolved (e.g. `ENV DIR=$MISSING`).
+    ///
+    /// Docker evaluates such a reference against an unset variable, which expands
+    /// to nothing, so the assigned variable ends up *set to the empty string* —
+    /// not undefined. We model that by binding it empty and locking it, so later
+    /// references follow Docker's parameter-expansion rules: `$DIR`, `${DIR}` and
+    /// `${DIR-word}` yield the empty string while `${DIR:-word}` falls back to
+    /// `word`. The lock keeps a later same-name `ARG` from overriding it.
     pub fn taint(&mut self, key: &str) {
-        self.vars.remove(key);
-        self.secret.remove(key);
+        self.bind(key, String::new(), false);
         self.locked.insert(key.to_string());
-        self.tainted.insert(key.to_string());
     }
 
     /// Resolve ${VAR} and $VAR references in a string (stage-body scope).
@@ -272,30 +272,47 @@ impl VariableResolver {
 
                 if let Some(end_idx) = close_idx {
                     let var_expr = &input[expr_start..end_idx];
-                    let (var_name, default) = if let Some(sep) = var_expr.find(":-") {
-                        (&var_expr[..sep], Some(&var_expr[sep + 2..]))
+                    // Docker distinguishes `:-` (use the default when the variable is
+                    // unset *or* empty) from `-` (use it only when unset). Track which
+                    // form was written so a set-but-empty variable honours the
+                    // difference instead of being treated as plain unresolved.
+                    let (var_name, default, colon) = if let Some(sep) = var_expr.find(":-") {
+                        (&var_expr[..sep], Some(&var_expr[sep + 2..]), true)
                     } else if let Some(sep) = var_expr.find('-') {
-                        (&var_expr[..sep], Some(&var_expr[sep + 1..]))
+                        (&var_expr[..sep], Some(&var_expr[sep + 1..]), false)
                     } else {
-                        (var_expr, None)
+                        (var_expr, None, false)
                     };
 
-                    if let Some((val, val_secret)) = self.lookup(var_name, global_scope) {
-                        result.push_str(val);
-                        secret |= val_secret;
-                    } else if self.tainted.contains(var_name) {
-                        // Tainted: its dash-default doesn't apply since the name is set.
-                        result.push_str(&input[idx..end_idx + 1]);
-                        unresolved = true;
-                    } else if let Some(def) = default {
-                        // Resolve the default recursively so nested `$OTHER` refs expand too.
-                        let resolved_def = self.resolve_checked_inner(def, global_scope);
-                        result.push_str(&resolved_def.value);
-                        unresolved |= resolved_def.unresolved;
-                        secret |= resolved_def.secret;
-                    } else {
-                        result.push_str(&input[idx..end_idx + 1]);
-                        unresolved = true;
+                    match self.lookup(var_name, global_scope) {
+                        // `${VAR:-default}` with a set-but-empty value uses the default.
+                        Some((val, _)) if colon && val.is_empty() => {
+                            let def = default.unwrap_or("");
+                            // Resolve the default recursively so nested `$OTHER` refs expand too.
+                            let resolved_def = self.resolve_checked_inner(def, global_scope);
+                            result.push_str(&resolved_def.value);
+                            unresolved |= resolved_def.unresolved;
+                            secret |= resolved_def.secret;
+                        }
+                        // Any other set value — non-empty, or empty under a bare ref or
+                        // `-` — is substituted verbatim, exactly as Docker would.
+                        Some((val, val_secret)) => {
+                            result.push_str(val);
+                            secret |= val_secret;
+                        }
+                        None => {
+                            if let Some(def) = default {
+                                // Unset with a default (`-` or `:-`): expand the default.
+                                let resolved_def = self.resolve_checked_inner(def, global_scope);
+                                result.push_str(&resolved_def.value);
+                                unresolved |= resolved_def.unresolved;
+                                secret |= resolved_def.secret;
+                            } else {
+                                // Unset with no default: keep the reference verbatim and flag it.
+                                result.push_str(&input[idx..end_idx + 1]);
+                                unresolved = true;
+                            }
+                        }
                     }
                 } else {
                     // Unterminated `${...}`: preserve the tail literally and flag it as unresolved.
@@ -493,10 +510,11 @@ mod tests {
 
     #[test]
     fn test_escaped_dollar_marker_never_leaks_from_verbatim_unresolved_text() {
-        let mut resolver = VariableResolver::new();
-        resolver.taint("T");
+        let resolver = VariableResolver::new();
+        // Genuinely-unset references are preserved verbatim; the internal
+        // escaped-dollar marker must be restored to a literal `$` in that kept
+        // text rather than leaking the raw noncharacter.
         let cases = [
-            ("${T:-\\$x}", "${T:-$x}"),
             ("${UNSET\\$}", "${UNSET$}"),
             ("/a/${UNTERM\\$x", "/a/${UNTERM$x"),
         ];
@@ -725,18 +743,51 @@ mod tests {
     }
 
     #[test]
-    fn test_tainted_var_reference_is_unresolved_ignoring_default() {
+    fn test_tainted_var_is_set_but_empty() {
         let mut resolver = VariableResolver::new();
         resolver.taint("DIR");
-        // A set-but-unknown var is unresolved for a bare ref and for both default forms.
-        assert!(resolver.resolve_checked("$DIR").unresolved);
-        assert!(resolver.resolve_checked("/srv/${DIR-fallback}").unresolved);
-        assert!(resolver.resolve_checked("/srv/${DIR:-fallback}").unresolved);
-        // A later resolvable binding clears the taint.
+        // Docker leaves an `ENV DIR=$MISSING` variable *set to the empty string*.
+        // A bare reference and a `-` default therefore yield "" (the variable is
+        // set), while a `:-` default falls back because the value is empty. None
+        // of these are unresolved — the value is known to be empty.
+        let bare = resolver.resolve_checked("$DIR");
+        assert_eq!(bare.value, "");
+        assert!(!bare.unresolved);
+
+        let dash = resolver.resolve_checked("/srv/${DIR-fallback}");
+        assert_eq!(dash.value, "/srv/");
+        assert!(!dash.unresolved);
+
+        let colon_dash = resolver.resolve_checked("/srv/${DIR:-fallback}");
+        assert_eq!(colon_dash.value, "/srv/fallback");
+        assert!(!colon_dash.unresolved);
+
+        // A later resolvable binding replaces the empty value.
         resolver.set_var("DIR", "real", false);
-        let resolved = resolver.resolve_checked("/srv/${DIR-fallback}");
-        assert_eq!(resolved.value, "/srv/real");
-        assert!(!resolved.unresolved);
+        let rebound = resolver.resolve_checked("/srv/${DIR-fallback}");
+        assert_eq!(rebound.value, "/srv/real");
+        assert!(!rebound.unresolved);
+    }
+
+    #[test]
+    fn test_literal_empty_env_honours_colon_dash_default() {
+        // A variable explicitly set to the empty string (e.g. `ENV DIR=`) behaves
+        // like a tainted one: `:-` uses the default, `-` and a bare ref give "".
+        let mut resolver = VariableResolver::new();
+        resolver.set_var("DIR", "", false);
+        assert_eq!(resolver.resolve_checked("$DIR").value, "");
+        assert_eq!(resolver.resolve_checked("${DIR-x}").value, "");
+        assert_eq!(resolver.resolve_checked("${DIR:-x}").value, "x");
+        assert!(!resolver.resolve_checked("${DIR:-x}").unresolved);
+    }
+
+    #[test]
+    fn test_colon_dash_default_only_fires_on_empty_not_on_set_value() {
+        // A non-empty value is kept under both `-` and `:-`.
+        let mut resolver = VariableResolver::new();
+        resolver.set_var("DIR", "/real", false);
+        assert_eq!(resolver.resolve_checked("${DIR:-/fallback}").value, "/real");
+        assert_eq!(resolver.resolve_checked("${DIR-/fallback}").value, "/real");
     }
 
     fn resolver_with_secret_build_arg() -> VariableResolver {
