@@ -1,5 +1,5 @@
 use crate::parser::CommandForm;
-use crate::Confidence;
+use crate::{Confidence, FileType};
 
 use super::model::{
     AssertionKind, ComponentKind, ContractAssertion, InstalledComponent, PackageManager,
@@ -180,7 +180,7 @@ pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<Con
                 assertions.push(ContractAssertion::new(
                     AssertionKind::FileExists {
                         path: "/etc/nginx/nginx.conf".to_string(),
-                        filetype: Some("file".to_string()),
+                        filetype: Some(FileType::File),
                         mode: None,
                     },
                     "nginx service pattern",

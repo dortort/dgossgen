@@ -9,7 +9,7 @@ use crate::parser::{
     escape_literal_dollars, CommandForm, Dockerfile, Instruction, PortSpec, Resolution, Stage,
     VariableResolver,
 };
-use crate::Confidence;
+use crate::{Confidence, FileType, Protocol};
 
 /// Maximum number of individual ports expanded from a single `EXPOSE low-high`
 /// range. Wider ranges are dropped with a warning rather than exploded into
@@ -105,7 +105,7 @@ pub fn extract_contract(
                         contract.assertions.push(ContractAssertion::new(
                             AssertionKind::FileExists {
                                 path,
-                                filetype: Some("directory".to_string()),
+                                filetype: Some(FileType::Directory),
                                 mode: None,
                             },
                             format!("WORKDIR {}", dir),
@@ -167,7 +167,7 @@ pub fn extract_contract(
                             contract.exposed_ports.push(port_spec.clone());
                             contract.assertions.push(ContractAssertion::new(
                                 AssertionKind::PortListening {
-                                    protocol: port_spec.protocol.clone(),
+                                    protocol: port_spec.protocol,
                                     port: port_spec.port,
                                 },
                                 format!("EXPOSE {}/{}", port_spec.port, port_spec.protocol),
@@ -333,9 +333,9 @@ pub fn extract_contract(
                     let is_dir = full_dest.ends_with('/');
                     let is_entrypoint_script = is_entrypoint_path(&full_dest);
                     let filetype = if is_entrypoint_script {
-                        Some("file".to_string())
+                        Some(FileType::File)
                     } else if is_dir {
-                        Some("directory".to_string())
+                        Some(FileType::Directory)
                     } else {
                         None
                     };
@@ -593,9 +593,22 @@ fn is_reset_exec(cmd: &CommandForm) -> bool {
 /// ranges. Returns any concrete specs plus an optional warning for tokens that
 /// could not be interpreted (unparseable, inverted, or over-wide ranges).
 fn parse_expose_token(token: &str) -> (Vec<PortSpec>, Option<String>) {
-    let (port_part, protocol) = match token.split_once('/') {
-        Some((p, proto)) => (p, proto.to_lowercase()),
-        None => (token, "tcp".to_string()),
+    let (port_part, protocol, proto_warning) = match token.split_once('/') {
+        Some((p, proto)) => match proto.parse::<Protocol>() {
+            Ok(parsed) => (p, parsed, None),
+            // goss only understands tcp/udp; an unknown suffix (which Docker
+            // itself would reject at build time) would otherwise leak into the
+            // port key as e.g. `http:80`, which goss cannot evaluate. Normalize
+            // to the tcp default and surface a warning instead.
+            Err(_) => (
+                p,
+                Protocol::Tcp,
+                Some(format!(
+                    "EXPOSE '{token}' has unknown protocol '{proto}'; assuming tcp"
+                )),
+            ),
+        },
+        None => (token, Protocol::Tcp, None),
     };
 
     if let Some((lo_str, hi_str)) = port_part.split_once('-') {
@@ -631,16 +644,11 @@ fn parse_expose_token(token: &str) -> (Vec<PortSpec>, Option<String>) {
             );
         }
 
-        let specs = (lo..=hi)
-            .map(|port| PortSpec {
-                port,
-                protocol: protocol.clone(),
-            })
-            .collect();
-        (specs, None)
+        let specs = (lo..=hi).map(|port| PortSpec { port, protocol }).collect();
+        (specs, proto_warning)
     } else {
         match port_part.parse::<u16>() {
-            Ok(port) => (vec![PortSpec { port, protocol }], None),
+            Ok(port) => (vec![PortSpec { port, protocol }], proto_warning),
             Err(_) => (
                 Vec::new(),
                 Some(format!(
@@ -933,7 +941,7 @@ WORKDIR $APP_HOME
             matches!(
                 &a.kind,
                 AssertionKind::FileExists { path, filetype, .. }
-                    if path == "/app" && filetype.as_deref() == Some("directory")
+                    if path == "/app" && *filetype == Some(FileType::Directory)
             )
         });
         assert!(
@@ -1064,7 +1072,7 @@ COPY other $MISSING/other
             .iter()
             .find(|a| {
                 matches!(&a.kind, AssertionKind::FileExists { filetype, .. }
-                if filetype.as_deref() == Some("directory"))
+                if *filetype == Some(FileType::Directory))
             })
             .expect("expected a workdir directory assertion");
         assert_eq!(workdir.confidence, Confidence::High);
@@ -2197,7 +2205,7 @@ EXPOSE ${PORT}
 
         assert_eq!(contract.exposed_ports.len(), 1);
         assert_eq!(contract.exposed_ports[0].port, 8080);
-        assert_eq!(contract.exposed_ports[0].protocol, "tcp");
+        assert_eq!(contract.exposed_ports[0].protocol, Protocol::Tcp);
         assert!(contract.warnings.is_empty());
 
         let port_assertion = contract
@@ -2220,7 +2228,7 @@ EXPOSE $PORT/udp
 
         assert_eq!(contract.exposed_ports.len(), 1);
         assert_eq!(contract.exposed_ports[0].port, 9000);
-        assert_eq!(contract.exposed_ports[0].protocol, "udp");
+        assert_eq!(contract.exposed_ports[0].protocol, Protocol::Udp);
         assert!(contract.warnings.is_empty());
     }
 
@@ -2248,7 +2256,7 @@ EXPOSE 8000-8001/udp
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.exposed_ports.len(), 2);
-        assert!(contract.exposed_ports.iter().all(|p| p.protocol == "udp"));
+        assert!(contract.exposed_ports.iter().all(|p| p.protocol == Protocol::Udp));
     }
 
     #[test]
@@ -2285,14 +2293,14 @@ EXPOSE 1024-65535
             parse_expose_token("8080").0,
             vec![PortSpec {
                 port: 8080,
-                protocol: "tcp".to_string()
+                protocol: Protocol::Tcp
             }]
         );
         assert_eq!(
             parse_expose_token("53/udp").0,
             vec![PortSpec {
                 port: 53,
-                protocol: "udp".to_string()
+                protocol: Protocol::Udp
             }]
         );
         assert_eq!(parse_expose_token("8000-8002").0.len(), 3);
@@ -2304,6 +2312,30 @@ EXPOSE 1024-65535
         let (specs, warning) = parse_expose_token("notaport");
         assert!(specs.is_empty());
         assert!(warning.unwrap().contains("not a valid port"));
+    }
+
+    #[test]
+    fn test_parse_expose_token_unknown_protocol_normalizes_to_tcp() {
+        // An unknown protocol suffix (which Docker itself rejects at build
+        // time) must not leak into the port key as e.g. `http:80`. It is
+        // normalized to tcp and a warning is surfaced instead.
+        let (specs, warning) = parse_expose_token("80/http");
+        assert_eq!(
+            specs,
+            vec![PortSpec {
+                port: 80,
+                protocol: Protocol::Tcp
+            }]
+        );
+        let warning = warning.expect("unknown protocol should warn");
+        assert!(warning.contains("unknown protocol"));
+        assert!(warning.contains("http"));
+
+        // A range with an unknown protocol normalizes every spec and still warns.
+        let (specs, warning) = parse_expose_token("8000-8001/sctp");
+        assert!(specs.iter().all(|s| s.protocol == Protocol::Tcp));
+        assert_eq!(specs.len(), 2);
+        assert!(warning.unwrap().contains("unknown protocol"));
     }
 
     fn env_value<'a>(contract: &'a RuntimeContract, key: &str) -> Option<&'a str> {
@@ -2458,7 +2490,7 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
                 filetype: Some(ft),
                 mode: Some(mode),
                 ..
-            } if ft == "file" && mode == "0755"
+            } if *ft == FileType::File && mode == "0755"
         ));
     }
 

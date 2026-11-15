@@ -507,7 +507,9 @@ pub fn merge_evidence(contract: &mut RuntimeContract, evidence: &ProbeEvidence) 
         if !already_exists {
             contract.assertions.push(ContractAssertion::new(
                 AssertionKind::PortListening {
-                    protocol: proto.clone(),
+                    // Probe evidence carries the protocol as a raw string; map
+                    // it onto the typed enum, defaulting unknown values to tcp.
+                    protocol: proto.parse().unwrap_or_default(),
                     port: *port,
                 },
                 "probe: discovered listening port",
@@ -641,15 +643,16 @@ mod tests {
     #[test]
     fn test_merge_evidence_raises_confidence() {
         use crate::parser::PortSpec;
+        use crate::Protocol;
 
         let mut contract = RuntimeContract {
             exposed_ports: vec![PortSpec {
                 port: 8080,
-                protocol: "tcp".to_string(),
+                protocol: Protocol::Tcp,
             }],
             assertions: vec![ContractAssertion::new(
                 AssertionKind::PortListening {
-                    protocol: "tcp".to_string(),
+                    protocol: Protocol::Tcp,
                     port: 8080,
                 },
                 "EXPOSE 8080",

@@ -95,7 +95,7 @@ pub enum Instruction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSpec {
     pub port: u16,
-    pub protocol: String,
+    pub protocol: crate::Protocol,
 }
 
 /// Exec form vs shell form for CMD/ENTRYPOINT/RUN.
