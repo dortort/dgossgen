@@ -171,7 +171,9 @@ pub(crate) fn detect_installed_components(cmd: &CommandForm) -> Vec<InstalledCom
 }
 
 /// Generate assertions for known service patterns.
-pub(crate) fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<ContractAssertion> {
+pub(crate) fn generate_service_assertions(
+    components: &[InstalledComponent],
+) -> Vec<ContractAssertion> {
     let mut assertions = Vec::new();
 
     for component in components {

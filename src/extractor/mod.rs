@@ -2264,7 +2264,10 @@ EXPOSE 8000-8001/udp
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
         assert_eq!(contract.exposed_ports.len(), 2);
-        assert!(contract.exposed_ports.iter().all(|p| p.protocol == Protocol::Udp));
+        assert!(contract
+            .exposed_ports
+            .iter()
+            .all(|p| p.protocol == Protocol::Udp));
     }
 
     #[test]
