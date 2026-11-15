@@ -1,6 +1,9 @@
 mod render;
 
-pub use render::*;
+// Public surface: `generate` and the `GeneratorOutput`/`GossResource` types
+// defined below, plus the render entry points. Named re-exports replace the
+// blanket glob.
+pub use render::{render_goss, render_goss_wait, render_goss_wait_minimal};
 
 use crate::config::PolicyConfig;
 use crate::extractor::{

@@ -1,8 +1,17 @@
 mod ast;
 mod resolver;
 
-pub use ast::*;
-pub use resolver::*;
+// The parser's public surface: the pipeline entry points (`parse_dockerfile`
+// and `parse_dockerfile_content`, defined below) plus the model types they
+// produce. Named re-exports replace blanket globs so the supported API is
+// distinguishable from implementation detail.
+pub use ast::{
+    ArgInstruction, CommandForm, Dockerfile, Instruction, PortSpec, RawInstruction, Stage,
+};
+pub use resolver::{Resolution, VariableResolver};
+// Literal-dollar escaping is an implementation detail shared with the extractor,
+// not part of the public API.
+pub(crate) use resolver::{escape_literal_dollars, ESCAPED_DOLLAR};
 
 use anyhow::{Context, Result};
 use std::path::Path;

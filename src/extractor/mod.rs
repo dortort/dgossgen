@@ -1,8 +1,16 @@
 mod heuristics;
 mod model;
 
-pub use heuristics::*;
-pub use model::*;
+// Public surface: `extract_contract` (defined below) and the contract model it
+// builds. The `heuristics` helpers are extraction internals reached through the
+// `heuristics::` path within this module, so they are deliberately not
+// re-exported.
+pub use model::{
+    AssertionKind, ComponentKind, ContractAssertion, HealthcheckInfo, InstalledComponent,
+    PackageManager, RuntimeContract,
+};
+// Shared with the generator; crate-internal rather than public API.
+pub(crate) use model::is_shell_interpreter;
 
 use crate::config::{PolicyConfig, REDACTED_PLACEHOLDER};
 use crate::parser::{

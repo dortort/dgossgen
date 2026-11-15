@@ -17,11 +17,6 @@ impl Dockerfile {
             None => self.stages.last(),
         }
     }
-
-    /// Get all stage aliases for COPY --from resolution.
-    pub fn stage_aliases(&self) -> Vec<String> {
-        self.stages.iter().filter_map(|s| s.alias.clone()).collect()
-    }
 }
 
 /// A single build stage (one FROM ... block).

@@ -103,7 +103,7 @@ static COMPONENT_PATTERNS: LazyLock<Vec<(Regex, &'static str, ComponentKind)>> =
     });
 
 /// Analyze a RUN command for installed packages and generate assertions.
-pub fn analyze_run_command(cmd: &CommandForm, source_line: usize) -> Vec<ContractAssertion> {
+pub(crate) fn analyze_run_command(cmd: &CommandForm, source_line: usize) -> Vec<ContractAssertion> {
     let cmd_str = cmd.to_string_lossy();
     let mut assertions = Vec::new();
 
@@ -152,7 +152,7 @@ pub fn analyze_run_command(cmd: &CommandForm, source_line: usize) -> Vec<Contrac
 }
 
 /// Detect installed components from a RUN command.
-pub fn detect_installed_components(cmd: &CommandForm) -> Vec<InstalledComponent> {
+pub(crate) fn detect_installed_components(cmd: &CommandForm) -> Vec<InstalledComponent> {
     let cmd_str = cmd.to_string_lossy().to_lowercase();
     let mut components = Vec::new();
 
@@ -171,7 +171,7 @@ pub fn detect_installed_components(cmd: &CommandForm) -> Vec<InstalledComponent>
 }
 
 /// Generate assertions for known service patterns.
-pub fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<ContractAssertion> {
+pub(crate) fn generate_service_assertions(components: &[InstalledComponent]) -> Vec<ContractAssertion> {
     let mut assertions = Vec::new();
 
     for component in components {
