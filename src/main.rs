@@ -117,7 +117,8 @@ struct CommonArgs {
     #[arg(long)]
     strict_warnings: bool,
 
-    /// Override primary service port
+    /// Override the primary service port. Selects the port the readiness gate
+    /// (goss_wait.yml) waits on, and the port used for the health-check URL.
     #[arg(long)]
     primary_port: Option<u16>,
 
@@ -355,8 +356,14 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             );
         }
 
-        // Generate
-        let output = generator::generate(&contract, profile, &policy, force_wait);
+        // Generate. Only the explicit `--primary-port` flag narrows the
+        // readiness gate: its gate is user intent that overrides confidence and
+        // the ports policy. `session.primary_port` is an interactive inference
+        // (auto-set for a single EXPOSE without a prompt), so it must not be
+        // treated as an explicit override here — it still drives the health URL
+        // above. This keeps the interactive and non-interactive paths identical.
+        let output =
+            generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
 
         // Preview and confirm
         match interactive::preview_and_confirm(&output)? {
@@ -383,7 +390,8 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
         apply_cli_health_path(&mut contract, &common);
 
         // Non-interactive generation
-        let output = generator::generate(&contract, profile, &policy, force_wait);
+        let output =
+            generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
         emit_output(&common.output_dir, &output, common.strict_warnings)?
     };
 
@@ -449,7 +457,7 @@ fn cmd_probe(
     // Generate
     let force_wait = resolve_force_wait(common.no_wait, common.force_wait);
 
-    let output = generator::generate(&contract, profile, &policy, force_wait);
+    let output = generator::generate(&contract, profile, &policy, force_wait, common.primary_port);
     emit_output(&common.output_dir, &output, common.strict_warnings)
 }
 
