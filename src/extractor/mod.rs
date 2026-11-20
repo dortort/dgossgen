@@ -32,6 +32,11 @@ pub fn extract_contract(
     resolver.load_build_args(build_args, |k| policy.is_secret_key(k));
     resolver.load_global_args(&dockerfile.global_args);
 
+    // Built-in service knowledge merged with any user-configured
+    // `service_patterns`, computed once and used for both component detection
+    // (in the RUN arm) and service-assertion generation (the emit phase).
+    let service_rules = heuristics::effective_service_rules(&policy.service_patterns);
+
     // Walk the internal `FROM <alias>` chain so the final stage inherits the base stage's ENV/etc.
     let chain = resolve_stage_chain(dockerfile, stage, &resolver);
 
@@ -425,7 +430,7 @@ pub fn extract_contract(
                     contract.assertions.extend(run_assertions);
 
                     // Detect installed components
-                    let components = heuristics::detect_installed_components(cmd);
+                    let components = heuristics::detect_components_with(cmd, &service_rules);
                     contract.installed_components.extend(components);
                 }
 
@@ -488,7 +493,7 @@ pub fn extract_contract(
 
     // Add service-specific assertions based on detected components
     let service_assertions =
-        heuristics::generate_service_assertions(&contract.installed_components);
+        heuristics::service_assertions_with(&contract.installed_components, &service_rules);
     contract.assertions.extend(service_assertions);
 
     contract

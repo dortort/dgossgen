@@ -310,6 +310,89 @@ fn test_probe_with_warnings_code_path() {
 }
 
 #[test]
+fn test_init_honors_custom_service_pattern_from_config() {
+    // Regression guard for #25: a `.dgossgen.yml` service_patterns entry was
+    // deserialized and then never read, so a user's custom service produced no
+    // assertions. It must now be detected from the RUN line and emit the
+    // configured process/file/version assertions into goss.yml.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(
+        &dockerfile,
+        "FROM alpine\nEXPOSE 8080\nRUN apk add --no-cache myservice\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join(".dgossgen.yml"),
+        "service_patterns:\n  - name: myservice\n    process: myserviced\n    \
+         config_path: /etc/myservice.conf\n    version_cmd: \"myservice --version\"\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let goss = fs::read_to_string(output_dir.join("goss.yml")).expect("goss.yml should be written");
+    assert!(
+        goss.contains("/etc/myservice.conf"),
+        "configured config_path must be asserted, got:\n{goss}"
+    );
+    assert!(
+        goss.contains("myserviced"),
+        "configured process must be asserted, got:\n{goss}"
+    );
+    assert!(
+        goss.contains("myservice --version"),
+        "configured version_cmd must be asserted, got:\n{goss}"
+    );
+}
+
+#[test]
+fn test_init_detects_postgres_service_assertion() {
+    // #25 drift fix end-to-end: postgres was detected as a component but
+    // generated zero assertions. A Dockerfile installing postgresql must now
+    // yield its Medium-confidence version check under the default profile.
+    let temp = tempdir().unwrap();
+    let dockerfile = temp.path().join("Dockerfile");
+    let output_dir = temp.path().join("generated");
+
+    fs::write(
+        &dockerfile,
+        "FROM debian:12\nEXPOSE 5432\nRUN apt-get install -y postgresql\n",
+    )
+    .unwrap();
+
+    Command::new(assert_cmd::cargo::cargo_bin!("dgossgen"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "-f",
+            dockerfile.to_str().unwrap(),
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let goss = fs::read_to_string(output_dir.join("goss.yml")).expect("goss.yml should be written");
+    assert!(
+        goss.contains("psql --version"),
+        "a detected postgres component must emit a version check, got:\n{goss}"
+    );
+}
+
+#[test]
 fn test_explain_with_malformed_config_fails_loudly() {
     let temp = tempdir().unwrap();
     let dockerfile = temp.path().join("Dockerfile");
