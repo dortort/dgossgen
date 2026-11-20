@@ -17,11 +17,6 @@ impl Dockerfile {
             None => self.stages.last(),
         }
     }
-
-    /// Get all stage aliases for COPY --from resolution.
-    pub fn stage_aliases(&self) -> Vec<String> {
-        self.stages.iter().filter_map(|s| s.alias.clone()).collect()
-    }
 }
 
 /// A single build stage (one FROM ... block).
@@ -95,7 +90,7 @@ pub enum Instruction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSpec {
     pub port: u16,
-    pub protocol: String,
+    pub protocol: crate::Protocol,
 }
 
 /// Exec form vs shell form for CMD/ENTRYPOINT/RUN.

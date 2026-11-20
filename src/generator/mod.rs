@@ -1,12 +1,15 @@
 mod render;
 
-pub use render::*;
+// Public surface: `generate` and the `GeneratorOutput`/`GossResource` types
+// defined below, plus the render entry points. Named re-exports replace the
+// blanket glob.
+pub use render::{render_goss, render_goss_wait, render_goss_wait_minimal};
 
 use crate::config::PolicyConfig;
 use crate::extractor::{
     is_shell_interpreter, AssertionKind, ContractAssertion, PackageManager, RuntimeContract,
 };
-use crate::{Confidence, Profile};
+use crate::{Confidence, FileType, Profile};
 
 /// Output of the goss generator.
 #[derive(Debug)]
@@ -71,7 +74,7 @@ pub fn generate(
         if wait_resources.is_empty() {
             // Generate minimal viable wait from port check
             if let Some(port) = contract.exposed_ports.first() {
-                let minimal_wait = render_goss_wait_minimal(port.port, &port.protocol);
+                let minimal_wait = render_goss_wait_minimal(port.port, port.protocol);
                 Some(minimal_wait)
             } else {
                 None
@@ -202,6 +205,7 @@ fn build_wait_resources(
                     name: "healthcheck".to_string(),
                     command: sanitize_command(command),
                     exit_status: 0,
+                    stdout: Vec::new(),
                     timeout: 5000,
                     provenance: assertion.provenance.clone(),
                     confidence: assertion.confidence,
@@ -275,7 +279,7 @@ fn build_main_resources(
                 resources.push(GossResource::File {
                     path: path.clone(),
                     exists: true,
-                    filetype: filetype.clone(),
+                    filetype: *filetype,
                     mode: effective_mode,
                     provenance: assertion.provenance.clone(),
                     confidence: assertion.confidence,
@@ -301,6 +305,7 @@ fn build_main_resources(
                     name: command_to_name(command),
                     command: sanitize_command(command),
                     exit_status: *exit_status,
+                    stdout: Vec::new(),
                     timeout: 10000,
                     provenance: assertion.provenance.clone(),
                     confidence: assertion.confidence,
@@ -312,7 +317,7 @@ fn build_main_resources(
                 exit_status,
                 expected_output,
             } => {
-                resources.push(GossResource::CommandWithOutput {
+                resources.push(GossResource::Command {
                     name: command_to_name(command),
                     command: sanitize_command(command),
                     exit_status: *exit_status,
@@ -328,6 +333,7 @@ fn build_main_resources(
                     name: format!("user-{}-exists", username),
                     command: format!("getent passwd {}", sanitize_shell_arg(username)),
                     exit_status: 0,
+                    stdout: Vec::new(),
                     timeout: 5000,
                     provenance: assertion.provenance.clone(),
                     confidence: assertion.confidence,
@@ -377,6 +383,7 @@ fn build_main_resources(
                     name: format!("package-{}", command_to_name(package)),
                     command: check_cmd,
                     exit_status: 0,
+                    stdout: Vec::new(),
                     timeout: 10000,
                     provenance: assertion.provenance.clone(),
                     confidence: assertion.confidence,
@@ -388,6 +395,7 @@ fn build_main_resources(
                         name: command_to_name(vcmd),
                         command: sanitize_command(vcmd),
                         exit_status: 0,
+                        stdout: Vec::new(),
                         timeout: 10000,
                         provenance: assertion.provenance.clone(),
                         confidence: assertion.confidence,
@@ -507,7 +515,7 @@ pub enum GossResource {
     File {
         path: String,
         exists: bool,
-        filetype: Option<String>,
+        filetype: Option<FileType>,
         mode: Option<String>,
         provenance: String,
         confidence: Confidence,
@@ -528,14 +536,9 @@ pub enum GossResource {
         name: String,
         command: String,
         exit_status: i32,
-        timeout: i32,
-        provenance: String,
-        confidence: Confidence,
-    },
-    CommandWithOutput {
-        name: String,
-        command: String,
-        exit_status: i32,
+        /// Expected stdout substrings. Empty means no output assertion is
+        /// emitted (the `stdout:` key is omitted), which is the common case for
+        /// exit-status-only command checks.
         stdout: Vec<String>,
         timeout: i32,
         provenance: String,
@@ -557,7 +560,6 @@ impl GossResource {
             GossResource::Port { address, .. } => format!("port:{}", address),
             GossResource::Process { name, .. } => format!("process:{}", name),
             GossResource::Command { name, .. } => format!("command:{}", name),
-            GossResource::CommandWithOutput { name, .. } => format!("command:{}", name),
             GossResource::Http { url, .. } => format!("http:{}", url),
         }
     }
@@ -860,7 +862,7 @@ CMD ["nginx", "-g", "daemon off;"]
             GossResource::File {
                 path: "/docker-entrypoint.sh".to_string(),
                 exists: true,
-                filetype: Some("file".to_string()),
+                filetype: Some(FileType::File),
                 mode: Some("0755".to_string()),
                 provenance: "COPY /docker-entrypoint.sh (entrypoint script pattern)".to_string(),
                 confidence: Confidence::High,
@@ -876,7 +878,7 @@ CMD ["nginx", "-g", "daemon off;"]
                 mode: Some(mode),
                 confidence: Confidence::High,
                 ..
-            } if ft == "file" && mode == "0755"
+            } if *ft == FileType::File && mode == "0755"
         ));
         // The merged assertion must credit both contributing sources, not only
         // the first-seen COPY, since the filetype/mode came from the second.

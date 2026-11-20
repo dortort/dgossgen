@@ -550,6 +550,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use dgossgen::extractor::RuntimeContract;
+    use dgossgen::Protocol;
 
     fn common_from(args: &[&str]) -> CommonArgs {
         let mut argv = vec!["dgossgen"];
@@ -609,7 +610,7 @@ mod tests {
         let mut contract = RuntimeContract::default();
         contract.assertions.push(extractor::ContractAssertion::new(
             AssertionKind::PortListening {
-                protocol: "tcp".to_string(),
+                protocol: Protocol::Tcp,
                 port: 8080,
             },
             "probe: discovered listening port",
@@ -637,7 +638,7 @@ mod tests {
         let mut contract = RuntimeContract::default();
         contract.assertions.push(extractor::ContractAssertion::new(
             AssertionKind::PortListening {
-                protocol: "tcp".to_string(),
+                protocol: Protocol::Tcp,
                 port: 8080,
             },
             "probe: discovered listening port",

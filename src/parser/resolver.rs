@@ -350,11 +350,6 @@ impl VariableResolver {
     pub fn has_unresolved(&self, input: &str) -> bool {
         self.resolve_checked(input).unresolved
     }
-
-    /// Get current variable map.
-    pub fn variables(&self) -> &HashMap<String, String> {
-        &self.vars
-    }
 }
 
 #[cfg(test)]

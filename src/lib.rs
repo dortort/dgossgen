@@ -57,3 +57,51 @@ impl std::str::FromStr for Profile {
         }
     }
 }
+
+/// Transport protocol for an exposed port. goss port addresses only understand
+/// `tcp` and `udp`, so this enum replaces the previously stringly-typed
+/// protocol suffix and guarantees a valid address key is always emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Protocol::Tcp => write!(f, "tcp"),
+            Protocol::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+impl std::str::FromStr for Protocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tcp" => Ok(Protocol::Tcp),
+            "udp" => Ok(Protocol::Udp),
+            _ => Err(format!("unknown protocol: {s}")),
+        }
+    }
+}
+
+/// Whether a `FileExists` assertion targets a regular file or a directory.
+/// `Display` emits the exact strings goss expects in a `filetype:` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Directory,
+}
+
+impl std::fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileType::File => write!(f, "file"),
+            FileType::Directory => write!(f, "directory"),
+        }
+    }
+}

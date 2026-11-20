@@ -109,11 +109,11 @@ impl ContractAssertion {
 pub enum AssertionKind {
     FileExists {
         path: String,
-        filetype: Option<String>,
+        filetype: Option<crate::FileType>,
         mode: Option<String>,
     },
     PortListening {
-        protocol: String,
+        protocol: crate::Protocol,
         port: u16,
     },
     ProcessRunning {

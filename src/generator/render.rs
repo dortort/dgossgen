@@ -138,7 +138,7 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
                 path,
                 &FileAssertion {
                     exists: *exists,
-                    filetype: filetype.clone(),
+                    filetype: filetype.as_ref().map(|ft| ft.to_string()),
                     mode: mode.clone(),
                 },
             );
@@ -189,32 +189,6 @@ fn resource_to_entry(resource: &GossResource) -> (Section, String, Entry) {
             )
         }
         GossResource::Command {
-            name,
-            command,
-            exit_status,
-            timeout,
-            provenance,
-            confidence,
-        } => {
-            let block = render_entry(
-                name,
-                &CommandAssertion {
-                    exec: command.clone(),
-                    exit_status: *exit_status,
-                    stdout: Vec::new(),
-                    timeout: *timeout,
-                },
-            );
-            (
-                Section::Command,
-                name.clone(),
-                Entry {
-                    comment: comment_line(provenance, *confidence),
-                    block,
-                },
-            )
-        }
-        GossResource::CommandWithOutput {
             name,
             command,
             exit_status,
@@ -343,7 +317,7 @@ pub fn render_goss_wait(resources: &[GossResource]) -> String {
 /// Render a minimal viable wait file with just a port check. The synthesized
 /// port assertion carries a provenance comment so the minimal fallback stays
 /// consistent with every other generated file.
-pub fn render_goss_wait_minimal(port: u16, protocol: &str) -> String {
+pub fn render_goss_wait_minimal(port: u16, protocol: crate::Protocol) -> String {
     let resource = GossResource::Port {
         address: format!("{}:{}", protocol, port),
         listening: true,
@@ -369,7 +343,7 @@ mod tests {
         let resources = vec![GossResource::File {
             path: "/app".to_string(),
             exists: true,
-            filetype: Some("directory".to_string()),
+            filetype: Some(crate::FileType::Directory),
             mode: None,
             provenance: "WORKDIR /app".to_string(),
             confidence: Confidence::High,
@@ -446,7 +420,7 @@ mod tests {
             GossResource::File {
                 path: "/app".to_string(),
                 exists: true,
-                filetype: Some("directory".to_string()),
+                filetype: Some(crate::FileType::Directory),
                 mode: Some("0755".to_string()),
                 provenance: "WORKDIR /app".to_string(),
                 confidence: Confidence::High,
@@ -455,6 +429,7 @@ mod tests {
                 name: "check".to_string(),
                 command: "echo hello && echo world".to_string(),
                 exit_status: 0,
+                stdout: Vec::new(),
                 timeout: 1000,
                 provenance: "RUN echo".to_string(),
                 confidence: Confidence::Low,
@@ -482,6 +457,7 @@ mod tests {
             name: "check".to_string(),
             command: "echo hello && echo world".to_string(),
             exit_status: 0,
+            stdout: Vec::new(),
             timeout: 1000,
             provenance: "RUN".to_string(),
             confidence: Confidence::Low,
@@ -494,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_minimal_wait_carries_provenance_comment() {
-        let output = render_goss_wait_minimal(8080, "tcp");
+        let output = render_goss_wait_minimal(8080, crate::Protocol::Tcp);
         assert!(output.contains("port:"));
         assert!(output.contains("tcp:8080"));
         assert!(output.contains("listening: true"));
@@ -663,7 +639,7 @@ mod tests {
         let resources = vec![GossResource::File {
             path: long_path.clone(),
             exists: true,
-            filetype: Some("directory".to_string()),
+            filetype: Some(crate::FileType::Directory),
             mode: None,
             provenance: "WORKDIR (long path)".to_string(),
             confidence: Confidence::High,
@@ -694,6 +670,7 @@ mod tests {
                 name: "check".to_string(),
                 command: "first".to_string(),
                 exit_status: 0,
+                stdout: Vec::new(),
                 timeout: 1000,
                 provenance: "first".to_string(),
                 confidence: Confidence::Low,
@@ -702,6 +679,7 @@ mod tests {
                 name: "check".to_string(),
                 command: "second".to_string(),
                 exit_status: 0,
+                stdout: Vec::new(),
                 timeout: 1000,
                 provenance: "second".to_string(),
                 confidence: Confidence::High,
@@ -741,7 +719,7 @@ mod tests {
             "",
         ];
         for sample in samples {
-            let resources = vec![GossResource::CommandWithOutput {
+            let resources = vec![GossResource::Command {
                 name: sample.to_string(),
                 command: sample.to_string(),
                 exit_status: 0,
@@ -760,5 +738,44 @@ mod tests {
                 "stdout must round-trip:\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn test_command_stdout_present_and_omitted() {
+        // The unified Command variant must render a `stdout:` list when
+        // stdout is non-empty and omit the key entirely when it is empty.
+        let with_output = vec![GossResource::Command {
+            name: "versioned".to_string(),
+            command: "node --version".to_string(),
+            exit_status: 0,
+            stdout: vec!["v18".to_string()],
+            timeout: 1000,
+            provenance: "RUN".to_string(),
+            confidence: Confidence::Low,
+        }];
+        let rendered = render_goss(&with_output);
+        assert!(
+            rendered.contains("stdout:"),
+            "non-empty stdout must emit a stdout key:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("- v18"),
+            "stdout substring must be listed:\n{rendered}"
+        );
+
+        let without_output = vec![GossResource::Command {
+            name: "versioned".to_string(),
+            command: "node --version".to_string(),
+            exit_status: 0,
+            stdout: Vec::new(),
+            timeout: 1000,
+            provenance: "RUN".to_string(),
+            confidence: Confidence::Low,
+        }];
+        let rendered = render_goss(&without_output);
+        assert!(
+            !rendered.contains("stdout:"),
+            "empty stdout must omit the stdout key:\n{rendered}"
+        );
     }
 }
