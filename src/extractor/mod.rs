@@ -69,6 +69,16 @@ pub fn extract_contract(
                         unresolved,
                         secret,
                     } = resolver.resolve_checked(&escape_literal_dollars(dir));
+                    // An argument that expands to nothing (e.g. `WORKDIR $VAR` where
+                    // VAR is a set-but-empty variable) leaves the working directory
+                    // unchanged in Docker; there is nothing new to assert.
+                    if !unresolved && !secret && resolved.is_empty() {
+                        contract.warnings.push(format!(
+                            "WORKDIR '{dir}' expanded to an empty path; no directory \
+                             assertion generated (working directory unchanged)"
+                        ));
+                        continue;
+                    }
                     // `None` means unknown (unresolved, secret, or unknown base); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
@@ -102,16 +112,26 @@ pub fn extract_contract(
                     current_workdir = new_workdir.clone();
                     contract.workdir = new_workdir.clone();
                     if let Some(path) = new_workdir {
-                        contract.assertions.push(ContractAssertion::new(
-                            AssertionKind::FileExists {
-                                path,
-                                filetype: Some("directory".to_string()),
-                                mode: None,
-                            },
-                            format!("WORKDIR {}", dir),
-                            inst.line_number,
-                            Confidence::High,
-                        ));
+                        if path_is_root(&path) {
+                            // Asserting the root directory exists is trivially true and
+                            // carries no signal (it often results from an empty expansion
+                            // such as `WORKDIR /$VAR` or `/$VAR/`); skip it.
+                            contract.warnings.push(format!(
+                                "WORKDIR '{dir}' resolves to the root directory; no directory \
+                                 assertion generated"
+                            ));
+                        } else {
+                            contract.assertions.push(ContractAssertion::new(
+                                AssertionKind::FileExists {
+                                    path,
+                                    filetype: Some("directory".to_string()),
+                                    mode: None,
+                                },
+                                format!("WORKDIR {}", dir),
+                                inst.line_number,
+                                Confidence::High,
+                            ));
+                        }
                     }
                 }
 
@@ -188,6 +208,12 @@ pub fn extract_contract(
                         if secret {
                             contract.warnings.push(format!(
                                 "VOLUME '{vol}' uses a secret build arg; volume not recorded"
+                            ));
+                            continue;
+                        }
+                        if resolved.is_empty() {
+                            contract.warnings.push(format!(
+                                "VOLUME '{vol}' expanded to an empty path; volume not recorded"
                             ));
                             continue;
                         }
@@ -312,6 +338,13 @@ pub fn extract_contract(
                                 ));
                                 continue;
                             }
+                            DestPath::Empty => {
+                                contract.warnings.push(format!(
+                                    "COPY destination '{dest}' expanded to an empty path; no file \
+                                     assertion generated"
+                                ));
+                                continue;
+                            }
                             DestPath::UnknownWorkdir => {
                                 contract.warnings.push(format!(
                                     "COPY destination '{dest}' is relative to a working directory \
@@ -327,6 +360,16 @@ pub fn extract_contract(
                                 continue;
                             }
                         };
+
+                    if path_is_root(&full_dest) {
+                        // A root destination (often from an empty expansion like
+                        // `COPY x /$VAR` or `/$VAR/`) yields only a trivially-true assertion.
+                        contract.warnings.push(format!(
+                            "COPY destination '{dest}' resolves to the root directory; no file \
+                             assertion generated"
+                        ));
+                        continue;
+                    }
 
                     let confidence = Confidence::Medium;
 
@@ -389,6 +432,13 @@ pub fn extract_contract(
                                 ));
                                 continue;
                             }
+                            DestPath::Empty => {
+                                contract.warnings.push(format!(
+                                    "ADD destination '{dest}' expanded to an empty path; no file \
+                                     assertion generated"
+                                ));
+                                continue;
+                            }
                             DestPath::UnknownWorkdir => {
                                 contract.warnings.push(format!(
                                     "ADD destination '{dest}' is relative to a working directory \
@@ -404,6 +454,14 @@ pub fn extract_contract(
                                 continue;
                             }
                         };
+
+                    if path_is_root(&full_dest) {
+                        contract.warnings.push(format!(
+                            "ADD destination '{dest}' resolves to the root directory; no file \
+                             assertion generated"
+                        ));
+                        continue;
+                    }
 
                     contract.assertions.push(ContractAssertion::new(
                         AssertionKind::FileExists {
@@ -678,6 +736,8 @@ enum DestPath {
     Resolved(String),
     /// The destination itself contained an unresolved variable.
     UnresolvedVar,
+    /// The destination expanded to the empty string (a set-but-empty variable).
+    Empty,
     /// Relative but the current WORKDIR is unknown (an earlier WORKDIR failed to resolve).
     UnknownWorkdir,
     /// The destination substituted a secret-derived variable.
@@ -701,6 +761,9 @@ fn resolve_dest_path(
     if secret {
         return DestPath::Secret;
     }
+    if resolved_dest.is_empty() {
+        return DestPath::Empty;
+    }
     if resolved_dest.starts_with('/') {
         return DestPath::Resolved(resolved_dest);
     }
@@ -717,6 +780,13 @@ fn resolve_dest_path(
 fn is_entrypoint_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.contains("entrypoint") || lower.contains("docker-entrypoint")
+}
+
+/// Whether a path refers to the root directory in any slash-redundant spelling
+/// (`/`, `//`, `///`, …). Such a path, usually the product of an empty variable
+/// expansion like `WORKDIR /$EMPTY/`, yields only a trivially-true assertion.
+fn path_is_root(path: &str) -> bool {
+    !path.is_empty() && path.bytes().all(|b| b == b'/')
 }
 
 #[cfg(test)]
@@ -826,6 +896,9 @@ CMD ["node", "server.js"]
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
 
+        // T is tainted (set-but-unknown), so each `${T:-...}` stays unresolved and
+        // is kept verbatim; the escaped `\$` is restored to a literal `$` in that
+        // kept text without ever leaking the internal marker.
         assert_eq!(contract.user, Some("${T:-$x}".to_string()));
         assert_eq!(contract.volumes, vec!["/data/${T:-$y}".to_string()]);
         assert!(!format!("{contract:?}").contains(crate::parser::ESCAPED_DOLLAR));
@@ -1313,6 +1386,8 @@ USER $FOO
             "no `$`-bearing username may ship: {:?}",
             contract.assertions
         );
+        // FOO is tainted (set-but-unknown), so `WORKDIR $FOO` stays unresolved and
+        // is dropped with a warning — no `$`-bearing or wrong path laundered.
         assert!(contract
             .warnings
             .iter()
@@ -1422,7 +1497,9 @@ WORKDIR $APP_DIR
 
     #[test]
     fn test_env_reassignment_to_unresolved_invalidates_prior_value() {
-        // Reassigning a var to an unresolved value must invalidate its prior binding, not stale.
+        // Reassigning a var to an unresolvable value must invalidate its prior
+        // binding, not go stale: `/old` must not survive, and because the new value
+        // is unknown (possibly base-image), `WORKDIR $DIR` stays unresolved.
         let content = "FROM alpine\nENV DIR=/old\nENV DIR=$MISSING\nWORKDIR $DIR\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
@@ -1439,12 +1516,14 @@ WORKDIR $APP_DIR
         assert!(contract
             .warnings
             .iter()
-            .any(|w| w.contains("ENV") && w.contains("unresolved variable")));
+            .any(|w| w.starts_with("WORKDIR '$DIR'") && w.contains("unresolved variable")));
     }
 
     #[test]
     fn test_env_unresolved_keeps_precedence_over_later_arg() {
-        // An unresolved ENV keeps precedence over a later same-name ARG; must not be overridden.
+        // An unresolvable ENV taints and locks the name, so a later same-name ARG
+        // cannot override it. `$DIR` therefore stays unresolved (not `new`), and the
+        // dependent WORKDIR is dropped rather than shipping a wrong assertion.
         let content = r#"
 FROM alpine
 ENV DIR=$MISSING
@@ -1467,7 +1546,9 @@ WORKDIR /app/$DIR
 
     #[test]
     fn test_tainted_env_var_with_dash_default_is_dropped() {
-        // A tainted var's `-`/`:-` default isn't substituted (Docker treats it as set-empty).
+        // A tainted var's value is unknown (possibly base-image), so neither a `-`
+        // nor a `:-` default is substituted; the dependent WORKDIR is dropped
+        // conservatively rather than risking a wrong assertion.
         let content = "FROM alpine\nENV DIR=$MISSING\nWORKDIR /srv/${DIR-fallback}\n";
         let df = parse_dockerfile_content(content).unwrap();
         let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
@@ -1481,6 +1562,150 @@ WORKDIR /app/$DIR
             "a tainted var's dash-default must not be substituted: {:?}",
             contract.assertions
         );
+    }
+
+    #[test]
+    fn test_literal_empty_env_colon_dash_default_is_substituted() {
+        // A variable dgossgen *knows* is empty (a literal `ENV DIR=`) triggers the
+        // `:-` default, producing the previously-dropped assertion `/srv/fallback`
+        // (the issue #48 win, delivered only where emptiness is provable).
+        let content = "FROM alpine\nENV DIR=\nWORKDIR /srv/${DIR:-fallback}\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/srv/fallback".to_string()));
+    }
+
+    #[test]
+    fn test_literal_empty_env_dash_default_gives_empty_path() {
+        // The same known-empty var under `-` keeps the empty value, so the directory
+        // is `/srv/` — never `/srv/fallback`.
+        let content = "FROM alpine\nENV DIR=\nWORKDIR /srv/${DIR-fallback}\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/srv/".to_string()));
+        assert!(!contract.assertions.iter().any(|a| matches!(
+            &a.kind,
+            AssertionKind::FileExists { path, .. } if path.contains("fallback")
+        )));
+    }
+
+    #[test]
+    fn test_known_empty_var_yields_no_volume_or_copy_assertion() {
+        // A known-empty var expanding to an empty VOLUME/COPY destination must not
+        // ship a bogus assertion; each warns and is skipped instead.
+        let content = "FROM alpine\nENV DIR=\nVOLUME $DIR\nCOPY app $DIR\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert!(
+            contract.volumes.is_empty(),
+            "an empty VOLUME path must not be recorded: {:?}",
+            contract.volumes
+        );
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { .. } | AssertionKind::PortListening { .. }
+            )),
+            "no file assertion may ship for empty expansions: {:?}",
+            contract.assertions
+        );
+        for needle in ["VOLUME '$DIR'", "COPY destination '$DIR'"] {
+            assert!(
+                contract.warnings.iter().any(|w| w.contains(needle)),
+                "expected a warning containing {needle:?}, got: {:?}",
+                contract.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_only_expansion_is_not_asserted() {
+        // An expansion that leaves only the root path — in any slash-redundant
+        // spelling (`/$EMPTY` -> `/`, `/$EMPTY/` -> `//`) — would be a trivially-true
+        // assertion; WORKDIR, COPY and ADD must all skip it with a warning.
+        let content = "FROM alpine\nENV DIR=\nWORKDIR /$DIR/\nCOPY app /$DIR\nADD app.tar /$DIR/\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path_is_root(path)
+            )),
+            "the root directory must not be asserted: {:?}",
+            contract.assertions
+        );
+        for needle in [
+            "WORKDIR '/$DIR/'",
+            "COPY destination '/$DIR'",
+            "ADD destination '/$DIR/'",
+        ] {
+            assert!(
+                contract
+                    .warnings
+                    .iter()
+                    .any(|w| w.starts_with(needle) && w.contains("root directory")),
+                "expected a root-directory warning starting {needle:?}, got: {:?}",
+                contract.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_workdir_leaves_working_directory_unchanged() {
+        // A WORKDIR argument that expands to nothing (a known-empty var) leaves the
+        // working directory unchanged (Docker semantics): the prior workdir and its
+        // assertion stand, a following relative COPY resolves against it, and no
+        // bogus `/app/` directory assertion is emitted.
+        let content = "FROM alpine\nWORKDIR /app\nENV DIR=\nWORKDIR $DIR\nCOPY rel.txt there.txt\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/app".to_string()));
+        let paths: Vec<&str> = contract
+            .assertions
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AssertionKind::FileExists { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths.contains(&"/app") && paths.contains(&"/app/there.txt"),
+            "expected /app and /app/there.txt, got: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/app/"),
+            "an empty WORKDIR must not emit a bogus /app/ assertion: {paths:?}"
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '$DIR'") && w.contains("working directory unchanged")));
+    }
+
+    #[test]
+    fn test_add_empty_destination_is_skipped() {
+        // The ADD path shares the empty-destination guard with COPY.
+        let content = "FROM alpine\nENV DIR=\nADD app.tar $DIR\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert!(
+            !contract
+                .assertions
+                .iter()
+                .any(|a| matches!(&a.kind, AssertionKind::FileExists { .. })),
+            "no file assertion may ship for an empty ADD destination: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("ADD destination '$DIR'") && w.contains("empty path")));
     }
 
     #[test]
@@ -1866,6 +2091,8 @@ WORKDIR /app/$DIR
             &[("DIR".to_string(), "cli".to_string())],
             &PolicyConfig::default(),
         );
+        // The ENV lock (taint) wins over the build-arg-bound ARG, so DIR stays
+        // tainted (never `cli`); `$DIR` is unresolved and the WORKDIR is dropped.
         assert_eq!(contract.workdir, None);
         assert!(
             !contract.assertions.iter().any(|a| matches!(
