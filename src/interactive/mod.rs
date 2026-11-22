@@ -174,7 +174,13 @@ pub fn apply_session(
     }
 
     // An explicit --primary-port wins over the interactively selected port;
-    // push_health_assertion then applies the shared EXPOSE/discovered/80 chain.
+    // push_health_assertion then applies the shared EXPOSE -> discovered -> 80
+    // chain. On today's interactive path those latter fallbacks are inert — and
+    // so this matches the old `…unwrap_or(80)` exactly — because run_interactive
+    // fills session.primary_port from the exposed ports whenever any exist, and
+    // `init` never probes (so no bare PortListening without a matching EXPOSE).
+    // Routing through the shared helper is deliberate: if `init` ever gains a
+    // probe step, the health port should follow the same chain as `probe`.
     let port_override = primary_port_flag.or(session.primary_port);
 
     if let Some((path, status)) = health_flag {
@@ -466,8 +472,11 @@ mod tests {
 
     #[test]
     fn test_apply_session_health_falls_back_to_exposed_port() {
-        // No port on the session and no flag, but an EXPOSE exists: the shared
-        // port chain targets it rather than defaulting to 80.
+        // Pins the standalone contract of the shared port chain: with no port
+        // override but an EXPOSE present, the chain targets the exposed port
+        // rather than 80. (The live interactive flow never reaches this branch —
+        // run_interactive prefills session.primary_port from exposed ports — but
+        // the fallback must hold for any caller, e.g. a future probing `init`.)
         let mut contract = RuntimeContract {
             exposed_ports: vec![PortSpec {
                 port: 8080,
