@@ -144,6 +144,64 @@ pub fn run_interactive(
     Ok(session)
 }
 
+/// Apply the answers from an interactive [`InteractiveSession`] to the contract.
+///
+/// This is the testable core of the interactive `init` flow, extracted from the
+/// binary crate so it can be unit-tested without driving dialoguer prompts:
+///
+/// - If the user declined the process assertion, every `ProcessRunning`
+///   assertion is dropped.
+/// - A health endpoint is injected when one is known. An explicit
+///   `--health-path` flag (`health_flag`, carrying the path and its
+///   `--health-status`) is authoritative and wins over the session's own
+///   answer. Either way the assertion is built by the shared
+///   [`crate::extractor::push_health_assertion`], so the health port is chosen
+///   by exactly the same default chain as the non-interactive path.
+///
+/// `primary_port_flag` is the `--primary-port` override; it takes precedence
+/// over the interactively selected port. When neither is set, the shared port
+/// chain (first `EXPOSE` → probe-discovered → 80) applies.
+pub fn apply_session(
+    contract: &mut RuntimeContract,
+    session: &InteractiveSession,
+    health_flag: Option<(&str, u16)>,
+    primary_port_flag: Option<u16>,
+) {
+    if !session.confirm_process {
+        contract
+            .assertions
+            .retain(|a| !matches!(a.kind, AssertionKind::ProcessRunning { .. }));
+    }
+
+    // An explicit --primary-port wins over the interactively selected port;
+    // push_health_assertion then applies the shared EXPOSE -> discovered -> 80
+    // chain. On today's interactive path those latter fallbacks are inert — and
+    // so this matches the old `…unwrap_or(80)` exactly — because run_interactive
+    // fills session.primary_port from the exposed ports whenever any exist, and
+    // `init` never probes (so no bare PortListening without a matching EXPOSE).
+    // Routing through the shared helper is deliberate: if `init` ever gains a
+    // probe step, the health port should follow the same chain as `probe`.
+    let port_override = primary_port_flag.or(session.primary_port);
+
+    if let Some((path, status)) = health_flag {
+        crate::extractor::push_health_assertion(
+            contract,
+            port_override,
+            path,
+            status,
+            "CLI: --health-path flag",
+        );
+    } else if let Some(path) = &session.health_path {
+        crate::extractor::push_health_assertion(
+            contract,
+            port_override,
+            path,
+            session.health_status.unwrap_or(200),
+            "interactive: user-provided health endpoint",
+        );
+    }
+}
+
 /// Preview generated output and offer accept/edit/regenerate.
 pub fn preview_and_confirm(output: &GeneratorOutput) -> Result<UserAction> {
     println!();
@@ -275,4 +333,163 @@ pub fn open_in_editor(path: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extractor::ContractAssertion;
+    use crate::parser::PortSpec;
+
+    fn session() -> InteractiveSession {
+        InteractiveSession {
+            primary_port: None,
+            health_path: None,
+            health_status: None,
+            confirm_process: true,
+            volume_mounts: Vec::new(),
+        }
+    }
+
+    fn with_process(name: &str) -> RuntimeContract {
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(ContractAssertion::new(
+            AssertionKind::ProcessRunning {
+                name: name.to_string(),
+            },
+            "test",
+            0,
+            Confidence::Medium,
+        ));
+        contract
+    }
+
+    fn health(contract: &RuntimeContract) -> Option<(String, u16, String)> {
+        contract.assertions.iter().find_map(|a| match &a.kind {
+            AssertionKind::HttpStatus { url, status } => {
+                Some((url.clone(), *status, a.provenance.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn test_apply_session_drops_process_when_declined() {
+        let mut contract = with_process("nginx");
+        let s = InteractiveSession {
+            confirm_process: false,
+            ..session()
+        };
+        apply_session(&mut contract, &s, None, None);
+        assert!(
+            !contract
+                .assertions
+                .iter()
+                .any(|a| matches!(a.kind, AssertionKind::ProcessRunning { .. })),
+            "declining the process prompt must drop ProcessRunning assertions"
+        );
+    }
+
+    #[test]
+    fn test_apply_session_keeps_process_when_confirmed() {
+        let mut contract = with_process("nginx");
+        apply_session(&mut contract, &session(), None, None);
+        assert!(
+            contract
+                .assertions
+                .iter()
+                .any(|a| matches!(a.kind, AssertionKind::ProcessRunning { .. })),
+            "confirming the process prompt must keep ProcessRunning assertions"
+        );
+    }
+
+    #[test]
+    fn test_apply_session_adds_no_health_without_a_source() {
+        let mut contract = RuntimeContract::default();
+        apply_session(&mut contract, &session(), None, None);
+        assert!(
+            health(&contract).is_none(),
+            "no flag and no session answer means no HttpStatus assertion"
+        );
+    }
+
+    #[test]
+    fn test_apply_session_injects_session_health_with_default_status() {
+        // No flag: the session answer drives the endpoint, and a missing status
+        // defaults to 200. The session's selected port is used.
+        let mut contract = RuntimeContract::default();
+        let s = InteractiveSession {
+            primary_port: Some(3000),
+            health_path: Some("/healthz".to_string()),
+            health_status: None,
+            ..session()
+        };
+        apply_session(&mut contract, &s, None, None);
+        let (url, status, provenance) = health(&contract).expect("health assertion expected");
+        assert_eq!(url, "http://127.0.0.1:3000/healthz");
+        assert_eq!(status, 200);
+        assert_eq!(provenance, "interactive: user-provided health endpoint");
+    }
+
+    #[test]
+    fn test_apply_session_health_flag_wins_over_session_answer() {
+        // The --health-path flag is authoritative: its path, status, and
+        // provenance override any session answer.
+        let mut contract = RuntimeContract::default();
+        let s = InteractiveSession {
+            primary_port: Some(3000),
+            health_path: Some("/from-session".to_string()),
+            health_status: Some(500),
+            ..session()
+        };
+        apply_session(&mut contract, &s, Some(("/from-flag", 204)), None);
+        let (url, status, provenance) = health(&contract).expect("health assertion expected");
+        assert_eq!(url, "http://127.0.0.1:3000/from-flag");
+        assert_eq!(status, 204);
+        assert_eq!(provenance, "CLI: --health-path flag");
+        // Only one health assertion is added (the flag, not also the session).
+        let count = contract
+            .assertions
+            .iter()
+            .filter(|a| matches!(a.kind, AssertionKind::HttpStatus { .. }))
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_apply_session_primary_port_flag_overrides_session_port() {
+        // --primary-port beats the interactively selected port.
+        let mut contract = RuntimeContract::default();
+        let s = InteractiveSession {
+            primary_port: Some(3000),
+            health_path: Some("/healthz".to_string()),
+            ..session()
+        };
+        apply_session(&mut contract, &s, None, Some(9090));
+        let (url, _, _) = health(&contract).expect("health assertion expected");
+        assert_eq!(url, "http://127.0.0.1:9090/healthz");
+    }
+
+    #[test]
+    fn test_apply_session_health_falls_back_to_exposed_port() {
+        // Pins the standalone contract of the shared port chain: with no port
+        // override but an EXPOSE present, the chain targets the exposed port
+        // rather than 80. (The live interactive flow never reaches this branch —
+        // run_interactive prefills session.primary_port from exposed ports — but
+        // the fallback must hold for any caller, e.g. a future probing `init`.)
+        let mut contract = RuntimeContract {
+            exposed_ports: vec![PortSpec {
+                port: 8080,
+                protocol: "tcp".to_string(),
+            }],
+            ..Default::default()
+        };
+        let s = InteractiveSession {
+            health_path: Some("/healthz".to_string()),
+            ..session()
+        };
+        apply_session(&mut contract, &s, None, None);
+        let (url, _, _) = health(&contract).expect("health assertion expected");
+        assert_eq!(url, "http://127.0.0.1:8080/healthz");
+    }
 }

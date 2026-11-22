@@ -7,12 +7,12 @@ use console::style;
 
 use dgossgen::cli::{explain, lint, output};
 use dgossgen::config::PolicyConfig;
-use dgossgen::extractor::{self, AssertionKind};
+use dgossgen::extractor;
 use dgossgen::generator;
 use dgossgen::interactive;
 use dgossgen::parser;
 use dgossgen::probe::{self, ContainerRuntime, ProbeConfig};
-use dgossgen::{Confidence, Profile};
+use dgossgen::Profile;
 
 #[derive(Parser)]
 #[command(
@@ -222,39 +222,18 @@ fn load_contract(common: &CommonArgs) -> Result<LoadedContract> {
 
 /// Translate a `--health-path` CLI flag into a user-requested `HttpStatus`
 /// assertion on the contract. Shared by the non-interactive `init` and `probe`
-/// paths so the flag behaves identically in both (the interactive path builds
-/// its own assertion from session answers). The assertion is marked
-/// `user_requested`, so the generator emits it regardless of the default
-/// `http_checks` policy. No-op when `--health-path` was not supplied.
+/// paths so the flag behaves identically in both (the interactive path routes
+/// its session answer through the same [`extractor::push_health_assertion`], so
+/// the port-default chain lives in exactly one place). No-op when
+/// `--health-path` was not supplied.
 fn apply_cli_health_path(contract: &mut extractor::RuntimeContract, common: &CommonArgs) {
     if let Some(path) = &common.health_path {
-        // Port precedence: an explicit --primary-port, else a declared EXPOSE,
-        // else a port the probe discovered the container listening on (merged
-        // in as a PortListening assertion), else the conventional 80. Consulting
-        // the discovered evidence matters for `probe`, where the real service
-        // port is often not in EXPOSE — falling straight to 80 would emit an
-        // HTTP check against the wrong endpoint.
-        let port = common
-            .primary_port
-            .or_else(|| contract.exposed_ports.first().map(|p| p.port))
-            .or_else(|| {
-                contract.assertions.iter().find_map(|a| match &a.kind {
-                    AssertionKind::PortListening { port, .. } => Some(*port),
-                    _ => None,
-                })
-            })
-            .unwrap_or(80);
-        contract.assertions.push(
-            extractor::ContractAssertion::new(
-                AssertionKind::HttpStatus {
-                    url: format!("http://127.0.0.1:{}{path}", port),
-                    status: common.health_status,
-                },
-                "CLI: --health-path flag",
-                0,
-                Confidence::High,
-            )
-            .user_requested(),
+        extractor::push_health_assertion(
+            contract,
+            common.primary_port,
+            path,
+            common.health_status,
+            "CLI: --health-path flag",
         );
     }
 }
@@ -307,53 +286,18 @@ fn cmd_init(common: CommonArgs, interactive: bool) -> Result<ExitCode> {
             common.health_path.is_some(),
         )?;
 
-        // Apply session overrides
-        if !session.confirm_process {
-            contract
-                .assertions
-                .retain(|a| !matches!(a.kind, AssertionKind::ProcessRunning { .. }));
-        }
-
-        // Resolve the health endpoint. A --health-path flag is explicit intent
-        // and must win even in interactive mode — otherwise it is silently
-        // dropped whenever the health prompt is skipped (e.g. the Dockerfile
-        // already declares a HEALTHCHECK, so run_interactive never asks). The
-        // interactive answer is the fallback when no flag was given.
-        let health = if let Some(path) = &common.health_path {
-            Some((
-                path.clone(),
-                common.health_status,
-                "CLI: --health-path flag",
-            ))
-        } else {
-            session.health_path.as_ref().map(|path| {
-                (
-                    path.clone(),
-                    session.health_status.unwrap_or(200),
-                    "interactive: user-provided health endpoint",
-                )
-            })
-        };
-        if let Some((path, status, provenance)) = health {
-            contract.assertions.push(
-                extractor::ContractAssertion::new(
-                    AssertionKind::HttpStatus {
-                        url: format!(
-                            "http://127.0.0.1:{}{path}",
-                            // An explicit --primary-port wins, matching the
-                            // non-interactive path; otherwise use the port the
-                            // session selected (or the sole EXPOSE), then 80.
-                            common.primary_port.or(session.primary_port).unwrap_or(80)
-                        ),
-                        status,
-                    },
-                    provenance,
-                    0,
-                    Confidence::High,
-                )
-                .user_requested(),
-            );
-        }
+        // Apply the session answers to the contract: drop the process assertion
+        // if declined and inject the health endpoint. A --health-path flag is
+        // explicit intent and must win even in interactive mode — otherwise it
+        // is silently dropped whenever the health prompt is skipped (e.g. the
+        // Dockerfile already declares a HEALTHCHECK, so run_interactive never
+        // asks). The port-default chain lives in push_health_assertion, shared
+        // with the non-interactive path.
+        let health_flag = common
+            .health_path
+            .as_deref()
+            .map(|p| (p, common.health_status));
+        interactive::apply_session(&mut contract, &session, health_flag, common.primary_port);
 
         // Generate
         let output = generator::generate(&contract, profile, &policy, force_wait);
@@ -549,7 +493,8 @@ fn cmd_lint(file: PathBuf, wait_file: Option<PathBuf>) -> Result<ExitCode> {
 mod tests {
     use super::*;
     use clap::Parser;
-    use dgossgen::extractor::RuntimeContract;
+    use dgossgen::extractor::{AssertionKind, RuntimeContract};
+    use dgossgen::Confidence;
 
     fn common_from(args: &[&str]) -> CommonArgs {
         let mut argv = vec!["dgossgen"];
