@@ -719,11 +719,157 @@ fn is_entrypoint_path(path: &str) -> bool {
     lower.contains("entrypoint") || lower.contains("docker-entrypoint")
 }
 
+/// Push a user-requested HTTP health-check assertion onto the contract, picking
+/// the target port from a single, shared default chain.
+///
+/// This is the one place the health-check port is resolved, so the `init`
+/// (`--health-path`), interactive, and `probe` paths cannot drift apart. The
+/// chain is: an explicit `port_override` (an `--primary-port` flag or an
+/// interactively chosen port) wins; otherwise the first declared `EXPOSE` port;
+/// otherwise a port the probe discovered the container listening on (merged in
+/// as a `PortListening` assertion — this is why `probe` can target the real
+/// service port even when it is not in `EXPOSE`); otherwise the conventional 80.
+///
+/// The assertion is `High`-confidence and `user_requested`, so it bypasses the
+/// default `http_checks` policy gate — an explicit health endpoint is intent,
+/// not a heuristic guess.
+pub fn push_health_assertion(
+    contract: &mut RuntimeContract,
+    port_override: Option<u16>,
+    path: &str,
+    status: u16,
+    provenance: &str,
+) {
+    let port = port_override
+        .or_else(|| contract.exposed_ports.first().map(|p| p.port))
+        .or_else(|| {
+            contract.assertions.iter().find_map(|a| match &a.kind {
+                AssertionKind::PortListening { port, .. } => Some(*port),
+                _ => None,
+            })
+        })
+        .unwrap_or(80);
+    contract.assertions.push(
+        ContractAssertion::new(
+            AssertionKind::HttpStatus {
+                url: format!("http://127.0.0.1:{port}{path}"),
+                status,
+            },
+            provenance,
+            0,
+            Confidence::High,
+        )
+        .user_requested(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::PolicyConfig;
-    use crate::parser::parse_dockerfile_content;
+    use crate::parser::{parse_dockerfile_content, PortSpec};
+
+    /// Extract the single HttpStatus URL a push_health_assertion test added.
+    fn health_url(contract: &RuntimeContract) -> String {
+        contract
+            .assertions
+            .iter()
+            .find_map(|a| match &a.kind {
+                AssertionKind::HttpStatus { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .expect("a health HttpStatus assertion should be present")
+    }
+
+    #[test]
+    fn test_push_health_assertion_marks_user_requested_high_confidence() {
+        // The health check is explicit user intent: it must survive policy gates.
+        let mut contract = RuntimeContract::default();
+        push_health_assertion(&mut contract, Some(9000), "/healthz", 204, "test");
+
+        assert_eq!(contract.assertions.len(), 1);
+        let a = &contract.assertions[0];
+        assert!(a.user_requested, "health assertion must be user_requested");
+        assert_eq!(a.confidence, Confidence::High);
+        assert_eq!(a.provenance, "test");
+        match &a.kind {
+            AssertionKind::HttpStatus { url, status } => {
+                assert_eq!(url, "http://127.0.0.1:9000/healthz");
+                assert_eq!(*status, 204);
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_push_health_assertion_port_override_wins() {
+        // An explicit override beats every other signal, including EXPOSE and a
+        // discovered listening port.
+        let mut contract = RuntimeContract {
+            exposed_ports: vec![PortSpec {
+                port: 8080,
+                protocol: "tcp".to_string(),
+            }],
+            ..Default::default()
+        };
+        contract.assertions.push(ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 5000,
+            },
+            "probe",
+            0,
+            Confidence::High,
+        ));
+        push_health_assertion(&mut contract, Some(9000), "/ready", 200, "test");
+        assert_eq!(health_url(&contract), "http://127.0.0.1:9000/ready");
+    }
+
+    #[test]
+    fn test_push_health_assertion_falls_back_to_first_exposed_port() {
+        // No override: the first declared EXPOSE port is used.
+        let mut contract = RuntimeContract {
+            exposed_ports: vec![
+                PortSpec {
+                    port: 8080,
+                    protocol: "tcp".to_string(),
+                },
+                PortSpec {
+                    port: 9090,
+                    protocol: "tcp".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        push_health_assertion(&mut contract, None, "/healthz", 200, "test");
+        assert_eq!(health_url(&contract), "http://127.0.0.1:8080/healthz");
+    }
+
+    #[test]
+    fn test_push_health_assertion_falls_back_to_discovered_port() {
+        // No override and no EXPOSE, but the probe merged in a listening port:
+        // target that rather than the conventional 80.
+        let mut contract = RuntimeContract::default();
+        contract.assertions.push(ContractAssertion::new(
+            AssertionKind::PortListening {
+                protocol: "tcp".to_string(),
+                port: 8080,
+            },
+            "probe: discovered listening port",
+            0,
+            Confidence::High,
+        ));
+        push_health_assertion(&mut contract, None, "/healthz", 200, "test");
+        assert_eq!(health_url(&contract), "http://127.0.0.1:8080/healthz");
+    }
+
+    #[test]
+    fn test_push_health_assertion_defaults_to_port_80() {
+        // Nothing to go on: the conventional HTTP port.
+        let mut contract = RuntimeContract::default();
+        push_health_assertion(&mut contract, None, "/", 200, "test");
+        assert_eq!(health_url(&contract), "http://127.0.0.1:80/");
+    }
 
     #[test]
     fn test_extract_basic_contract() {
