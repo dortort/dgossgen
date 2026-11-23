@@ -1421,6 +1421,129 @@ WORKDIR $APP_DIR
     }
 
     #[test]
+    fn test_global_arg_not_visible_in_stage_body_without_redeclaration() {
+        // Issue #59: a global ARG must not leak into a stage body. Docker expands
+        // `$APP_DIR` to empty here, so dgossgen must not confidently assert /srv/app.
+        let content = r#"
+ARG APP_DIR=/srv/app
+FROM alpine
+WORKDIR $APP_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("srv/app")
+            )),
+            "a global ARG must not resolve in a stage body without an ARG: {:?}",
+            contract.assertions
+        );
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '$APP_DIR'") && w.contains("unresolved variable")));
+    }
+
+    #[test]
+    fn test_global_arg_visible_in_stage_body_after_bare_redeclaration() {
+        // Redeclaring the global ARG with a bare `ARG NAME` brings its value in.
+        let content = r#"
+ARG APP_DIR=/srv/app
+FROM alpine
+ARG APP_DIR
+WORKDIR $APP_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/srv/app".to_string()));
+        assert!(contract.warnings.is_empty(), "{:?}", contract.warnings);
+    }
+
+    #[test]
+    fn test_supplied_global_build_arg_still_needs_stage_redeclaration() {
+        // A `--build-arg` value for a global ARG resolves the FROM image but stays
+        // out of the stage body until the stage redeclares the name.
+        let content = r#"
+ARG APP_DIR=/default
+FROM alpine
+WORKDIR $APP_DIR
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("APP_DIR".to_string(), "/supplied".to_string())],
+            &PolicyConfig::default(),
+        );
+
+        assert_eq!(contract.workdir, None);
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("supplied") || path.contains("default")
+            )),
+            "a supplied global build arg must not leak into the stage body: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_bare_stage_arg_prefers_global_over_parent_inherited_value() {
+        // BuildKit precedence: a bare `ARG V` in a child stage takes the global
+        // value, not the value inherited from the parent stage.
+        let content = r#"
+ARG V=global
+FROM alpine AS base
+ARG V=parent
+FROM base
+ARG V
+WORKDIR /opt/$V
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/global".to_string()));
+        assert!(
+            !contract.assertions.iter().any(|a| matches!(
+                &a.kind,
+                AssertionKind::FileExists { path, .. } if path.contains("parent")
+            )),
+            "the parent-inherited ARG value must not win over the global: {:?}",
+            contract.assertions
+        );
+    }
+
+    #[test]
+    fn test_secret_global_arg_redeclared_in_stage_is_dropped() {
+        // A secret-named global ARG pulled into a stage body keeps its taint, so no
+        // assertion that would embed the secret value is emitted.
+        let content = r#"
+ARG DB_PASSWORD
+FROM alpine
+ARG DB_PASSWORD
+WORKDIR /srv/$DB_PASSWORD
+"#;
+        let df = parse_dockerfile_content(content).unwrap();
+        let contract = extract_contract(
+            &df,
+            None,
+            &[("DB_PASSWORD".to_string(), "hunter2".to_string())],
+            &PolicyConfig::default(),
+        );
+
+        assert_eq!(contract.workdir, None);
+        assert!(!format!("{contract:?}").contains("hunter2"));
+        assert!(contract
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("WORKDIR '/srv/$DB_PASSWORD'") && w.contains("secret")));
+    }
+
+    #[test]
     fn test_env_reassignment_to_unresolved_invalidates_prior_value() {
         // Reassigning a var to an unresolved value must invalidate its prior binding, not stale.
         let content = "FROM alpine\nENV DIR=/old\nENV DIR=$MISSING\nWORKDIR $DIR\n";
