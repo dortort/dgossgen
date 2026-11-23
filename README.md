@@ -148,7 +148,7 @@ dgossgen explain [OPTIONS]
 Validates existing goss YAML files and detects likely flaky patterns.
 
 ```sh
-dgossgen lint [FILE] [--wait-file <PATH>]
+dgossgen lint [FILE] [--wait-file <PATH>] [--format human|json]
 
 Checks for:
   - Invalid YAML syntax
@@ -156,6 +156,19 @@ Checks for:
   - Excessive process assertions (>3 increases flake risk)
   - Commands without timeouts
 ```
+
+Each finding carries a severity, the source line it was found on, and a
+concrete remediation. The default `human` output prints these with a `fix:`
+hint per finding; `--format json` emits a machine-readable array (`file`,
+`line`, `severity`, `message`, `suggestion`) on stdout so CI can turn the
+exit-2 signal into annotations:
+
+```sh
+dgossgen lint goss.yml --format json
+```
+
+The command exits `2` when any issue is found and `0` otherwise, in both
+formats.
 
 ## Profiles
 
