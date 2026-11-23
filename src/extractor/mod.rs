@@ -28,9 +28,13 @@ pub fn extract_contract(
         None => return RuntimeContract::default(),
     };
 
+    // The Dockerfile's active escape character governs literal-`$` escaping; it
+    // flows into every escape_literal_dollars call below and into the resolver.
+    let escape = dockerfile.escape;
+
     let mut resolver = VariableResolver::new();
     resolver.load_build_args(build_args, |k| policy.is_secret_key(k));
-    resolver.load_global_args(&dockerfile.global_args);
+    resolver.load_global_args(&dockerfile.global_args, escape);
 
     // Walk the internal `FROM <alias>` chain so the final stage inherits the base stage's ENV/etc.
     let chain = resolve_stage_chain(dockerfile, stage, &resolver);
@@ -68,7 +72,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(&escape_literal_dollars(dir));
+                    } = resolver.resolve_checked(&escape_literal_dollars(dir, escape));
                     // `None` means unknown (unresolved, secret, or unknown base); never asserted.
                     let new_workdir = if unresolved {
                         contract.warnings.push(format!(
@@ -121,7 +125,7 @@ pub fn extract_contract(
                         value: resolved,
                         unresolved,
                         secret,
-                    } = resolver.resolve_checked(&escape_literal_dollars(user));
+                    } = resolver.resolve_checked(&escape_literal_dollars(user, escape));
                     fold_user = Some(FoldedUser {
                         raw: user.clone(),
                         resolved,
@@ -137,7 +141,7 @@ pub fn extract_contract(
                             value: resolved,
                             unresolved,
                             secret,
-                        } = resolver.resolve_checked(&escape_literal_dollars(raw_token));
+                        } = resolver.resolve_checked(&escape_literal_dollars(raw_token, escape));
                         if unresolved {
                             contract.warnings.push(format!(
                                 "EXPOSE '{}' contains an unresolved variable (no ARG/ENV default \
@@ -184,7 +188,7 @@ pub fn extract_contract(
                             value: resolved,
                             secret,
                             ..
-                        } = resolver.resolve_checked(&escape_literal_dollars(vol));
+                        } = resolver.resolve_checked(&escape_literal_dollars(vol, escape));
                         if secret {
                             contract.warnings.push(format!(
                                 "VOLUME '{vol}' uses a secret build arg; volume not recorded"
@@ -206,7 +210,7 @@ pub fn extract_contract(
                         match default.as_deref() {
                             Some(def) => {
                                 let resolved_def =
-                                    resolver.resolve_checked(&escape_literal_dollars(def));
+                                    resolver.resolve_checked(&escape_literal_dollars(def, escape));
                                 if resolved_def.unresolved {
                                     // Leave the name undefined so later uses drop with a warning.
                                     if !resolver.is_locked(name) {
@@ -302,31 +306,35 @@ pub fn extract_contract(
                     chmod,
                 } => {
                     // Only assert build-local copies (unknown for other stages) or absolute paths.
-                    let full_dest =
-                        match resolve_dest_path(dest, &resolver, current_workdir.as_deref()) {
-                            DestPath::Resolved(path) => path,
-                            DestPath::UnresolvedVar => {
-                                contract.warnings.push(format!(
-                                    "COPY destination '{dest}' contains an unresolved variable \
+                    let full_dest = match resolve_dest_path(
+                        dest,
+                        &resolver,
+                        current_workdir.as_deref(),
+                        escape,
+                    ) {
+                        DestPath::Resolved(path) => path,
+                        DestPath::UnresolvedVar => {
+                            contract.warnings.push(format!(
+                                "COPY destination '{dest}' contains an unresolved variable \
                                      (no ARG/ENV default in scope); no file assertion generated"
-                                ));
-                                continue;
-                            }
-                            DestPath::UnknownWorkdir => {
-                                contract.warnings.push(format!(
-                                    "COPY destination '{dest}' is relative to a working directory \
+                            ));
+                            continue;
+                        }
+                        DestPath::UnknownWorkdir => {
+                            contract.warnings.push(format!(
+                                "COPY destination '{dest}' is relative to a working directory \
                                      that could not be resolved; no file assertion generated"
-                                ));
-                                continue;
-                            }
-                            DestPath::Secret => {
-                                contract.warnings.push(format!(
-                                    "COPY destination '{dest}' uses a secret build arg; no file \
+                            ));
+                            continue;
+                        }
+                        DestPath::Secret => {
+                            contract.warnings.push(format!(
+                                "COPY destination '{dest}' uses a secret build arg; no file \
                                      assertion generated"
-                                ));
-                                continue;
-                            }
-                        };
+                            ));
+                            continue;
+                        }
+                    };
 
                     let confidence = Confidence::Medium;
 
@@ -379,31 +387,35 @@ pub fn extract_contract(
                     dest,
                     chmod,
                 } => {
-                    let full_dest =
-                        match resolve_dest_path(dest, &resolver, current_workdir.as_deref()) {
-                            DestPath::Resolved(path) => path,
-                            DestPath::UnresolvedVar => {
-                                contract.warnings.push(format!(
-                                    "ADD destination '{dest}' contains an unresolved variable \
+                    let full_dest = match resolve_dest_path(
+                        dest,
+                        &resolver,
+                        current_workdir.as_deref(),
+                        escape,
+                    ) {
+                        DestPath::Resolved(path) => path,
+                        DestPath::UnresolvedVar => {
+                            contract.warnings.push(format!(
+                                "ADD destination '{dest}' contains an unresolved variable \
                                      (no ARG/ENV default in scope); no file assertion generated"
-                                ));
-                                continue;
-                            }
-                            DestPath::UnknownWorkdir => {
-                                contract.warnings.push(format!(
-                                    "ADD destination '{dest}' is relative to a working directory \
+                            ));
+                            continue;
+                        }
+                        DestPath::UnknownWorkdir => {
+                            contract.warnings.push(format!(
+                                "ADD destination '{dest}' is relative to a working directory \
                                      that could not be resolved; no file assertion generated"
-                                ));
-                                continue;
-                            }
-                            DestPath::Secret => {
-                                contract.warnings.push(format!(
-                                    "ADD destination '{dest}' uses a secret build arg; no file \
+                            ));
+                            continue;
+                        }
+                        DestPath::Secret => {
+                            contract.warnings.push(format!(
+                                "ADD destination '{dest}' uses a secret build arg; no file \
                                      assertion generated"
-                                ));
-                                continue;
-                            }
-                        };
+                            ));
+                            continue;
+                        }
+                    };
 
                     contract.assertions.push(ContractAssertion::new(
                         AssertionKind::FileExists {
@@ -689,12 +701,13 @@ fn resolve_dest_path(
     dest: &str,
     resolver: &crate::parser::VariableResolver,
     current_workdir: Option<&str>,
+    escape: char,
 ) -> DestPath {
     let Resolution {
         value: resolved_dest,
         unresolved,
         secret,
-    } = resolver.resolve_checked(&escape_literal_dollars(dest));
+    } = resolver.resolve_checked(&escape_literal_dollars(dest, escape));
     if unresolved {
         return DestPath::UnresolvedVar;
     }
@@ -754,6 +767,33 @@ CMD ["node", "server.js"]
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn test_extractor_threads_backtick_escape_into_resolution() {
+        // Guards that the active escape char reaches the extractor's
+        // escape_literal_dollars call sites (#57). Under a backtick escape a
+        // backslash is a literal character, so `\$DIR` keeps the backslash and
+        // still expands `$DIR`. If a call site regressed to a hardcoded `\`,
+        // `\$` would be read as a literal `$` and the variable would stop
+        // expanding, so this fails if the threading is reverted.
+        let content =
+            "# escape=`\nFROM alpine\nARG DIR=app\nWORKDIR /opt/\\$DIR\nVOLUME /data/\\$DIR\n";
+        let df = parse_dockerfile_content(content).unwrap();
+        assert_eq!(df.escape, '`');
+        let contract = extract_contract(&df, None, &[], &PolicyConfig::default());
+
+        assert_eq!(contract.workdir, Some("/opt/\\app".to_string()));
+        assert!(
+            contract.volumes.contains(&"/data/\\app".to_string()),
+            "volumes: {:?}",
+            contract.volumes
+        );
+        assert!(
+            contract.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            contract.warnings
+        );
     }
 
     #[test]

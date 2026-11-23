@@ -1,0 +1,15 @@
+file:
+  # derived from WORKDIR C:\app\; confidence: high
+  "/C:\\app\\":
+    exists: true
+    filetype: directory
+process:
+  # derived from ENTRYPOINT app.exe; confidence: medium
+  app.exe:
+    running: true
+command:
+  # derived from USER ContainerUser; confidence: high
+  user-ContainerUser-exists:
+    exec: getent passwd ContainerUser
+    exit-status: 0
+    timeout: 5000
